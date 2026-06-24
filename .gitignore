@@ -18,6 +18,9 @@ build/
 # Machine-specific toolchain env written by the installer (absolute paths)
 /context/env.sh
 
+# Native libs built into the app by cargo-ndk (build artifacts, rebuilt on demand)
+app/android/app/src/main/jniLibs/
+
 # Local logs / scratch
 *.log
 .smoke.log
