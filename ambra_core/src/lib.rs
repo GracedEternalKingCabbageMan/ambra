@@ -14,6 +14,10 @@
 //! safety depth is the *Bitcoin* confirmation depth of its block's anchor, not
 //! its Sequentia block depth.
 
+/// flutter_rust_bridge API surface consumed by the Flutter (Dart) app.
+pub mod api;
+mod frb_generated;
+
 use std::str::FromStr;
 
 use lwk_common::{singlesig_desc, DescriptorBlindingKey, Singlesig};
@@ -27,6 +31,12 @@ pub type AmbraResult<T> = Result<T, String>;
 /// The Sequentia testnet network handle (policy asset, genesis, address params).
 pub fn sequentia_testnet() -> Network {
     Network::sequentia_testnet()
+}
+
+/// Generate a fresh 12-word BIP39 recovery phrase (testnet).
+pub fn generate_mnemonic() -> AmbraResult<String> {
+    let (_signer, mnemonic) = SwSigner::random(false).map_err(|e| format!("{e:?}"))?;
+    Ok(mnemonic.to_string())
 }
 
 /// Derive Ambra's standard Sequentia receive descriptor from a BIP39 mnemonic:

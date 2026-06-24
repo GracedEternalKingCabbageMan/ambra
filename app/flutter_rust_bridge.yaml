@@ -1,0 +1,6 @@
+# flutter_rust_bridge codegen config (FRB 2.12.0).
+# Generates Dart bindings in app/lib/src/rust/ from the ambra_core crate's
+# `api` module, and writes the Rust glue to ambra_core/src/frb_generated.rs.
+rust_input: crate::api
+rust_root: ../ambra_core
+dart_output: lib/src/rust
