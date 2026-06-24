@@ -1,0 +1,30 @@
+[package]
+name = "ambra_core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared Rust core for the Ambra Sequentia wallet (Android + iOS), built on SWK."
+license = "MIT"
+
+# Ambra's core consumes the SWK fork (a fork of Blockstream LWK) and turns ON
+# lwk_wollet's `sequentia` feature so the Sequentia send-flow (any-asset fee,
+# RBF/CPFP, non-confidential-as-first-class funds, staking) is compiled in.
+# Unlike lwk_bindings, which builds lwk_wollet with DEFAULT features (sequentia
+# OFF), this crate reaches those code paths.
+[dependencies]
+lwk_wollet = { version = "0.18.1", default-features = false, features = ["sequentia"] }
+# Software-only signer: drop default features ["jade","amp0"] so we don't pull
+# lwk_jade/lwk_ledger (hardware wallets) or lwk_containers (docker) — irrelevant
+# on mobile, and they keep the unpublished-crate closure (and binary) minimal.
+lwk_signer = { version = "0.18.1", default-features = false }
+lwk_common = { version = "0.18.1" }
+
+# The lwk_* crates are the unpublished SWK fork and depend on each other (and on
+# `elements`) BY VERSION; these path patches redirect those to the local SWK
+# checkout, and critically point `elements` at SWK's vendored rust-elements that
+# can (de)serialize Sequentia's anchored block headers. (Local-dev layout: the
+# `ambra` repo sits as a sibling of `SWK`. This becomes a git dep before CI.)
+[patch.crates-io]
+lwk_common = { path = "../../SWK/lwk_common" }
+lwk_signer = { path = "../../SWK/lwk_signer" }
+lwk_wollet = { path = "../../SWK/lwk_wollet" }
+elements   = { path = "../../SWK/rust-elements" }

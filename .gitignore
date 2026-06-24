@@ -1,0 +1,26 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+
+# Flutter / Dart (app/ added in a later milestone)
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+.packages
+*.iml
+.idea/
+
+# flutter_rust_bridge generated artifacts kept out of source where appropriate
+# (decide per-file once FRB is wired)
+
+# Machine-specific toolchain env written by the installer (absolute paths)
+/context/env.sh
+
+# Local logs / scratch
+*.log
+.smoke.log
+
+# OS
+.DS_Store
