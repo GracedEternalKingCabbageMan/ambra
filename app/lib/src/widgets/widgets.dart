@@ -241,6 +241,24 @@ class AmbraField extends StatelessWidget {
   }
 }
 
+/// A readable, floating snackbar consistent with the app theme. The default
+/// SnackBar renders dark-on-dark and anchors to the very bottom (over buttons /
+/// behind the keyboard); this floats above with a panel background and light text.
+SnackBar ambraSnack(String message, {SnackBarAction? action}) {
+  return SnackBar(
+    content: Text(message, style: const TextStyle(color: AmbraColors.txt, fontWeight: FontWeight.w600)),
+    backgroundColor: AmbraColors.panel,
+    behavior: SnackBarBehavior.floating,
+    margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+    shape: RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(14),
+      side: const BorderSide(color: AmbraColors.line),
+    ),
+    action: action,
+    duration: const Duration(seconds: 4),
+  );
+}
+
 /// 3-column numbered word grid for the recovery phrase.
 class MnemonicWordGrid extends StatelessWidget {
   const MnemonicWordGrid({super.key, required this.words});
