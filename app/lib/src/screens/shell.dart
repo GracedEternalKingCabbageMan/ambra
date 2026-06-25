@@ -242,13 +242,27 @@ class _SyncChip extends StatelessWidget {
   final int? tip;
   @override
   Widget build(BuildContext context) {
+    if (loading) {
+      return Row(mainAxisSize: MainAxisSize.min, children: const [
+        SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 1.6, color: AmbraColors.dim)),
+        SizedBox(width: 7),
+        Text('syncing', style: AmbraText.sub),
+      ]);
+    }
+    // Not loading: green + block height when synced; amber + "offline" when the
+    // last sync didn't complete (so the screen is showing last-known data).
+    final synced = tip != null;
     return Row(mainAxisSize: MainAxisSize.min, children: [
-      if (loading)
-        const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 1.6, color: AmbraColors.dim))
-      else
-        Container(width: 7, height: 7, decoration: const BoxDecoration(color: AmbraColors.green, shape: BoxShape.circle)),
+      Container(
+        width: 7,
+        height: 7,
+        decoration: BoxDecoration(
+          color: synced ? AmbraColors.green : AmbraColors.amber,
+          shape: BoxShape.circle,
+        ),
+      ),
       const SizedBox(width: 7),
-      Text(tip == null ? 'syncing' : 'block $tip', style: AmbraText.sub),
+      Text(synced ? 'block $tip' : 'offline', style: AmbraText.sub),
     ]);
   }
 }

@@ -81,17 +81,18 @@ class _SendTabState extends State<SendTab> {
     try {
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) return;
+      // Fee rates are independent of the chain sync; fetch + apply them first so
+      // fee pricing stays correct even if the sync is slow or fails.
+      try {
+        final rates = await ApiClient.feeRates();
+        if (mounted && rates.isNotEmpty) setState(() => _feeRates = rates);
+      } catch (_) {/* fee-rate list unavailable; the default fee still works */}
       final s = await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
       WalletCache.saveBalances(s.balances); // keep the shared cache fresh
-      Map<String, BigInt> rates = {};
-      try {
-        rates = await ApiClient.feeRates();
-      } catch (_) {/* fee-rate list unavailable; the default tSEQ fee still works */}
       if (!mounted) return;
       setState(() {
         _error = null; // a successful load clears any earlier (transient) error
         _balances = s.balances;
-        _feeRates = rates;
         // Default the send asset to one you hold (keep the current choice if it's
         // still funded). Never default to tSEQ when its balance is 0.
         final held = _heldIds();

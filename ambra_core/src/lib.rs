@@ -79,6 +79,15 @@ pub fn auth_header() -> Option<String> {
     AUTH_HEADER.lock().ok().and_then(|g| g.clone())
 }
 
+/// Delete the on-disk wallet store. Used to recover when the persisted state is
+/// ahead of a regressed backend (a testnet reorg/reindex); the next wallet build
+/// recreates the store and rescans from the current chain.
+pub fn clear_data_dir() {
+    if let Some(dir) = DATA_DIR.lock().ok().and_then(|g| g.clone()) {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Build a watch-only wallet for `descriptor` on Sequentia testnet. Holds no
 /// keys. When a data dir is set, restores prior scanned state from disk on build
 /// (and persists future updates there). If the on-disk store is missing or

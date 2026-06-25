@@ -297,12 +297,36 @@ fn with_synced_wollet<T>(
         let w = crate::build_wollet(&descriptor).map_err(err)?;
         guard.insert(descriptor.clone(), w);
     }
-    let wollet = guard.get_mut(&descriptor).expect("just inserted");
     let mut client = esplora_client(esplora_url).map_err(rerr)?;
-    if let Some(update) = client.full_scan(&*wollet).map_err(rerr)? {
-        wollet.apply_update(update).map_err(rerr)?;
+    let first = scan_into(guard.get_mut(&descriptor).expect("just inserted"), &mut client);
+    match first {
+        Ok(()) => {}
+        // The persisted cache is ahead of the backend: a testnet reorg/reindex
+        // dropped blocks below our saved tip, so every update looks "too old".
+        // Discard the stale memory + disk state and rebuild from the current
+        // chain (the fresh wallet starts empty, so the next scan applies cleanly).
+        Err(lwk_wollet::Error::UpdateHeightTooOld { .. }) => {
+            guard.remove(&descriptor);
+            crate::clear_data_dir();
+            let w = crate::build_wollet(&descriptor).map_err(err)?;
+            guard.insert(descriptor.clone(), w);
+            scan_into(guard.get_mut(&descriptor).expect("just inserted"), &mut client).map_err(rerr)?;
+        }
+        Err(e) => return Err(rerr(e)),
     }
-    f(&*wollet)
+    let wollet = guard.get(&descriptor).expect("present after sync");
+    f(wollet)
+}
+
+/// Incrementally scan `wollet` against `client`, applying any returned update.
+fn scan_into(
+    wollet: &mut lwk_wollet::Wollet,
+    client: &mut EsploraClient,
+) -> std::result::Result<(), lwk_wollet::Error> {
+    if let Some(update) = client.full_scan(&*wollet)? {
+        wollet.apply_update(update)?;
+    }
+    Ok(())
 }
 
 /// Forget any cached wallet state (called when the wallet is removed).
