@@ -32,11 +32,17 @@ class ApiClient {
   }
 
   /// The producer fee-acceptance set: {("bitcoin"=tSEQ | ticker | hex): rate}.
-  /// rate = atoms-of-asset per reference unit ×1e8.
-  static Future<Map<String, num>> feeRates() async {
+  /// rate = atoms-of-asset per reference unit ×1e8 (an integer, consensus-exact).
+  /// Parsed losslessly as BigInt; non-integer/garbage rates are dropped.
+  static Future<Map<String, BigInt>> feeRates() async {
     final r = await http.get(Uri.parse(Backend.feerates)).timeout(const Duration(seconds: 20));
     if (r.statusCode != 200) throw Exception('HTTP ${r.statusCode}');
     final j = jsonDecode(r.body) as Map<String, dynamic>;
-    return j.map((k, v) => MapEntry(k, v is num ? v : num.parse('$v')));
+    final out = <String, BigInt>{};
+    j.forEach((k, v) {
+      final b = BigInt.tryParse('$v');
+      if (b != null && b > BigInt.zero) out[k] = b;
+    });
+    return out;
   }
 }

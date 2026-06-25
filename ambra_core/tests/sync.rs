@@ -3,7 +3,9 @@
 //!
 //!   cargo test --test sync -- --nocapture
 
-use ambra_core::api::{build_send_tx, receive_address_at, sign_pset, sync_wallet, Recipient};
+use ambra_core::api::{
+    build_send_tx, receive_address_at, sign_pset, sync_wallet, validate_address, Recipient,
+};
 
 const MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -55,4 +57,20 @@ fn build_and_sign_self_send() {
     let signed = sign_pset(MNEMONIC.to_string(), pset).expect("sign_pset");
     assert!(!signed.is_empty(), "signed PSET should be non-empty");
     println!("built + signed a self-send PSET ({} chars) — NOT broadcast", signed.len());
+}
+
+/// A Sequentia tb1 address validates; foreign-network addresses are rejected
+/// (offline; no network needed).
+#[test]
+fn rejects_foreign_network_addresses() {
+    let tb1 = receive_address_at(MNEMONIC.to_string(), 0, false).expect("addr").address;
+    assert!(validate_address(tb1.clone()).is_ok(), "tb1 should validate: {tb1}");
+    for foreign in [
+        "lq1qqg9q6hgr7p3xq6t3z6m3l0w0r0t0n0q0p0r0t0n0q0p0r0t0n0q0p0r0t0n0q0p", // Liquid-ish
+        "ert1qw508d6qejxtdg4y5r3zarvary0c5xw7kxgt8q",                          // Elements regtest
+        "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",                          // Bitcoin mainnet
+        "not-an-address",
+    ] {
+        assert!(validate_address(foreign.to_string()).is_err(), "should reject {foreign}");
+    }
 }

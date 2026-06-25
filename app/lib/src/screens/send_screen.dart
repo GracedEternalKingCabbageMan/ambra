@@ -19,7 +19,7 @@ class _SendTabState extends State<SendTab> {
   final _addr = TextEditingController();
   final _amount = TextEditingController();
   List<core.AssetBalance> _balances = [];
-  Map<String, num> _feeRates = {};
+  Map<String, BigInt> _feeRates = {};
   String _assetId = SeqAssets.policy;
   String? _feeAsset; // null = native tSEQ
   bool _loading = true;
@@ -43,7 +43,7 @@ class _SendTabState extends State<SendTab> {
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) return;
       final s = await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
-      Map<String, num> rates = {};
+      Map<String, BigInt> rates = {};
       try {
         rates = await ApiClient.feeRates();
       } catch (_) {/* fee asset unavailable; native fee still works */}
@@ -76,14 +76,19 @@ class _SendTabState extends State<SendTab> {
 
   /// The published fee rate (atoms per reference unit) for an asset, keyed in
   /// /feerates by ticker or hex (deployments vary). null = not fee-priced.
-  num? _rateFor(String hex) {
+  BigInt? _rateFor(String hex) {
     final t = SeqAssets.labelFor(hex).ticker;
-    final r = _feeRates[t] ?? _feeRates[hex];
-    return (r != null && r > 0) ? r : null;
+    return _feeRates[t] ?? _feeRates[hex]; // already filtered to >0 in feeRates()
   }
 
-  List<String> _feeEligible() =>
-      _balances.map((b) => b.assetId).where((id) => id != SeqAssets.policy && _rateFor(id) != null).toList();
+  /// Owned, fee-priced, and actually funded (a different asset can't pay the fee).
+  List<String> _feeEligible() => _balances
+      .map((b) => b.assetId)
+      .where((id) =>
+          id != SeqAssets.policy &&
+          _rateFor(id) != null &&
+          (BigInt.tryParse(_balanceOf(id)) ?? BigInt.zero) > BigInt.zero)
+      .toList();
 
   String get _feeLabel => _feeAsset == null ? 'tSEQ' : SeqAssets.labelFor(_feeAsset!).ticker;
 
@@ -136,14 +141,30 @@ class _SendTabState extends State<SendTab> {
     final atoms = parseAtoms(_amount.text, label.precision);
     if (addr.isEmpty) return _snack('Enter a recipient address');
     if (atoms == null || atoms <= BigInt.zero) return _snack('Enter a valid amount');
+    if (atoms >= (BigInt.one << 64)) return _snack('Amount is too large.'); // u64 FFI guard
     final bal = BigInt.tryParse(_selected?.atoms ?? '0') ?? BigInt.zero;
     if (atoms > bal) return _snack('Amount exceeds your ${label.ticker} balance');
 
+    // Fund checks (fees are multi-asset — another asset's balance can't cover a
+    // fee), so the user isn't asked to authorize a doomed payment.
     core.FeeAsset? feeAsset;
-    if (_feeAsset != null) {
+    if (_feeAsset == null) {
+      if (_assetId == SeqAssets.policy) {
+        if (atoms == bal) {
+          return _snack('Leave a little tSEQ for the network fee — send a bit less.');
+        }
+      } else {
+        final tseq = BigInt.tryParse(_balanceOf(SeqAssets.policy)) ?? BigInt.zero;
+        if (tseq <= BigInt.zero) {
+          return _snack('You need some tSEQ for the network fee. Use the faucet, or pay the fee in ${label.ticker}.');
+        }
+      }
+    } else {
       final rate = _rateFor(_feeAsset!);
       if (rate == null) return _snack('No published fee rate for $_feeLabel');
-      feeAsset = core.FeeAsset(assetId: _feeAsset!, rate: BigInt.from(rate));
+      final feeBal = BigInt.tryParse(_balanceOf(_feeAsset!)) ?? BigInt.zero;
+      if (feeBal <= BigInt.zero) return _snack('You have no $_feeLabel to pay the fee with.');
+      feeAsset = core.FeeAsset(assetId: _feeAsset!, rate: rate);
     }
 
     final txid = await showModalBottomSheet<String>(
@@ -287,11 +308,11 @@ class _ReviewSheetState extends State<_ReviewSheet> {
       _error = null;
     });
     try {
-      final ok = await WalletRepository.instance.authenticate(reason: 'Authorize this payment');
+      final ok = await WalletRepository.instance.requirePaymentAuth();
       if (!ok) {
         setState(() {
           _busy = false;
-          _error = 'Authentication cancelled';
+          _error = 'Authentication failed or cancelled — payment not sent.';
         });
         return;
       }
@@ -362,5 +383,8 @@ class _Row extends StatelessWidget {
 
 String _pretty(Object e) {
   final s = e.toString().replaceFirst('Exception: ', '');
+  if (s.toLowerCase().contains('insufficient') || s.contains('InsufficientFunds')) {
+    return 'Not enough funds to cover the amount plus the network fee. Try a smaller amount.';
+  }
   return s.length > 200 ? '${s.substring(0, 200)}…' : s;
 }

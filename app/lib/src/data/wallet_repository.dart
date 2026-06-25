@@ -74,6 +74,24 @@ class WalletRepository extends ChangeNotifier {
     }
   }
 
+  /// Authorize a money-moving action. Unlike [authenticate], this FAILS CLOSED:
+  /// any auth error or user denial returns false — a payment must never be
+  /// signed without real authentication. Does not touch the app-lock state.
+  /// (A device with no enrolled credential at all — e.g. a bare emulator — is
+  /// allowed through, as this is a testnet build.)
+  Future<bool> requirePaymentAuth() async {
+    try {
+      final supported = await _auth.isDeviceSupported();
+      if (!supported) return true;
+      return await _auth.authenticate(
+        localizedReason: 'Authorize this payment',
+        options: const AuthenticationOptions(stickyAuth: true, biometricOnly: false),
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
   bool _grant() {
     unlocked = true;
     notifyListeners();

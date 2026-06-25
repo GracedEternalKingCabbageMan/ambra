@@ -132,9 +132,12 @@ pub struct FeeAsset {
     pub rate: u64,
 }
 
-/// Quick format-level validity check of a recipient address.
+/// Validate a recipient address is a well-formed **Sequentia** address (rejects
+/// foreign-network addresses).
 pub fn validate_address(address: String) -> Result<()> {
-    Address::from_str(&address).map(|_| ()).map_err(rerr)
+    Address::parse_with_params(&address, crate::sequentia_testnet().address_params())
+        .map(|_| ())
+        .map_err(rerr)
 }
 
 /// Build an UNSIGNED send PSET (base64). Syncs first so the wallet has utxos.
@@ -154,9 +157,14 @@ pub fn build_send_tx(
     if let Some(update) = client.full_scan(&wollet).map_err(rerr)? {
         wollet.apply_update(update).map_err(rerr)?;
     }
+    // Parse recipients with the SEQUENTIA address params so foreign-network
+    // addresses (Liquid ex1/lq1, Elements ert1, …) are REJECTED — `from_str`
+    // would happily accept them and we'd broadcast funds to an unrecoverable
+    // foreign script.
+    let params = crate::sequentia_testnet().address_params();
     let mut b = TxBuilder::new(crate::sequentia_testnet());
     for r in &recipients {
-        let address = Address::from_str(&r.address).map_err(rerr)?;
+        let address = Address::parse_with_params(&r.address, params).map_err(rerr)?;
         let asset = AssetId::from_str(&r.asset_id).map_err(rerr)?;
         // Sequentia defaults to explicit (tb1) recipients; confidential (tsqb1)
         // go through the blinded path.
