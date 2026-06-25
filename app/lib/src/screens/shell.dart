@@ -499,6 +499,28 @@ class MoreTab extends StatelessWidget {
     if (confirm == true) await WalletRepository.instance.removeWallet();
   }
 
+  Future<void> _toggleLock(BuildContext context, bool on) async {
+    final repo = WalletRepository.instance;
+    if (on) {
+      // Only enable if the device can actually enforce it (has a screen lock).
+      if (!await repo.canEnforceLock()) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+              content: Text('Set up a screen lock (PIN, pattern, or biometrics) on your device first.')));
+        }
+        return;
+      }
+      // Confirm the user can authenticate before relying on the lock.
+      if (!await repo.authenticate(reason: 'Confirm to enable the app lock')) return;
+      await repo.setLockEnabled(true);
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('App lock enabled.')));
+      }
+    } else {
+      await repo.setLockEnabled(false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return ListView(
@@ -539,14 +561,36 @@ class MoreTab extends StatelessWidget {
           ]),
         ),
         const SizedBox(height: 14),
+        ListenableBuilder(
+          listenable: WalletRepository.instance,
+          builder: (context, _) {
+            final repo = WalletRepository.instance;
+            return AmbraCard(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                const SectionLabel('Security'),
+                const SizedBox(height: 4),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  activeThumbColor: AmbraColors.amber,
+                  value: repo.lockEnabled,
+                  onChanged: (v) => _toggleLock(context, v),
+                  title: const Text('App lock', style: AmbraText.body),
+                  subtitle: const Text('Require biometrics or your device PIN to open Ambra.', style: AmbraText.sub),
+                ),
+                if (repo.lockEnabled) ...[
+                  const SizedBox(height: 8),
+                  SecondaryButton(label: 'Lock now', icon: Icons.lock, onPressed: repo.lock),
+                ],
+              ]),
+            );
+          },
+        ),
+        const SizedBox(height: 14),
         AmbraCard(
           child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
             const SectionLabel('Wallet'),
             const SizedBox(height: 12),
             SecondaryButton(label: 'Reveal recovery phrase', icon: Icons.visibility, onPressed: () => _reveal(context)),
-            const SizedBox(height: 10),
-            SecondaryButton(
-                label: 'Lock now', icon: Icons.lock, onPressed: () => WalletRepository.instance.lock()),
             const SizedBox(height: 10),
             DangerButton(label: 'Remove wallet', onPressed: () => _remove(context)),
           ]),

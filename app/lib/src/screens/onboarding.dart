@@ -47,6 +47,9 @@ class WelcomeScreen extends StatelessWidget {
                         'Testnet. Your recovery phrase is stored on this device, '
                         'protected by your device lock. For real funds, use a hardware wallet.',
                       ),
+                      const SizedBox(height: 22),
+                      const Center(child: SequentiaWordmark()),
+                      const SizedBox(height: 4),
                     ],
                   ),
                 ),

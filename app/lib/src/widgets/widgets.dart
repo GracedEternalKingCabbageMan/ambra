@@ -2,25 +2,40 @@ import 'package:flutter/material.dart';
 
 import '../theme/theme.dart';
 
-/// The circular near-black coin with the two-stroke gold "S".
+/// The official Sequentia mark — gold two-stroke "S" on the near-black disc.
 class BrandMark extends StatelessWidget {
   const BrandMark({super.key, this.size = 56});
   final double size;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    return Image.asset(
+      'assets/icon/sequentia-s.png',
       width: size,
       height: size,
-      decoration: BoxDecoration(
-        gradient: AmbraColors.goldGradient,
-        borderRadius: BorderRadius.circular(size * 0.26),
-      ),
-      alignment: Alignment.center,
-      child: Text('S',
-          style: TextStyle(
-              fontSize: size * 0.54, fontWeight: FontWeight.w800, color: AmbraColors.onGold, height: 1.0)),
+      filterQuality: FilterQuality.medium,
     );
+  }
+}
+
+/// A subtle "built on Sequentia" endorsement (the real gold "S" mark + wordmark
+/// text) for the welcome / lock screens. Sequentia has no standalone wordmark
+/// asset — only the "S" — so the wordmark is set typographically.
+class SequentiaWordmark extends StatelessWidget {
+  const SequentiaWordmark({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(mainAxisSize: MainAxisSize.min, children: [
+      Text('BUILT ON', style: AmbraText.label.copyWith(letterSpacing: 3, fontSize: 10)),
+      const SizedBox(height: 10),
+      Row(mainAxisSize: MainAxisSize.min, children: [
+        const BrandMark(size: 22),
+        const SizedBox(width: 9),
+        const Text('Sequentia',
+            style: TextStyle(color: AmbraColors.txt, fontSize: 18, fontWeight: FontWeight.w700, letterSpacing: -0.2)),
+      ]),
+    ]);
   }
 }
 

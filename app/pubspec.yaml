@@ -19,7 +19,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # Versioning: 0.x = pre-mainnet; minor tracks the milestone (M7 -> 0.7.0);
 # bump the build number (+N) every release, patch for fix-only builds, 1.0.0 at
 # mainnet. Keep in sync with the download filename + page.
-version: 0.7.2+9
+version: 0.7.3+10
 
 environment:
   sdk: ^3.12.2
@@ -59,6 +59,17 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+  # Generates the Android launcher (+ adaptive) icons from the Sequentia "S".
+  flutter_launcher_icons: ^0.14.4
+
+# Run with: dart run flutter_launcher_icons
+flutter_launcher_icons:
+  android: true
+  ios: false # iOS bring-up comes later (needs a Mac)
+  image_path: "assets/icon/sequentia-s.png"
+  adaptive_icon_background: "#121212" # matches the mark's dark disc
+  adaptive_icon_foreground: "assets/icon/sequentia-s.png"
+  min_sdk_android: 21
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -70,6 +81,9 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  assets:
+    - assets/icon/sequentia-s.png
 
   # To add assets to your application, add an assets section, like this:
   # assets:
