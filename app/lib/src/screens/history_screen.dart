@@ -25,7 +25,7 @@ class _HistoryTabState extends State<HistoryTab> {
   @override
   void initState() {
     super.initState();
-    _load();
+    if (widget.isActive) _load(); // lazy: load when first opened (also reloads on activation)
   }
 
   @override
