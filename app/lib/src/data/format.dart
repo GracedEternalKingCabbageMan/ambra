@@ -27,6 +27,20 @@ BigInt? parseAtoms(String input, int precision) {
   return BigInt.tryParse(whole + frac);
 }
 
+/// Map a raw core/network error to a short, user-friendly message. Transient
+/// connectivity failures (the common case on a flaky link) become a calm
+/// "retry" message rather than a wall of Reqwest/hyper internals.
+String friendlyError(Object e) {
+  final low = e.toString().toLowerCase();
+  const net = ['reqwest', 'connectionaborted', 'connection abort', 'connectionreset',
+    'connect', 'timed out', 'timeout', 'dns', 'network', 'unreachable', 'broken pipe', 'os { code'];
+  if (net.any(low.contains)) {
+    return "Couldn't reach the network. Check your connection and pull down to retry.";
+  }
+  final s = e.toString().replaceFirst('Exception: ', '').replaceFirst(RegExp(r'AnyhowException\(?'), '');
+  return s.length > 160 ? '${s.substring(0, 160)}…' : s;
+}
+
 String _group(String intStr) {
   final out = StringBuffer();
   for (var i = 0; i < intStr.length; i++) {
