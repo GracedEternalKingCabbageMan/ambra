@@ -29,3 +29,38 @@ Future<String> confidentialReceiveAddress({required String mnemonic}) =>
 /// The wallet's CT output descriptor for a recovery phrase.
 Future<String> descriptorFromMnemonic({required String mnemonic}) =>
     RustLib.instance.api.crateApiDescriptorFromMnemonic(mnemonic: mnemonic);
+
+/// Validate a BIP39 recovery phrase (import flow). Throws on an invalid phrase.
+Future<void> validateMnemonic({required String mnemonic}) =>
+    RustLib.instance.api.crateApiValidateMnemonic(mnemonic: mnemonic);
+
+/// Receive address at `index`: non-confidential `tb1…` (default) or the opt-in
+/// confidential `tsqb…` form. Returns the address + the index it used.
+Future<AddressInfo> receiveAddressAt({
+  required String mnemonic,
+  required int index,
+  required bool confidential,
+}) => RustLib.instance.api.crateApiReceiveAddressAt(
+  mnemonic: mnemonic,
+  index: index,
+  confidential: confidential,
+);
+
+/// A receive address together with the derivation index it came from.
+class AddressInfo {
+  final String address;
+  final int index;
+
+  const AddressInfo({required this.address, required this.index});
+
+  @override
+  int get hashCode => address.hashCode ^ index.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is AddressInfo &&
+          runtimeType == other.runtimeType &&
+          address == other.address &&
+          index == other.index;
+}

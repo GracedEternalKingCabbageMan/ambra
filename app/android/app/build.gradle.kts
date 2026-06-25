@@ -7,7 +7,10 @@ plugins {
 android {
     namespace = "io.sequentia.ambra"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+    // Pin to the NDK we have fully installed (and that built the jniLibs .so),
+    // instead of flutter.ndkVersion, whose default NDK auto-download was
+    // landing incomplete (missing source.properties -> [CXX1101]).
+    ndkVersion = "29.0.14206865"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

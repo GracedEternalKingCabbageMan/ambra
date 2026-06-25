@@ -43,3 +43,21 @@ pub fn confidential_receive_address(mnemonic: String) -> Result<String> {
 pub fn descriptor_from_mnemonic(mnemonic: String) -> Result<String> {
     crate::descriptor_from_mnemonic(&mnemonic).map_err(err)
 }
+
+/// A receive address together with the derivation index it came from.
+pub struct AddressInfo {
+    pub address: String,
+    pub index: u32,
+}
+
+/// Validate a BIP39 recovery phrase (import flow). Throws on an invalid phrase.
+pub fn validate_mnemonic(mnemonic: String) -> Result<()> {
+    crate::validate_mnemonic(&mnemonic).map_err(err)
+}
+
+/// Receive address at `index`: non-confidential `tb1…` (default) or the opt-in
+/// confidential `tsqb…` form. Returns the address + the index it used.
+pub fn receive_address_at(mnemonic: String, index: u32, confidential: bool) -> Result<AddressInfo> {
+    let address = crate::receive_address_at(&mnemonic, index, confidential).map_err(err)?;
+    Ok(AddressInfo { address, index })
+}

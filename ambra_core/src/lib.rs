@@ -75,3 +75,25 @@ pub fn confidential_receive_address(wollet: &Wollet, index: u32) -> AmbraResult<
     let res = wollet.address(Some(index)).map_err(|e| format!("{e:?}"))?;
     Ok(res.address().to_string())
 }
+
+/// Validate a BIP39 recovery phrase (used by import before persisting it).
+pub fn validate_mnemonic(mnemonic: &str) -> AmbraResult<()> {
+    SwSigner::new(mnemonic, false)
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Receive address at a specific `index`: non-confidential `tb1…` by default,
+/// or the opt-in confidential `tsqb…` form. Powers "New address" + the
+/// confidential toggle.
+pub fn receive_address_at(mnemonic: &str, index: u32, confidential: bool) -> AmbraResult<String> {
+    let descriptor = descriptor_from_mnemonic(mnemonic)?;
+    let wollet = build_wollet(&descriptor)?;
+    let res = wollet.address(Some(index)).map_err(|e| format!("{e:?}"))?;
+    let addr = res.address();
+    Ok(if confidential {
+        addr.to_string()
+    } else {
+        addr.to_unconfidential().to_string()
+    })
+}

@@ -37,6 +37,9 @@ dependencies:
 
   # Bridge to the ambra_core Rust crate (version must match the codegen, 2.12.0).
   flutter_rust_bridge: 2.12.0
+  # Non-custodial key storage + app lock.
+  flutter_secure_storage: ^9.2.4
+  local_auth: ^2.3.0
 
 dev_dependencies:
   flutter_test:
