@@ -2,6 +2,8 @@
     <!-- Required for esplora/faucet/registry/prices network access. (Flutter only
          adds this to the debug manifest by default, so release builds need it here.) -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- QR scanning for the send recipient address. -->
+    <uses-permission android:name="android.permission.CAMERA"/>
     <application
         android:label="Ambra"
         android:name="${applicationName}"

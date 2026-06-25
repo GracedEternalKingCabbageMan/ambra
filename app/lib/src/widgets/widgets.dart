@@ -194,6 +194,7 @@ class AmbraField extends StatelessWidget {
     this.mono = false,
     this.maxLines = 1,
     this.onChanged,
+    this.suffix,
   });
   final String label;
   final TextEditingController? controller;
@@ -201,6 +202,7 @@ class AmbraField extends StatelessWidget {
   final bool mono;
   final int maxLines;
   final ValueChanged<String>? onChanged;
+  final Widget? suffix;
 
   @override
   Widget build(BuildContext context) {
@@ -219,6 +221,7 @@ class AmbraField extends StatelessWidget {
             hintStyle: const TextStyle(color: AmbraColors.dim),
             filled: true,
             fillColor: AmbraColors.panelDeep,
+            suffixIcon: suffix,
             contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
             enabledBorder: OutlineInputBorder(
               borderRadius: BorderRadius.circular(AmbraRadii.input),

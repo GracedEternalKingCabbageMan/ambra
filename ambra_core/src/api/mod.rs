@@ -95,29 +95,24 @@ pub struct WalletSync {
 /// chain tip, per-asset balances, and the next unused receive index. Runs on an
 /// FRB worker thread (off the UI thread).
 pub fn sync_wallet(mnemonic: String, esplora_url: String) -> Result<WalletSync> {
-    let descriptor = crate::descriptor_from_mnemonic(&mnemonic).map_err(err)?;
-    let mut wollet = crate::build_wollet(&descriptor).map_err(err)?;
-    let mut client = EsploraClient::new(&esplora_url, crate::sequentia_testnet())
-        .map_err(|e| err(format!("{e:?}")))?;
-    if let Some(update) = client.full_scan(&wollet).map_err(|e| err(format!("{e:?}")))? {
-        wollet.apply_update(update).map_err(|e| err(format!("{e:?}")))?;
-    }
-    let tip = wollet.tip();
-    let balances = wollet
-        .balance()
-        .map_err(|e| err(format!("{e:?}")))?
-        .iter()
-        .map(|(asset, atoms)| AssetBalance {
-            asset_id: asset.to_string(),
-            atoms: atoms.to_string(),
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let tip = wollet.tip();
+        let balances = wollet
+            .balance()
+            .map_err(rerr)?
+            .iter()
+            .map(|(asset, atoms)| AssetBalance {
+                asset_id: asset.to_string(),
+                atoms: atoms.to_string(),
+            })
+            .collect();
+        let next_index = wollet.address(None).map_err(rerr)?.index();
+        Ok(WalletSync {
+            tip_height: tip.height(),
+            tip_hash: tip.hash().to_string(),
+            balances,
+            next_index,
         })
-        .collect();
-    let next_index = wollet.address(None).map_err(|e| err(format!("{e:?}")))?.index();
-    Ok(WalletSync {
-        tip_height: tip.height(),
-        tip_hash: tip.hash().to_string(),
-        balances,
-        next_index,
     })
 }
 
@@ -153,37 +148,26 @@ pub fn build_send_tx(
     fee_rate_sat_kvb: Option<f32>,
     fee_asset: Option<FeeAsset>,
 ) -> Result<String> {
-    let descriptor = crate::descriptor_from_mnemonic(&mnemonic).map_err(err)?;
-    let mut wollet = crate::build_wollet(&descriptor).map_err(err)?;
-    let mut client = EsploraClient::new(&esplora_url, crate::sequentia_testnet()).map_err(rerr)?;
-    if let Some(update) = client.full_scan(&wollet).map_err(rerr)? {
-        wollet.apply_update(update).map_err(rerr)?;
-    }
-    // Parse recipients with the SEQUENTIA address params so foreign-network
-    // addresses (Liquid ex1/lq1, Elements ert1, …) are REJECTED — `from_str`
-    // would happily accept them and we'd broadcast funds to an unrecoverable
-    // foreign script.
-    let params = crate::sequentia_testnet().address_params();
-    let mut b = TxBuilder::new(crate::sequentia_testnet());
-    for r in &recipients {
-        let address = Address::parse_with_params(&r.address, params).map_err(rerr)?;
-        let asset = AssetId::from_str(&r.asset_id).map_err(rerr)?;
-        // Sequentia defaults to explicit (tb1) recipients; confidential (tsqb1)
-        // go through the blinded path.
-        b = if address.blinding_pubkey.is_some() {
-            b.add_recipient(&address, r.satoshi, asset).map_err(rerr)?
-        } else {
-            b.add_explicit_recipient(&address, r.satoshi, asset).map_err(rerr)?
-        };
-    }
-    if let Some(fr) = fee_rate_sat_kvb {
-        b = b.fee_rate(Some(fr));
-    }
-    if let Some(fa) = &fee_asset {
-        b = b.fee_asset(AssetId::from_str(&fa.asset_id).map_err(rerr)?, fa.rate);
-    }
-    let pset = b.finish(&wollet).map_err(rerr)?;
-    Ok(pset.to_string())
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        // Parse recipients with the SEQUENTIA address params so foreign-network
+        // addresses (Liquid ex1/lq1, Elements ert1, …) are REJECTED; `from_str`
+        // would happily accept them and we'd broadcast funds to an unrecoverable
+        // foreign script.
+        let params = crate::sequentia_testnet().address_params();
+        let mut b = TxBuilder::new(crate::sequentia_testnet());
+        for r in &recipients {
+            let address = Address::parse_with_params(&r.address, params).map_err(rerr)?;
+            let asset = AssetId::from_str(&r.asset_id).map_err(rerr)?;
+            // Sequentia defaults to explicit (tb1) recipients; confidential
+            // (tsqb1) go through the blinded path.
+            b = if address.blinding_pubkey.is_some() {
+                b.add_recipient(&address, r.satoshi, asset).map_err(rerr)?
+            } else {
+                b.add_explicit_recipient(&address, r.satoshi, asset).map_err(rerr)?
+            };
+        }
+        apply_fee_and_finish(b, wollet, fee_rate_sat_kvb, fee_asset.as_ref())
+    })
 }
 
 /// Sign a PSET with the software signer (mnemonic read transiently, never
@@ -226,46 +210,75 @@ pub struct TxRow {
 /// Sync and return the wallet's transaction history (net signed per-asset deltas
 /// per tx). Ordering is left to the UI.
 pub fn wallet_transactions(mnemonic: String, esplora_url: String) -> Result<Vec<TxRow>> {
-    let descriptor = crate::descriptor_from_mnemonic(&mnemonic).map_err(err)?;
-    let mut wollet = crate::build_wollet(&descriptor).map_err(err)?;
-    let mut client = EsploraClient::new(&esplora_url, crate::sequentia_testnet()).map_err(rerr)?;
-    if let Some(update) = client.full_scan(&wollet).map_err(rerr)? {
-        wollet.apply_update(update).map_err(rerr)?;
-    }
-    let rows = wollet
-        .transactions()
-        .map_err(rerr)?
-        .into_iter()
-        .map(|t| TxRow {
-            txid: t.txid.to_string(),
-            height: t.height,
-            timestamp: t.timestamp.map(|ts| ts as u64),
-            kind: t.type_,
-            fee: t.fee,
-            deltas: t
-                .balance
-                .iter()
-                .map(|(a, v)| AssetDelta {
-                    asset_id: a.to_string(),
-                    atoms: v.to_string(),
-                })
-                .collect(),
-        })
-        .collect();
-    Ok(rows)
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let rows = wollet
+            .transactions()
+            .map_err(rerr)?
+            .into_iter()
+            .map(|t| TxRow {
+                txid: t.txid.to_string(),
+                height: t.height,
+                timestamp: t.timestamp.map(|ts| ts as u64),
+                kind: t.type_,
+                fee: t.fee,
+                deltas: t
+                    .balance
+                    .iter()
+                    .map(|(a, v)| AssetDelta {
+                        asset_id: a.to_string(),
+                        atoms: v.to_string(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        Ok(rows)
+    })
 }
 
 // --- M6: RBF / CPFP rescue (cross-asset, RBF on by default) -----------------
 
-/// Build a wollet from the mnemonic and full-scan it against esplora.
-fn build_wollet_synced(mnemonic: &str, esplora_url: &str) -> Result<lwk_wollet::Wollet> {
+/// Process-lifetime wallet cache, keyed by descriptor. Keeping the scanned
+/// `Wollet` between calls is the whole performance story: lwk's `full_scan` is
+/// INCREMENTAL when the wallet already holds state, so a cached wallet syncs only
+/// new data instead of re-scanning every address from scratch on every balance
+/// refresh, tab switch, history view, and build. `Wollet` is not `Clone`, so
+/// operations run against the cached wallet under the lock via
+/// [`with_synced_wollet`].
+fn wollet_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, lwk_wollet::Wollet>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, lwk_wollet::Wollet>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Sync the cached wallet (incrementally) and run `f` against it. All blockchain
+/// reads/builds go through here so they share one persistent, incrementally
+/// scanned wallet per descriptor.
+fn with_synced_wollet<T>(
+    mnemonic: &str,
+    esplora_url: &str,
+    f: impl FnOnce(&lwk_wollet::Wollet) -> Result<T>,
+) -> Result<T> {
     let descriptor = crate::descriptor_from_mnemonic(mnemonic).map_err(err)?;
-    let mut wollet = crate::build_wollet(&descriptor).map_err(err)?;
+    let mut guard = wollet_cache()
+        .lock()
+        .map_err(|e| err(format!("wallet cache lock: {e}")))?;
+    if !guard.contains_key(&descriptor) {
+        let w = crate::build_wollet(&descriptor).map_err(err)?;
+        guard.insert(descriptor.clone(), w);
+    }
+    let wollet = guard.get_mut(&descriptor).expect("just inserted");
     let mut client = EsploraClient::new(esplora_url, crate::sequentia_testnet()).map_err(rerr)?;
-    if let Some(update) = client.full_scan(&wollet).map_err(rerr)? {
+    if let Some(update) = client.full_scan(&*wollet).map_err(rerr)? {
         wollet.apply_update(update).map_err(rerr)?;
     }
-    Ok(wollet)
+    f(&*wollet)
+}
+
+/// Forget any cached wallet state (called when the wallet is removed).
+pub fn clear_wallet_cache() {
+    if let Ok(mut guard) = wollet_cache().lock() {
+        guard.clear();
+    }
 }
 
 /// Default fee rate (2 sat/vB) for any tx that does not set its own. The lwk
@@ -297,9 +310,10 @@ pub fn build_rbf_bump_tx(
     fee_rate_sat_kvb: f32,
     fee_asset: Option<FeeAsset>,
 ) -> Result<String> {
-    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
-    let b = wollet.bump_fee_of(Txid::from_str(&txid).map_err(rerr)?).map_err(rerr)?;
-    apply_fee_and_finish(b, &wollet, Some(fee_rate_sat_kvb), fee_asset.as_ref())
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let b = wollet.bump_fee_of(Txid::from_str(&txid).map_err(rerr)?).map_err(rerr)?;
+        apply_fee_and_finish(b, wollet, Some(fee_rate_sat_kvb), fee_asset.as_ref())
+    })
 }
 
 /// RBF replace: same inputs, brand-new recipients — to correct a still-pending
@@ -315,19 +329,20 @@ pub fn build_rbf_replace_tx(
     if new_recipients.is_empty() {
         return Err(err("a replacement needs at least one recipient".to_string()));
     }
-    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
-    let mut b = wollet.replace_tx_of(Txid::from_str(&txid).map_err(rerr)?).map_err(rerr)?;
-    let params = crate::sequentia_testnet().address_params();
-    for r in &new_recipients {
-        let address = Address::parse_with_params(&r.address, params).map_err(rerr)?;
-        let asset = AssetId::from_str(&r.asset_id).map_err(rerr)?;
-        b = if address.blinding_pubkey.is_some() {
-            b.add_recipient(&address, r.satoshi, asset).map_err(rerr)?
-        } else {
-            b.add_explicit_recipient(&address, r.satoshi, asset).map_err(rerr)?
-        };
-    }
-    apply_fee_and_finish(b, &wollet, Some(fee_rate_sat_kvb), fee_asset.as_ref())
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let mut b = wollet.replace_tx_of(Txid::from_str(&txid).map_err(rerr)?).map_err(rerr)?;
+        let params = crate::sequentia_testnet().address_params();
+        for r in &new_recipients {
+            let address = Address::parse_with_params(&r.address, params).map_err(rerr)?;
+            let asset = AssetId::from_str(&r.asset_id).map_err(rerr)?;
+            b = if address.blinding_pubkey.is_some() {
+                b.add_recipient(&address, r.satoshi, asset).map_err(rerr)?
+            } else {
+                b.add_explicit_recipient(&address, r.satoshi, asset).map_err(rerr)?
+            };
+        }
+        apply_fee_and_finish(b, wollet, Some(fee_rate_sat_kvb), fee_asset.as_ref())
+    })
 }
 
 /// CPFP: a child that spends the parent's unconfirmed wallet output and pays a
@@ -339,9 +354,10 @@ pub fn build_cpfp_tx(
     fee_rate_sat_kvb: f32,
     fee_asset: Option<FeeAsset>,
 ) -> Result<String> {
-    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
-    let b = wollet.cpfp_of(Txid::from_str(&parent_txid).map_err(rerr)?).map_err(rerr)?;
-    apply_fee_and_finish(b, &wollet, Some(fee_rate_sat_kvb), fee_asset.as_ref())
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let b = wollet.cpfp_of(Txid::from_str(&parent_txid).map_err(rerr)?).map_err(rerr)?;
+        apply_fee_and_finish(b, wollet, Some(fee_rate_sat_kvb), fee_asset.as_ref())
+    })
 }
 
 /// A conservative child fee rate (sat/kvb) that lifts the {parent, child}
@@ -352,10 +368,11 @@ pub fn cpfp_suggested_feerate(
     parent_txid: String,
     target_feerate: f32,
 ) -> Result<f32> {
-    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
-    wollet
-        .cpfp_suggested_feerate(Txid::from_str(&parent_txid).map_err(rerr)?, target_feerate)
-        .map_err(rerr)
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        wollet
+            .cpfp_suggested_feerate(Txid::from_str(&parent_txid).map_err(rerr)?, target_feerate)
+            .map_err(rerr)
+    })
 }
 
 // --- M7: asset issuance / reissue / burn + staking --------------------------
@@ -370,11 +387,12 @@ pub fn build_issue_tx(
     token_sats: u64,
     fee_rate_sat_kvb: Option<f32>,
 ) -> Result<String> {
-    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
-    let b = TxBuilder::new(crate::sequentia_testnet())
-        .issue_asset(asset_sats, None, token_sats, None, None)
-        .map_err(rerr)?;
-    apply_fee_and_finish(b, &wollet, fee_rate_sat_kvb, None)
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let b = TxBuilder::new(crate::sequentia_testnet())
+            .issue_asset(asset_sats, None, token_sats, None, None)
+            .map_err(rerr)?;
+        apply_fee_and_finish(b, wollet, fee_rate_sat_kvb, None)
+    })
 }
 
 /// Reissue more of an existing asset (needs its reissuance token in this wallet).
@@ -385,12 +403,13 @@ pub fn build_reissue_tx(
     satoshi: u64,
     fee_rate_sat_kvb: Option<f32>,
 ) -> Result<String> {
-    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
-    let asset = AssetId::from_str(&asset_id).map_err(rerr)?;
-    let b = TxBuilder::new(crate::sequentia_testnet())
-        .reissue_asset(asset, satoshi, None, None)
-        .map_err(rerr)?;
-    apply_fee_and_finish(b, &wollet, fee_rate_sat_kvb, None)
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let asset = AssetId::from_str(&asset_id).map_err(rerr)?;
+        let b = TxBuilder::new(crate::sequentia_testnet())
+            .reissue_asset(asset, satoshi, None, None)
+            .map_err(rerr)?;
+        apply_fee_and_finish(b, wollet, fee_rate_sat_kvb, None)
+    })
 }
 
 /// Permanently destroy `satoshi` atoms of an asset.
@@ -401,12 +420,13 @@ pub fn build_burn_tx(
     satoshi: u64,
     fee_rate_sat_kvb: Option<f32>,
 ) -> Result<String> {
-    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
-    let asset = AssetId::from_str(&asset_id).map_err(rerr)?;
-    let b = TxBuilder::new(crate::sequentia_testnet())
-        .add_burn(satoshi, asset)
-        .map_err(rerr)?;
-    apply_fee_and_finish(b, &wollet, fee_rate_sat_kvb, None)
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let asset = AssetId::from_str(&asset_id).map_err(rerr)?;
+        let b = TxBuilder::new(crate::sequentia_testnet())
+            .add_burn(satoshi, asset)
+            .map_err(rerr)?;
+        apply_fee_and_finish(b, wollet, fee_rate_sat_kvb, None)
+    })
 }
 
 /// The 33-byte staker public key (compressed hex) at m/2/0 — the key a stake is
@@ -438,8 +458,9 @@ pub fn build_stake_tx(
     if satoshi < MIN_STAKE_ATOMS {
         return Err(err("minimum stake is 40,000 tSEQ".to_string()));
     }
-    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
-    let pubkey = PublicKey::from_str(&staker_pubkey).map_err(rerr)?.serialize();
-    let b = TxBuilder::new(crate::sequentia_testnet()).add_stake_output(&pubkey, csv, satoshi);
-    apply_fee_and_finish(b, &wollet, fee_rate_sat_kvb, None)
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let pubkey = PublicKey::from_str(&staker_pubkey).map_err(rerr)?.serialize();
+        let b = TxBuilder::new(crate::sequentia_testnet()).add_stake_output(&pubkey, csv, satoshi);
+        apply_fee_and_finish(b, wollet, fee_rate_sat_kvb, None)
+    })
 }

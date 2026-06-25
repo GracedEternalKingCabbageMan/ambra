@@ -8,6 +8,7 @@ import '../data/format.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
+import 'scan_screen.dart';
 
 class SendTab extends StatefulWidget {
   const SendTab({super.key, this.isActive = false});
@@ -193,6 +194,25 @@ class _SendTabState extends State<SendTab> {
 
   void _snack(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
 
+  /// Scan a QR into the recipient field. Accepts a plain address or a BIP21-style
+  /// URI (scheme:address?amount=...); the build step validates the address.
+  Future<void> _scan() async {
+    final raw = await Navigator.of(context).push<String>(MaterialPageRoute(builder: (_) => const ScanScreen()));
+    if (raw == null || !mounted) return;
+    var s = raw.trim();
+    if (s.contains(':')) s = s.substring(s.indexOf(':') + 1); // drop any URI scheme
+    String? amount;
+    final q = s.indexOf('?');
+    if (q >= 0) {
+      amount = Uri.splitQueryString(s.substring(q + 1))['amount'];
+      s = s.substring(0, q);
+    }
+    setState(() {
+      _addr.text = s;
+      if (amount != null && double.tryParse(amount) != null) _amount.text = amount;
+    });
+  }
+
   Future<void> _review() async {
     final label = SeqAssets.labelFor(_assetId);
     final addr = _addr.text.trim();
@@ -293,7 +313,17 @@ class _SendTabState extends State<SendTab> {
                 onTap: _pickAsset,
               ),
               const SizedBox(height: 18),
-              AmbraField(label: 'Recipient address', controller: _addr, hint: 'tb1… or tsqb1…', mono: true),
+              AmbraField(
+                label: 'Recipient address',
+                controller: _addr,
+                hint: 'tb1… or tsqb1…',
+                mono: true,
+                suffix: IconButton(
+                  icon: const Icon(Icons.qr_code_scanner, color: AmbraColors.amber2),
+                  tooltip: 'Scan QR',
+                  onPressed: _scan,
+                ),
+              ),
               const SizedBox(height: 18),
               AmbraField(label: 'Amount (${label.ticker})', controller: _amount, hint: '0.0'),
               const SizedBox(height: 18),
