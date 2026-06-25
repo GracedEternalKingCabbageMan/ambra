@@ -30,7 +30,7 @@ class _SendTabState extends State<SendTab> {
   @override
   void initState() {
     super.initState();
-    _load();
+    if (widget.isActive) _load(); // lazy: load when first opened (also reloads on activation)
   }
 
   @override
@@ -66,6 +66,7 @@ class _SendTabState extends State<SendTab> {
       } catch (_) {/* fee-rate list unavailable; the default tSEQ fee still works */}
       if (!mounted) return;
       setState(() {
+        _error = null; // a successful load clears any earlier (transient) error
         _balances = s.balances;
         _feeRates = rates;
         // Default the send asset to one you hold (keep the current choice if it's
@@ -86,7 +87,10 @@ class _SendTabState extends State<SendTab> {
     } catch (e) {
       if (mounted) {
         setState(() {
-          if (_balances.isEmpty) _error = friendlyError(e); // keep last-good on a transient reload error
+          // Keep last-good data on a transient reload error; only surface it when
+          // there's nothing to show. Send has no pull-to-refresh, so don't tell
+          // the user to "pull down" — the error card carries a Retry button.
+          if (_balances.isEmpty) _error = friendlyError(e, pullToRefresh: false);
           _loading = false;
         });
       }
@@ -255,7 +259,13 @@ class _SendTabState extends State<SendTab> {
             if (_loading)
               const Padding(padding: EdgeInsets.only(top: 40), child: Center(child: CircularProgressIndicator(color: AmbraColors.amber)))
             else if (_error != null)
-              AmbraCard(child: Text(_error!, style: const TextStyle(color: AmbraColors.red)))
+              AmbraCard(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                  Text(_error!, style: const TextStyle(color: AmbraColors.red)),
+                  const SizedBox(height: 14),
+                  SecondaryButton(label: 'Retry', icon: Icons.refresh, onPressed: _load),
+                ]),
+              )
             else if (held.isEmpty)
               const AmbraCard(
                   child: Text(

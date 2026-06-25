@@ -62,7 +62,7 @@ class _BalanceTabState extends State<BalanceTab> {
   void initState() {
     super.initState();
     PriceService.instance.addListener(_onPrice);
-    _refresh();
+    if (widget.isActive) _refresh(); // lazy: non-active tabs load on activation
   }
 
   @override
