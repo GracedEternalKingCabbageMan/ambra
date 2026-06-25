@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `err`, `esplora_client`, `rerr`, `with_synced_wollet`, `wollet_cache`
+// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `clear_scan_marks`, `err`, `esplora_client`, `last_scan`, `mark_scanned`, `rerr`, `scan_into`, `scanned_recently`, `with_synced_wollet`, `wollet_cache`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
 String networkName() => RustLib.instance.api.crateApiNetworkName();
@@ -121,6 +121,11 @@ Future<List<TxRow>> walletTransactions({
 /// Forget any cached wallet state (called when the wallet is removed).
 Future<void> clearWalletCache() =>
     RustLib.instance.api.crateApiClearWalletCache();
+
+/// Read the network fee out of a built (unsigned) PSET so the review can show an
+/// estimate. For an any-asset-fee tx this is the chosen fee asset, not tSEQ.
+Future<PsetFee> psetFee({required String pset}) =>
+    RustLib.instance.api.crateApiPsetFee(pset: pset);
 
 /// RBF fee-bump: re-send the SAME payment at a higher fee (optionally in another
 /// asset). The replacement's reference (rfa) fee must exceed the original's.
@@ -332,6 +337,25 @@ class FeeAsset {
           runtimeType == other.runtimeType &&
           assetId == other.assetId &&
           rate == other.rate;
+}
+
+/// The network fee of a built PSET: the fee output's asset and amount (atoms).
+class PsetFee {
+  final String assetId;
+  final String atoms;
+
+  const PsetFee({required this.assetId, required this.atoms});
+
+  @override
+  int get hashCode => assetId.hashCode ^ atoms.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is PsetFee &&
+          runtimeType == other.runtimeType &&
+          assetId == other.assetId &&
+          atoms == other.atoms;
 }
 
 /// A send recipient: who, which asset, how many atoms.

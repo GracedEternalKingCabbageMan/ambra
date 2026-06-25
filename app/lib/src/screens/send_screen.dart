@@ -5,6 +5,7 @@ import '../rust/api.dart' as core;
 import '../data/api_client.dart';
 import '../data/config.dart';
 import '../data/format.dart';
+import '../data/price_service.dart';
 import '../data/wallet_cache.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
@@ -371,7 +372,9 @@ class _SendTabState extends State<SendTab> {
                   style: AmbraText.sub,
                 ),
               const SizedBox(height: 16),
-              AmbraField(label: 'Fee rate ($_feeLabel/vB, optional)', controller: _feeRateCtl, hint: '2'),
+              // The network fee rate (priority) in sat/vByte; the actual fee is paid
+              // in the asset above and is shown, estimated, on the review screen.
+              AmbraField(label: 'Fee rate (sat/vB, optional)', controller: _feeRateCtl, hint: '2'),
             ],
           ]),
         ),
@@ -437,10 +440,65 @@ class _ReviewSheet extends StatefulWidget {
 }
 
 class _ReviewSheetState extends State<_ReviewSheet> {
-  bool _busy = false;
+  bool _busy = false; // signing + broadcasting
+  bool _loading = true; // building the tx to estimate the fee
   String? _error;
+  String? _pset; // built up front so the fee estimate is the exact tx we send
+  core.PsetFee? _feeEst;
+
+  @override
+  void initState() {
+    super.initState();
+    _prepare();
+  }
+
+  /// Build the actual transaction now so the review can show the real fee (in
+  /// the chosen asset), then reuse that exact PSET on confirm.
+  Future<void> _prepare() async {
+    try {
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) throw Exception('wallet unavailable');
+      final pset = await core.buildSendTx(
+        mnemonic: m,
+        esploraUrl: Backend.esplora,
+        recipients: [core.Recipient(address: widget.address, assetId: widget.assetId, satoshi: widget.atoms)],
+        feeRateSatKvb: widget.feeRateSatKvb,
+        feeAsset: widget.feeAsset,
+      );
+      core.PsetFee? fee;
+      try {
+        fee = await core.psetFee(pset: pset);
+      } catch (_) {/* the estimate is best-effort; the send still works */}
+      if (mounted) {
+        setState(() {
+          _pset = pset;
+          _feeEst = fee;
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = _pretty(e);
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  /// The estimated fee in the asset it's paid in, plus the reference equivalent.
+  String _feeEstStr() {
+    final f = _feeEst!;
+    final label = SeqAssets.labelFor(f.assetId);
+    final amt = formatAtoms(f.atoms, label.precision);
+    final ref = PriceService.instance.refValue(label.ticker, f.atoms, label.precision);
+    final refStr = ref != null ? '  (≈ ${PriceService.instance.fmtRef(ref)} ${PriceService.instance.ref})' : '';
+    return '$amt ${label.ticker}$refStr';
+  }
 
   Future<void> _confirm() async {
+    final pset = _pset;
+    if (pset == null) return;
     setState(() {
       _busy = true;
       _error = null;
@@ -456,13 +514,6 @@ class _ReviewSheetState extends State<_ReviewSheet> {
       }
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) throw Exception('wallet unavailable');
-      final pset = await core.buildSendTx(
-        mnemonic: m,
-        esploraUrl: Backend.esplora,
-        recipients: [core.Recipient(address: widget.address, assetId: widget.assetId, satoshi: widget.atoms)],
-        feeRateSatKvb: widget.feeRateSatKvb,
-        feeAsset: widget.feeAsset,
-      );
       final signed = await core.signPset(mnemonic: m, pset: pset);
       final txid = await core.finalizeAndBroadcast(mnemonic: m, esploraUrl: Backend.esplora, pset: signed);
       if (mounted) Navigator.pop(context, txid);
@@ -491,13 +542,17 @@ class _ReviewSheetState extends State<_ReviewSheet> {
               _Row('To', widget.address, mono: true),
               _Row('Network', 'sequentia-testnet'),
               _Row('Fee paid in', widget.feeLabel),
-              _Row('Fee rate', '${(widget.feeRateSatKvb ?? 2000) ~/ 1000} ${widget.feeLabel}/vB'),
+              _Row('Network fee (est.)', _loading ? 'estimating…' : (_feeEst != null ? _feeEstStr() : 'unavailable')),
             ]),
           ),
           const SizedBox(height: 14),
           if (_error != null)
             Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
-          PrimaryButton(label: 'Confirm & sign', busy: _busy, icon: Icons.fingerprint, onPressed: _busy ? null : _confirm),
+          PrimaryButton(
+              label: 'Confirm & sign',
+              busy: _busy,
+              icon: Icons.fingerprint,
+              onPressed: (_busy || _loading || _pset == null) ? null : _confirm),
           const SizedBox(height: 6),
           GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
         ]),

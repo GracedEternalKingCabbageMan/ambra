@@ -84,6 +84,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw);
 
   @protected
+  PsetFee dco_decode_pset_fee(dynamic raw);
+
+  @protected
   Recipient dco_decode_recipient(dynamic raw);
 
   @protected
@@ -168,6 +171,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BigInt? sse_decode_opt_box_autoadd_u_64(SseDeserializer deserializer);
+
+  @protected
+  PsetFee sse_decode_pset_fee(SseDeserializer deserializer);
 
   @protected
   Recipient sse_decode_recipient(SseDeserializer deserializer);
@@ -276,6 +282,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_opt_box_autoadd_u_64(BigInt? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_pset_fee(PsetFee self, SseSerializer serializer);
 
   @protected
   void sse_encode_recipient(Recipient self, SseSerializer serializer);

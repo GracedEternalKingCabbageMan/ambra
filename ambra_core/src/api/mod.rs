@@ -412,6 +412,30 @@ fn apply_fee_and_finish(
     Ok(b.finish(wollet).map_err(rerr)?.to_string())
 }
 
+/// The network fee of a built PSET: the fee output's asset and amount (atoms).
+pub struct PsetFee {
+    pub asset_id: String,
+    pub atoms: String,
+}
+
+/// Read the network fee out of a built (unsigned) PSET so the review can show an
+/// estimate. For an any-asset-fee tx this is the chosen fee asset, not tSEQ.
+pub fn pset_fee(pset: String) -> Result<PsetFee> {
+    let p = PartiallySignedTransaction::from_str(&pset).map_err(rerr)?;
+    let tx = p.extract_tx().map_err(rerr)?;
+    for o in &tx.output {
+        if o.is_fee() {
+            let atoms = o.value.explicit().ok_or_else(|| err("fee value not explicit".to_string()))?;
+            let asset = o.asset.explicit().ok_or_else(|| err("fee asset not explicit".to_string()))?;
+            return Ok(PsetFee {
+                asset_id: asset.to_string(),
+                atoms: atoms.to_string(),
+            });
+        }
+    }
+    Err(err("pset has no fee output".to_string()))
+}
+
 /// RBF fee-bump: re-send the SAME payment at a higher fee (optionally in another
 /// asset). The replacement's reference (rfa) fee must exceed the original's.
 pub fn build_rbf_bump_tx(
