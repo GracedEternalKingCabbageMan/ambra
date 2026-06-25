@@ -308,6 +308,9 @@ pub fn build_rbf_replace_tx(
     fee_rate_sat_kvb: f32,
     fee_asset: Option<FeeAsset>,
 ) -> Result<String> {
+    if new_recipients.is_empty() {
+        return Err(err("a replacement needs at least one recipient".to_string()));
+    }
     let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
     let mut b = wollet.replace_tx_of(Txid::from_str(&txid).map_err(rerr)?).map_err(rerr)?;
     let params = crate::sequentia_testnet().address_params();

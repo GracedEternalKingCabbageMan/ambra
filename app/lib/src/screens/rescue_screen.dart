@@ -168,6 +168,14 @@ class _RescueFeeSheetState extends State<_RescueFeeSheet> {
       }
       feeAsset = core.FeeAsset(assetId: _feeAsset!, rate: r);
     }
+    final feeBal =
+        BigInt.tryParse(_feeAsset == null ? _balanceOf(SeqAssets.policy) : _balanceOf(_feeAsset!)) ?? BigInt.zero;
+    if (feeBal <= BigInt.zero) {
+      setState(() => _error = _feeAsset == null
+          ? 'You need some tSEQ to pay the fee.'
+          : 'You have no $_feeLabel to pay the fee with.');
+      return;
+    }
     setState(() {
       _busy = true;
       _error = null;
@@ -257,8 +265,14 @@ class _RescueFeeSheetState extends State<_RescueFeeSheet> {
 
 String _pretty(Object e) {
   final s = e.toString().replaceFirst('Exception: ', '');
-  if (s.contains('bad-txns-spends-conflicting') || s.toLowerCase().contains('insufficient')) {
-    return 'Rescue failed — try a higher fee rate, or pay the fee in a more widely-accepted asset.';
+  final low = s.toLowerCase();
+  if (low.contains('not enough additional fees') ||
+      low.contains('replacement') ||
+      low.contains('bad-txns-spends-conflicting')) {
+    return 'The new fee must exceed the original — raise the fee rate and try again.';
+  }
+  if (low.contains('insufficient')) {
+    return 'Not enough funds for the higher fee. Try a smaller fee, or pay it in another accepted asset.';
   }
   return s.length > 200 ? '${s.substring(0, 200)}…' : s;
 }

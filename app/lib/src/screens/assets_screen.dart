@@ -4,8 +4,13 @@ import '../rust/api.dart' as core;
 import '../data/config.dart';
 import '../data/format.dart';
 import '../data/tx_flow.dart';
+import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
+
+/// Precision Ambra issues/displays unnamed assets at (matches the unknown-asset
+/// display fallback, so an issued "1000" shows back as "1000").
+const int _issuePrecision = 8;
 
 class AssetsScreen extends StatefulWidget {
   const AssetsScreen({super.key});
@@ -18,6 +23,7 @@ class _AssetsScreenState extends State<AssetsScreen> {
   final _issueTokens = TextEditingController(text: '1');
   final _otherAsset = TextEditingController();
   final _otherAmount = TextEditingController();
+  List<core.AssetBalance> _balances = [];
   bool _busy = false;
 
   @override
@@ -29,32 +35,100 @@ class _AssetsScreenState extends State<AssetsScreen> {
     super.dispose();
   }
 
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final m = await WalletRepository.instance.readMnemonic();
+    if (m == null) return;
+    try {
+      final s = await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
+      if (mounted) setState(() => _balances = s.balances);
+    } catch (_) {}
+  }
+
+  BigInt _bal(String id) {
+    for (final b in _balances) {
+      if (b.assetId == id) return BigInt.tryParse(b.atoms) ?? BigInt.zero;
+    }
+    return BigInt.zero;
+  }
+
+  bool get _hasTseq => _bal(SeqAssets.policy) > BigInt.zero;
+  bool _tooBig(BigInt v) => v >= (BigInt.one << 64);
   void _snack(String s) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(s)));
+
+  Future<bool> _confirm({required String title, required String body, bool danger = false}) async {
+    final r = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: AmbraColors.panel,
+        title: Text(title, style: AmbraText.title),
+        content: Text(body, style: AmbraText.muted),
+        actions: [
+          GhostButton(label: 'Cancel', onPressed: () => Navigator.pop(context, false)),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: Text(danger ? 'Burn' : 'Confirm',
+                style: TextStyle(color: danger ? AmbraColors.red : AmbraColors.amber2, fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+    return r == true;
+  }
 
   Future<void> _run(String action, Future<String> Function(String m) build) async {
     setState(() => _busy = true);
     try {
       final txid = await authorizeBuildBroadcast(build);
       if (mounted) _snack('$action — ${txid.substring(0, 16)}…');
+      _load();
     } catch (e) {
-      if (mounted) _snack('$action failed: ${_short(e)}');
+      if (mounted) _snack('$action failed: ${friendlyError(e)}');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
-  void _issue() {
-    final amt = BigInt.tryParse(_issueAmount.text.trim());
+  Future<void> _issue() async {
+    final amt = parseAtoms(_issueAmount.text, _issuePrecision);
     final tok = BigInt.tryParse(_issueTokens.text.trim()) ?? BigInt.zero;
     if (amt == null || amt <= BigInt.zero) return _snack('Enter an amount to issue');
-    _run('Issued asset',
-        (m) => core.buildIssueTx(mnemonic: m, esploraUrl: Backend.esplora, assetSats: amt, tokenSats: tok));
+    if (_tooBig(amt) || _tooBig(tok)) return _snack('Amount is too large');
+    if (!_hasTseq) return _snack('You need some tSEQ for the network fee. Use the faucet (More tab).');
+    final ok = await _confirm(
+      title: 'Issue new asset',
+      body: 'Mint ${formatAtoms(amt.toString(), _issuePrecision)} units of a new asset'
+          '${tok > BigInt.zero ? ' + $tok reissuance token(s)' : ''} to this wallet.\n\n'
+          'A network fee in tSEQ applies. The asset has no name/ticker metadata yet.',
+    );
+    if (!ok || !mounted) return;
+    _run('Issued asset', (m) => core.buildIssueTx(mnemonic: m, esploraUrl: Backend.esplora, assetSats: amt, tokenSats: tok));
   }
 
-  void _reissueOrBurn(bool burn) {
-    final id = _otherAsset.text.trim();
-    final amt = parseAtoms(_otherAmount.text, SeqAssets.labelFor(id).precision);
-    if (id.length < 64 || amt == null || amt <= BigInt.zero) return _snack('Enter a 64-hex asset id + amount');
+  Future<void> _reissueOrBurn(bool burn) async {
+    final id = _otherAsset.text.trim().toLowerCase();
+    final label = SeqAssets.labelFor(id);
+    final amt = parseAtoms(_otherAmount.text, label.precision);
+    if (id.length != 64 || amt == null || amt <= BigInt.zero) return _snack('Enter a 64-hex asset id + amount');
+    if (_tooBig(amt)) return _snack('Amount is too large');
+    if (!_hasTseq) return _snack('You need some tSEQ for the network fee. Use the faucet (More tab).');
+    final known = label.subtitle != null; // a built-in asset => precision is known
+    final line = '${formatAtoms(amt.toString(), label.precision)} ${label.ticker}  (${amt.toString()} atoms)';
+    final ok = await _confirm(
+      title: burn ? 'Burn asset' : 'Reissue asset',
+      danger: burn,
+      body: burn
+          ? 'Permanently destroy $line.\n\nThis CANNOT be undone.'
+              '${known ? '' : "\n\nThis asset's precision is unknown — the atom amount above is exactly what will be destroyed."}'
+          : 'Reissue $line. This needs the asset\'s reissuance token in this wallet.'
+              '${known ? '' : "\n\nPrecision unknown — the atom amount above is what will be minted."}',
+    );
+    if (!ok || !mounted) return;
     if (burn) {
       _run('Burned', (m) => core.buildBurnTx(mnemonic: m, esploraUrl: Backend.esplora, assetId: id, satoshi: amt));
     } else {
@@ -80,7 +154,7 @@ class _AssetsScreenState extends State<AssetsScreen> {
               child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
                 const SectionLabel('Issue a new asset'),
                 const SizedBox(height: 12),
-                AmbraField(label: 'Amount to issue', controller: _issueAmount, hint: '1000'),
+                AmbraField(label: 'Amount to issue (units)', controller: _issueAmount, hint: '1000'),
                 const SizedBox(height: 14),
                 AmbraField(label: 'Reissuance tokens', controller: _issueTokens),
                 const SizedBox(height: 16),
@@ -105,7 +179,8 @@ class _AssetsScreenState extends State<AssetsScreen> {
             ),
             const SizedBox(height: 14),
             const Text(
-              "Reissue needs the asset's reissuance token in this wallet. Burn permanently destroys the amount.",
+              "Reissue needs the asset's reissuance token in this wallet. Burn permanently destroys "
+              'the amount and asks you to confirm first.',
               style: AmbraText.sub,
             ),
             if (_busy)
@@ -115,9 +190,4 @@ class _AssetsScreenState extends State<AssetsScreen> {
       ),
     );
   }
-}
-
-String _short(Object e) {
-  final s = e.toString().replaceFirst('Exception: ', '');
-  return s.length > 140 ? '${s.substring(0, 140)}…' : s;
 }
