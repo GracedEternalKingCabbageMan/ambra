@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `err`, `rerr`
+// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `build_wollet_synced`, `err`, `rerr`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
 String networkName() => RustLib.instance.api.crateApiNetworkName();
@@ -57,7 +57,8 @@ Future<WalletSync> syncWallet({
   esploraUrl: esploraUrl,
 );
 
-/// Quick format-level validity check of a recipient address.
+/// Validate a recipient address is a well-formed **Sequentia** address (rejects
+/// foreign-network addresses).
 Future<void> validateAddress({required String address}) =>
     RustLib.instance.api.crateApiValidateAddress(address: address);
 
@@ -103,6 +104,70 @@ Future<List<TxRow>> walletTransactions({
 }) => RustLib.instance.api.crateApiWalletTransactions(
   mnemonic: mnemonic,
   esploraUrl: esploraUrl,
+);
+
+/// RBF fee-bump: re-send the SAME payment at a higher fee (optionally in another
+/// asset). The replacement's reference (rfa) fee must exceed the original's.
+Future<String> buildRbfBumpTx({
+  required String mnemonic,
+  required String esploraUrl,
+  required String txid,
+  required double feeRateSatKvb,
+  FeeAsset? feeAsset,
+}) => RustLib.instance.api.crateApiBuildRbfBumpTx(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  txid: txid,
+  feeRateSatKvb: feeRateSatKvb,
+  feeAsset: feeAsset,
+);
+
+/// RBF replace: same inputs, brand-new recipients — to correct a still-pending
+/// payment's address/asset/amount.
+Future<String> buildRbfReplaceTx({
+  required String mnemonic,
+  required String esploraUrl,
+  required String txid,
+  required List<Recipient> newRecipients,
+  required double feeRateSatKvb,
+  FeeAsset? feeAsset,
+}) => RustLib.instance.api.crateApiBuildRbfReplaceTx(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  txid: txid,
+  newRecipients: newRecipients,
+  feeRateSatKvb: feeRateSatKvb,
+  feeAsset: feeAsset,
+);
+
+/// CPFP: a child that spends the parent's unconfirmed wallet output and pays a
+/// high fee (in any accepted asset) to lift the {parent, child} package.
+Future<String> buildCpfpTx({
+  required String mnemonic,
+  required String esploraUrl,
+  required String parentTxid,
+  required double feeRateSatKvb,
+  FeeAsset? feeAsset,
+}) => RustLib.instance.api.crateApiBuildCpfpTx(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  parentTxid: parentTxid,
+  feeRateSatKvb: feeRateSatKvb,
+  feeAsset: feeAsset,
+);
+
+/// A conservative child fee rate (sat/kvb) that lifts the {parent, child}
+/// package to `target_feerate`.
+Future<double> cpfpSuggestedFeerate({
+  required String mnemonic,
+  required String esploraUrl,
+  required String parentTxid,
+  required double targetFeerate,
+}) => RustLib.instance.api.crateApiCpfpSuggestedFeerate(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  parentTxid: parentTxid,
+  targetFeerate: targetFeerate,
 );
 
 /// A receive address together with the derivation index it came from.

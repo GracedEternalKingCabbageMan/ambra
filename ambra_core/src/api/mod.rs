@@ -12,7 +12,7 @@ use lwk_common::Signer;
 use lwk_signer::SwSigner;
 use lwk_wollet::clients::blocking::{BlockchainBackend, EsploraClient};
 use lwk_wollet::elements::pset::PartiallySignedTransaction;
-use lwk_wollet::elements::{Address, AssetId};
+use lwk_wollet::elements::{Address, AssetId, Txid};
 use lwk_wollet::TxBuilder;
 
 fn err(s: String) -> anyhow::Error {
@@ -251,4 +251,100 @@ pub fn wallet_transactions(mnemonic: String, esplora_url: String) -> Result<Vec<
         })
         .collect();
     Ok(rows)
+}
+
+// --- M6: RBF / CPFP rescue (cross-asset, RBF on by default) -----------------
+
+/// Build a wollet from the mnemonic and full-scan it against esplora.
+fn build_wollet_synced(mnemonic: &str, esplora_url: &str) -> Result<lwk_wollet::Wollet> {
+    let descriptor = crate::descriptor_from_mnemonic(mnemonic).map_err(err)?;
+    let mut wollet = crate::build_wollet(&descriptor).map_err(err)?;
+    let mut client = EsploraClient::new(esplora_url, crate::sequentia_testnet()).map_err(rerr)?;
+    if let Some(update) = client.full_scan(&wollet).map_err(rerr)? {
+        wollet.apply_update(update).map_err(rerr)?;
+    }
+    Ok(wollet)
+}
+
+/// Chain an optional fee rate + optional any-asset fee onto a builder, finish.
+fn apply_fee_and_finish(
+    mut b: TxBuilder,
+    wollet: &lwk_wollet::Wollet,
+    fee_rate_sat_kvb: Option<f32>,
+    fee_asset: Option<&FeeAsset>,
+) -> Result<String> {
+    if let Some(fr) = fee_rate_sat_kvb {
+        b = b.fee_rate(Some(fr));
+    }
+    if let Some(fa) = fee_asset {
+        b = b.fee_asset(AssetId::from_str(&fa.asset_id).map_err(rerr)?, fa.rate);
+    }
+    Ok(b.finish(wollet).map_err(rerr)?.to_string())
+}
+
+/// RBF fee-bump: re-send the SAME payment at a higher fee (optionally in another
+/// asset). The replacement's reference (rfa) fee must exceed the original's.
+pub fn build_rbf_bump_tx(
+    mnemonic: String,
+    esplora_url: String,
+    txid: String,
+    fee_rate_sat_kvb: f32,
+    fee_asset: Option<FeeAsset>,
+) -> Result<String> {
+    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
+    let b = wollet.bump_fee_of(Txid::from_str(&txid).map_err(rerr)?).map_err(rerr)?;
+    apply_fee_and_finish(b, &wollet, Some(fee_rate_sat_kvb), fee_asset.as_ref())
+}
+
+/// RBF replace: same inputs, brand-new recipients — to correct a still-pending
+/// payment's address/asset/amount.
+pub fn build_rbf_replace_tx(
+    mnemonic: String,
+    esplora_url: String,
+    txid: String,
+    new_recipients: Vec<Recipient>,
+    fee_rate_sat_kvb: f32,
+    fee_asset: Option<FeeAsset>,
+) -> Result<String> {
+    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
+    let mut b = wollet.replace_tx_of(Txid::from_str(&txid).map_err(rerr)?).map_err(rerr)?;
+    let params = crate::sequentia_testnet().address_params();
+    for r in &new_recipients {
+        let address = Address::parse_with_params(&r.address, params).map_err(rerr)?;
+        let asset = AssetId::from_str(&r.asset_id).map_err(rerr)?;
+        b = if address.blinding_pubkey.is_some() {
+            b.add_recipient(&address, r.satoshi, asset).map_err(rerr)?
+        } else {
+            b.add_explicit_recipient(&address, r.satoshi, asset).map_err(rerr)?
+        };
+    }
+    apply_fee_and_finish(b, &wollet, Some(fee_rate_sat_kvb), fee_asset.as_ref())
+}
+
+/// CPFP: a child that spends the parent's unconfirmed wallet output and pays a
+/// high fee (in any accepted asset) to lift the {parent, child} package.
+pub fn build_cpfp_tx(
+    mnemonic: String,
+    esplora_url: String,
+    parent_txid: String,
+    fee_rate_sat_kvb: f32,
+    fee_asset: Option<FeeAsset>,
+) -> Result<String> {
+    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
+    let b = wollet.cpfp_of(Txid::from_str(&parent_txid).map_err(rerr)?).map_err(rerr)?;
+    apply_fee_and_finish(b, &wollet, Some(fee_rate_sat_kvb), fee_asset.as_ref())
+}
+
+/// A conservative child fee rate (sat/kvb) that lifts the {parent, child}
+/// package to `target_feerate`.
+pub fn cpfp_suggested_feerate(
+    mnemonic: String,
+    esplora_url: String,
+    parent_txid: String,
+    target_feerate: f32,
+) -> Result<f32> {
+    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
+    wollet
+        .cpfp_suggested_feerate(Txid::from_str(&parent_txid).map_err(rerr)?, target_feerate)
+        .map_err(rerr)
 }
