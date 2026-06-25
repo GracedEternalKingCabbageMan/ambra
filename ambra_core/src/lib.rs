@@ -65,16 +65,28 @@ pub fn set_data_dir(path: String) {
 
 /// Build a watch-only wallet for `descriptor` on Sequentia testnet. Holds no
 /// keys. When a data dir is set, restores prior scanned state from disk on build
-/// (and persists future updates there); otherwise starts empty.
+/// (and persists future updates there). If the on-disk store is missing or
+/// unreadable, falls back to a fresh in-memory wallet rather than failing: the
+/// next scan rebuilds and re-persists the state.
 pub fn build_wollet(descriptor: &str) -> AmbraResult<Wollet> {
+    if let Some(dir) = DATA_DIR.lock().ok().and_then(|g| g.clone()) {
+        let persisted = WolletDescriptor::from_str(descriptor)
+            .map_err(|e| format!("{e:?}"))
+            .and_then(|d| {
+                WolletBuilder::new(sequentia_testnet(), d)
+                    .with_legacy_fs_store(&dir)
+                    .map_err(|e| format!("{e:?}"))
+            })
+            .and_then(|b| b.build().map_err(|e| format!("{e:?}")));
+        if let Ok(w) = persisted {
+            return Ok(w);
+        }
+        // Fall through to a non-persisted wallet so a bad store never bricks the app.
+    }
     let desc = WolletDescriptor::from_str(descriptor).map_err(|e| format!("{e:?}"))?;
-    let builder = WolletBuilder::new(sequentia_testnet(), desc);
-    let datadir = DATA_DIR.lock().ok().and_then(|g| g.clone());
-    let builder = match datadir {
-        Some(dir) => builder.with_legacy_fs_store(&dir).map_err(|e| format!("{e:?}"))?,
-        None => builder,
-    };
-    builder.build().map_err(|e| format!("{e:?}"))
+    WolletBuilder::new(sequentia_testnet(), desc)
+        .build()
+        .map_err(|e| format!("{e:?}"))
 }
 
 /// Derive the **default (non-confidential)** receive address at `index` — a

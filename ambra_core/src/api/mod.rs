@@ -11,6 +11,7 @@ use anyhow::Result;
 use lwk_common::Signer;
 use lwk_signer::SwSigner;
 use lwk_wollet::clients::blocking::{BlockchainBackend, EsploraClient};
+use lwk_wollet::clients::EsploraClientBuilder;
 use lwk_wollet::elements::pset::PartiallySignedTransaction;
 use lwk_wollet::bitcoin::bip32::{ChildNumber, DerivationPath};
 use lwk_wollet::elements::{Address, AssetId, Txid};
@@ -193,7 +194,7 @@ pub fn finalize_and_broadcast(mnemonic: String, esplora_url: String, pset: Strin
     let wollet = crate::build_wollet(&descriptor).map_err(err)?;
     let mut p = PartiallySignedTransaction::from_str(&pset).map_err(rerr)?;
     let tx = wollet.finalize(&mut p).map_err(rerr)?;
-    let client = EsploraClient::new(&esplora_url, crate::sequentia_testnet()).map_err(rerr)?;
+    let client = esplora_client(&esplora_url).map_err(rerr)?;
     let txid = client.broadcast(&tx).map_err(rerr)?;
     Ok(txid.to_string())
 }
@@ -258,6 +259,14 @@ fn wollet_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String,
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// A blocking Esplora client with a 30s request timeout, so a hung connection
+/// errors out instead of holding the shared wallet lock indefinitely.
+fn esplora_client(url: &str) -> std::result::Result<EsploraClient, lwk_wollet::Error> {
+    EsploraClientBuilder::new(url, crate::sequentia_testnet())
+        .timeout(30)
+        .build_blocking()
+}
+
 /// Sync the cached wallet (incrementally) and run `f` against it. All blockchain
 /// reads/builds go through here so they share one persistent, incrementally
 /// scanned wallet per descriptor.
@@ -275,7 +284,7 @@ fn with_synced_wollet<T>(
         guard.insert(descriptor.clone(), w);
     }
     let wollet = guard.get_mut(&descriptor).expect("just inserted");
-    let mut client = EsploraClient::new(esplora_url, crate::sequentia_testnet()).map_err(rerr)?;
+    let mut client = esplora_client(esplora_url).map_err(rerr)?;
     if let Some(update) = client.full_scan(&*wollet).map_err(rerr)? {
         wollet.apply_update(update).map_err(rerr)?;
     }

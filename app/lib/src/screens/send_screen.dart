@@ -5,6 +5,7 @@ import '../rust/api.dart' as core;
 import '../data/api_client.dart';
 import '../data/config.dart';
 import '../data/format.dart';
+import '../data/wallet_cache.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
@@ -32,7 +33,25 @@ class _SendTabState extends State<SendTab> {
   @override
   void initState() {
     super.initState();
+    _loadCached(); // render the form from last-known balances at once
     _load(); // eager: load at launch (also reloads on activation)
+  }
+
+  /// Show the send form instantly using the last-known balances (shared with the
+  /// Balance tab's cache), so a cold start never blocks on a spinner. The live
+  /// sync below refreshes balances and fee rates in the background.
+  Future<void> _loadCached() async {
+    final b = await WalletCache.loadBalances();
+    if (b == null || !mounted || _balances.isNotEmpty) return; // don't clobber a finished sync
+    setState(() {
+      _balances = b;
+      final held = _heldIds();
+      if (!held.contains(_assetId)) {
+        _assetId = held.isNotEmpty ? held.first : SeqAssets.policy;
+      }
+      if (!_feeManual) _feeAsset = _defaultFeeFor(_assetId);
+      _loading = false;
+    });
   }
 
   @override
@@ -63,6 +82,7 @@ class _SendTabState extends State<SendTab> {
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) return;
       final s = await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
+      WalletCache.saveBalances(s.balances); // keep the shared cache fresh
       Map<String, BigInt> rates = {};
       try {
         rates = await ApiClient.feeRates();
