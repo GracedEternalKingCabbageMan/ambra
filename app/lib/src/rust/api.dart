@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `err`
+// These functions are ignored because they are not marked as `pub`: `err`, `rerr`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
 String networkName() => RustLib.instance.api.crateApiNetworkName();
@@ -57,6 +57,44 @@ Future<WalletSync> syncWallet({
   esploraUrl: esploraUrl,
 );
 
+/// Quick format-level validity check of a recipient address.
+Future<void> validateAddress({required String address}) =>
+    RustLib.instance.api.crateApiValidateAddress(address: address);
+
+/// Build an UNSIGNED send PSET (base64). Syncs first so the wallet has utxos.
+/// `fee_asset` pays the fee in a non-native asset at the EXACT published rate
+/// (never fabricated); `fee_rate_sat_kvb` None = builder default. RBF is on by
+/// default (so a stuck tx can be bump/CPFP-rescued later).
+Future<String> buildSendTx({
+  required String mnemonic,
+  required String esploraUrl,
+  required List<Recipient> recipients,
+  double? feeRateSatKvb,
+  FeeAsset? feeAsset,
+}) => RustLib.instance.api.crateApiBuildSendTx(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  recipients: recipients,
+  feeRateSatKvb: feeRateSatKvb,
+  feeAsset: feeAsset,
+);
+
+/// Sign a PSET with the software signer (mnemonic read transiently, never
+/// cached). Returns the signed PSET as base64.
+Future<String> signPset({required String mnemonic, required String pset}) =>
+    RustLib.instance.api.crateApiSignPset(mnemonic: mnemonic, pset: pset);
+
+/// Finalize a signed PSET into a transaction and broadcast it. Returns the txid.
+Future<String> finalizeAndBroadcast({
+  required String mnemonic,
+  required String esploraUrl,
+  required String pset,
+}) => RustLib.instance.api.crateApiFinalizeAndBroadcast(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  pset: pset,
+);
+
 /// A receive address together with the derivation index it came from.
 class AddressInfo {
   final String address;
@@ -94,6 +132,50 @@ class AssetBalance {
           runtimeType == other.runtimeType &&
           assetId == other.assetId &&
           atoms == other.atoms;
+}
+
+/// Pay the fee in a non-native asset at the node's published rate.
+class FeeAsset {
+  final String assetId;
+  final BigInt rate;
+
+  const FeeAsset({required this.assetId, required this.rate});
+
+  @override
+  int get hashCode => assetId.hashCode ^ rate.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FeeAsset &&
+          runtimeType == other.runtimeType &&
+          assetId == other.assetId &&
+          rate == other.rate;
+}
+
+/// A send recipient: who, which asset, how many atoms.
+class Recipient {
+  final String address;
+  final String assetId;
+  final BigInt satoshi;
+
+  const Recipient({
+    required this.address,
+    required this.assetId,
+    required this.satoshi,
+  });
+
+  @override
+  int get hashCode => address.hashCode ^ assetId.hashCode ^ satoshi.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is Recipient &&
+          runtimeType == other.runtimeType &&
+          address == other.address &&
+          assetId == other.assetId &&
+          satoshi == other.satoshi;
 }
 
 /// A snapshot of the wallet after a full scan against an esplora backend.

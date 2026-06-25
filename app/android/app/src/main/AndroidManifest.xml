@@ -1,8 +1,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Required for esplora/faucet/registry/prices network access. (Flutter only
+         adds this to the debug manifest by default, so release builds need it here.) -->
+    <uses-permission android:name="android.permission.INTERNET"/>
     <application
-        android:label="ambra"
+        android:label="Ambra"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true">
         <activity
             android:name=".MainActivity"
             android:exported="true"
