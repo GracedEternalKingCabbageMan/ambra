@@ -9,6 +9,7 @@ import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 import 'faucet_screen.dart';
+import 'send_screen.dart';
 
 class Shell extends StatefulWidget {
   const Shell({super.key});
@@ -23,7 +24,7 @@ class _ShellState extends State<Shell> {
   Widget build(BuildContext context) {
     final tabs = <Widget>[
       const BalanceTab(),
-      const _ComingTab(title: 'Send', icon: Icons.north_east, note: 'Sending lands in the next build (M5).'),
+      const SendTab(),
       const ReceiveTab(),
       const _ComingTab(title: 'History', icon: Icons.receipt_long, note: 'Transaction history lands with sending (M5).'),
       const MoreTab(),
