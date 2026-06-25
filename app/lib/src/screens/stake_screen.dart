@@ -66,9 +66,9 @@ class _StakeScreenState extends State<StakeScreen> {
     if (atoms == null || atoms < _minStakeAtoms) return _snack('Minimum stake is 40,000 tSEQ');
     if (atoms >= (BigInt.one << 64)) return _snack('Amount is too large');
     final key = _stakerKey;
-    if (key == null) return _snack('Staker key not ready — try again');
+    if (key == null) return _snack('Staker key not ready; try again');
     if (_tseq <= atoms) {
-      return _snack('Not enough tSEQ — you need the staked amount plus a network fee.');
+      return _snack('Not enough tSEQ. You need the staked amount plus a network fee.');
     }
 
     final ok = await showDialog<bool>(
@@ -80,7 +80,7 @@ class _StakeScreenState extends State<StakeScreen> {
           'Stake ${formatAtoms(atoms.toString(), 8)} tSEQ to staker key '
           '${key.substring(0, 16)}…\n\n'
           'Staked tSEQ LEAVES your spendable balance and is locked for ~15 days. '
-          'Unbonding (withdrawing it) is not available in this build yet.',
+          'Unbonding (withdrawing it) is not available yet.',
           style: AmbraText.muted,
         ),
         actions: [
@@ -105,7 +105,7 @@ class _StakeScreenState extends State<StakeScreen> {
           ));
       if (mounted) {
         _amount.clear();
-        _snack('Staked — ${txid.substring(0, 16)}…');
+        _snack('Staked · ${txid.substring(0, 16)}…');
         _load();
       }
     } catch (e) {
@@ -149,7 +149,7 @@ class _StakeScreenState extends State<StakeScreen> {
               const SizedBox(height: 14),
               const WarnCallout(
                 'Staked tSEQ leaves your visible balance once it confirms and is locked for '
-                '~15 days. Unbonding lands in a later build — only stake what you can lock.',
+                '~15 days. Unbonding is not available yet; only stake what you can lock.',
               ),
             ]),
           ),

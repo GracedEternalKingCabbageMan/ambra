@@ -163,7 +163,7 @@ class _BalanceTabState extends State<BalanceTab> {
           if (sync != null && _totalRef() == null)
             const Padding(
               padding: EdgeInsets.only(top: 6),
-              child: Text('Live prices unavailable — see per-asset amounts below.', style: AmbraText.sub),
+              child: Text('Live prices unavailable; see per-asset amounts below.', style: AmbraText.sub),
             ),
           const SizedBox(height: 24),
           if (_error != null)
@@ -376,8 +376,8 @@ class _ReceiveTabState extends State<ReceiveTab> {
               const SizedBox(height: 10),
               Text(
                 _confidential
-                    ? 'Private — the amount and asset are hidden on-chain. This is NOT a Bitcoin address.'
-                    : 'Also receives Bitcoin (testnet4) — one address, both chains.',
+                    ? 'Private: the amount and asset are hidden on-chain. This is NOT a Bitcoin address.'
+                    : 'Also receives Bitcoin (testnet4); one address, both chains.',
                 style: AmbraText.sub,
               ),
               const SizedBox(height: 14),
@@ -615,7 +615,7 @@ class MoreTab extends StatelessWidget {
         ),
         const SizedBox(height: 20),
         Center(
-          child: Text('Lightning · T-DEX · Managed assets — coming soon', style: AmbraText.sub),
+          child: Text('Lightning · T-DEX · Managed assets (coming soon)', style: AmbraText.sub),
         ),
       ],
     );

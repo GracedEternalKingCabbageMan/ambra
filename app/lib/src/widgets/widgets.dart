@@ -35,6 +35,8 @@ class SequentiaWordmark extends StatelessWidget {
         const Text('Sequentia',
             style: TextStyle(color: AmbraColors.txt, fontSize: 18, fontWeight: FontWeight.w700, letterSpacing: -0.2)),
       ]),
+      const SizedBox(height: 10),
+      Text('by Concatena Labs', style: AmbraText.sub.copyWith(fontSize: 11)),
     ]);
   }
 }

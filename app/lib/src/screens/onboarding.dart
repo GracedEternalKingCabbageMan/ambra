@@ -38,7 +38,7 @@ class WelcomeScreen extends StatelessWidget {
                       ]),
                       const SizedBox(height: 14),
                       const Text(
-                        'A self-custodial wallet for Sequentia — Proof-of-Stake, '
+                        'A self-custodial wallet for Sequentia: Proof-of-Stake, '
                         'Bitcoin-anchored, with fees payable in any asset.',
                         style: AmbraText.muted,
                       ),

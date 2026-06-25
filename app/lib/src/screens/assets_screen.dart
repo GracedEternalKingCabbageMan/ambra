@@ -85,7 +85,7 @@ class _AssetsScreenState extends State<AssetsScreen> {
     setState(() => _busy = true);
     try {
       final txid = await authorizeBuildBroadcast(build);
-      if (mounted) _snack('$action — ${txid.substring(0, 16)}…');
+      if (mounted) _snack('$action · ${txid.substring(0, 16)}…');
       _load();
     } catch (e) {
       if (mounted) _snack('$action failed: ${friendlyError(e)}');
@@ -124,9 +124,9 @@ class _AssetsScreenState extends State<AssetsScreen> {
       danger: burn,
       body: burn
           ? 'Permanently destroy $line.\n\nThis CANNOT be undone.'
-              '${known ? '' : "\n\nThis asset's precision is unknown — the atom amount above is exactly what will be destroyed."}'
+              '${known ? '' : "\n\nThis asset's precision is unknown; the atom amount above is exactly what will be destroyed."}'
           : 'Reissue $line. This needs the asset\'s reissuance token in this wallet.'
-              '${known ? '' : "\n\nPrecision unknown — the atom amount above is what will be minted."}',
+              '${known ? '' : "\n\nPrecision unknown; the atom amount above is what will be minted."}',
     );
     if (!ok || !mounted) return;
     if (burn) {

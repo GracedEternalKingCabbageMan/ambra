@@ -58,7 +58,7 @@ class _NodeScreenState extends State<NodeScreen> {
       setState(() {
         _testOk = r.statusCode == 200 && h != null;
         _testMsg = _testOk
-            ? 'Reachable — chain tip at block $h.'
+            ? 'Reachable: chain tip at block $h.'
             : 'Reached the host, but it didn\'t return a Sequentia tip (HTTP ${r.statusCode}).';
       });
     } catch (e) {
@@ -82,7 +82,7 @@ class _NodeScreenState extends State<NodeScreen> {
     if (!mounted) return;
     Navigator.of(context).pop();
     ScaffoldMessenger.of(context)
-        .showSnackBar(const SnackBar(content: Text('Node updated — pull to refresh your balance.')));
+        .showSnackBar(const SnackBar(content: Text('Node updated. Pull to refresh your balance.')));
   }
 
   Future<void> _reset() async {
@@ -109,7 +109,7 @@ class _NodeScreenState extends State<NodeScreen> {
         child: ListView(padding: const EdgeInsets.all(20), children: [
           const Text(
             'Ambra syncs balances, history, fees and prices from this node. The default is the '
-            'public Sequentia testnet node — point it at your own for privacy or reliability.',
+            'public Sequentia testnet node; point it at your own for privacy or reliability.',
             style: AmbraText.muted,
           ),
           const SizedBox(height: 18),
