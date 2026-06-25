@@ -19,7 +19,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # Versioning: 0.x = pre-mainnet; minor tracks the milestone (M7 -> 0.7.0);
 # bump the build number (+N) every release, patch for fix-only builds, 1.0.0 at
 # mainnet. Keep in sync with the download filename + page.
-version: 0.7.5+12
+version: 0.7.6+13
 
 environment:
   sdk: ^3.12.2

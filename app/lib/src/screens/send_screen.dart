@@ -19,6 +19,7 @@ class SendTab extends StatefulWidget {
 class _SendTabState extends State<SendTab> {
   final _addr = TextEditingController();
   final _amount = TextEditingController();
+  final _feeRateCtl = TextEditingController(); // sat/vB, optional; empty = network default
   List<core.AssetBalance> _balances = [];
   Map<String, BigInt> _feeRates = {};
   String _assetId = SeqAssets.policy;
@@ -45,6 +46,7 @@ class _SendTabState extends State<SendTab> {
   void dispose() {
     _addr.dispose();
     _amount.dispose();
+    _feeRateCtl.dispose();
     super.dispose();
   }
 
@@ -217,6 +219,15 @@ class _SendTabState extends State<SendTab> {
       feeAsset = core.FeeAsset(assetId: _feeAsset!, rate: _feeRate(_feeAsset!));
     }
 
+    // Optional fee rate (sat/vB). Empty leaves it to the network default.
+    double? feeRateSatKvb;
+    final frText = _feeRateCtl.text.trim();
+    if (frText.isNotEmpty) {
+      final fr = double.tryParse(frText);
+      if (fr == null || fr <= 0) return _snack('Enter a valid fee rate, or leave it blank.');
+      feeRateSatKvb = fr * 1000; // sat/vB → sat/kvB
+    }
+
     final txid = await showModalBottomSheet<String>(
       context: context,
       isScrollControlled: true,
@@ -230,6 +241,7 @@ class _SendTabState extends State<SendTab> {
         amountStr: formatAtoms(atoms.toString(), label.precision),
         feeAsset: feeAsset,
         feeLabel: _feeLabel,
+        feeRateSatKvb: feeRateSatKvb,
       ),
     );
     if (txid != null && mounted) {
@@ -303,6 +315,8 @@ class _SendTabState extends State<SendTab> {
                           'Confirmation depends on producers accepting it.',
                   style: AmbraText.sub,
                 ),
+              const SizedBox(height: 16),
+              AmbraField(label: 'Fee rate ($_feeLabel/vB, optional)', controller: _feeRateCtl, hint: '2'),
             ],
           ]),
         ),
@@ -352,6 +366,7 @@ class _ReviewSheet extends StatefulWidget {
     required this.amountStr,
     required this.feeAsset,
     required this.feeLabel,
+    required this.feeRateSatKvb,
   });
   final String address;
   final String assetId;
@@ -360,6 +375,7 @@ class _ReviewSheet extends StatefulWidget {
   final String amountStr;
   final core.FeeAsset? feeAsset;
   final String feeLabel;
+  final double? feeRateSatKvb;
 
   @override
   State<_ReviewSheet> createState() => _ReviewSheetState();
@@ -389,6 +405,7 @@ class _ReviewSheetState extends State<_ReviewSheet> {
         mnemonic: m,
         esploraUrl: Backend.esplora,
         recipients: [core.Recipient(address: widget.address, assetId: widget.assetId, satoshi: widget.atoms)],
+        feeRateSatKvb: widget.feeRateSatKvb,
         feeAsset: widget.feeAsset,
       );
       final signed = await core.signPset(mnemonic: m, pset: pset);
@@ -419,6 +436,7 @@ class _ReviewSheetState extends State<_ReviewSheet> {
               _Row('To', widget.address, mono: true),
               _Row('Network', 'sequentia-testnet'),
               _Row('Fee paid in', widget.feeLabel),
+              _Row('Fee rate', '${(widget.feeRateSatKvb ?? 2000) ~/ 1000} ${widget.feeLabel}/vB'),
             ]),
           ),
           const SizedBox(height: 14),

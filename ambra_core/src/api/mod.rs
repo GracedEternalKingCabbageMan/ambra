@@ -268,16 +268,20 @@ fn build_wollet_synced(mnemonic: &str, esplora_url: &str) -> Result<lwk_wollet::
     Ok(wollet)
 }
 
-/// Chain an optional fee rate + optional any-asset fee onto a builder, finish.
+/// Default fee rate (2 sat/vB) for any tx that does not set its own. The lwk
+/// builder default is 0.1 sat/vB, which is below the network min-relay, so every
+/// build path here applies at least this.
+const DEFAULT_FEERATE_SAT_KVB: f32 = 2000.0;
+
+/// Chain a fee rate (defaulted when absent) + optional any-asset fee onto a
+/// builder, finish.
 fn apply_fee_and_finish(
     mut b: TxBuilder,
     wollet: &lwk_wollet::Wollet,
     fee_rate_sat_kvb: Option<f32>,
     fee_asset: Option<&FeeAsset>,
 ) -> Result<String> {
-    if let Some(fr) = fee_rate_sat_kvb {
-        b = b.fee_rate(Some(fr));
-    }
+    b = b.fee_rate(Some(fee_rate_sat_kvb.unwrap_or(DEFAULT_FEERATE_SAT_KVB)));
     if let Some(fa) = fee_asset {
         b = b.fee_asset(AssetId::from_str(&fa.asset_id).map_err(rerr)?, fa.rate);
     }
