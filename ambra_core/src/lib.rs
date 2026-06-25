@@ -63,6 +63,22 @@ pub fn set_data_dir(path: String) {
     }
 }
 
+/// `Authorization` header sent on every Esplora request, for nodes behind HTTP
+/// auth (a bearer token or basic-auth). Set from Dart when the node changes.
+static AUTH_HEADER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Set (or clear, when empty) the `Authorization` header for Esplora requests.
+pub fn set_auth_header(value: String) {
+    if let Ok(mut g) = AUTH_HEADER.lock() {
+        *g = if value.is_empty() { None } else { Some(value) };
+    }
+}
+
+/// The current `Authorization` header value, if any.
+pub fn auth_header() -> Option<String> {
+    AUTH_HEADER.lock().ok().and_then(|g| g.clone())
+}
+
 /// Build a watch-only wallet for `descriptor` on Sequentia testnet. Holds no
 /// keys. When a data dir is set, restores prior scanned state from disk on build
 /// (and persists future updates there). If the on-disk store is missing or

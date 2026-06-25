@@ -1,5 +1,5 @@
 /// App version shown in the More footer. Bump alongside pubspec on release.
-const kAppVersion = '0.7.10';
+const kAppVersion = '0.7.11';
 
 /// Backend node the wallet talks to. Defaults to the public Sequentia testnet
 /// node; users can point Ambra at their own (persisted via [NodeConfig]). Every
@@ -21,6 +21,17 @@ class Backend {
   static String get prices => '$_origin/prices';
   static String get registry => '$_origin/registry/index.minimal.json';
   static String get faucet => '$_origin/faucet';
+
+  /// Optional `Authorization` header for a node behind HTTP auth. Set by
+  /// [NodeConfig]; applied to the sidecar HTTP calls (and, via the core, to
+  /// Esplora). Null when the node is open (the public default).
+  static String? _authHeader;
+  static String? get authHeader => _authHeader;
+  static set authHeader(String? v) => _authHeader = (v != null && v.isNotEmpty) ? v : null;
+
+  /// Header map to spread into sidecar requests; empty when no auth is set.
+  static Map<String, String> get authHeaders =>
+      _authHeader == null ? const {} : {'Authorization': _authHeader!};
 
   /// Public block-explorer (Esplora SPA) page for a transaction.
   static String explorerTx(String txid) => '$_origin/explorer/tx/$txid';

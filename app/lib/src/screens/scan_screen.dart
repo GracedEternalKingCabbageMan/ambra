@@ -6,8 +6,9 @@ import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 
 /// Full-screen camera QR scanner. Requests the camera permission up front and
-/// recovers gracefully if it is denied. Pops the first decoded payload (raw
-/// string); the caller parses out the address. Returns null if the user backs out.
+/// recovers gracefully if it is denied or the camera fails to start. Pops the
+/// first decoded payload (raw string); the caller parses out the address.
+/// Returns null if the user backs out or chooses to type the address instead.
 class ScanScreen extends StatefulWidget {
   const ScanScreen({super.key});
   @override
@@ -30,7 +31,14 @@ class _ScanScreenState extends State<ScanScreen> {
     if (!mounted) return;
     setState(() {
       _perm = status;
-      if (status.isGranted) _controller ??= MobileScannerController();
+      if (status.isGranted) {
+        // QR-only and de-duplicated; the widget auto-starts the camera and
+        // drives its lifecycle (start/stop on resume/pause).
+        _controller ??= MobileScannerController(
+          formats: const [BarcodeFormat.qrCode],
+          detectionSpeed: DetectionSpeed.noDuplicates,
+        );
+      }
     });
   }
 
@@ -77,39 +85,28 @@ class _ScanScreenState extends State<ScanScreen> {
       return const Center(child: CircularProgressIndicator(color: AmbraColors.amber));
     }
     if (!perm.isGranted) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(28),
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            const Icon(Icons.no_photography_outlined, color: Colors.white54, size: 48),
-            const SizedBox(height: 16),
-            const Text('Camera access is needed to scan a QR code.',
-                textAlign: TextAlign.center, style: TextStyle(color: Colors.white70, fontSize: 15)),
-            const SizedBox(height: 20),
-            SizedBox(
-              width: 240,
-              child: PrimaryButton(
-                label: perm.isPermanentlyDenied ? 'Open settings' : 'Allow camera',
-                icon: Icons.camera_alt,
-                onPressed: () => perm.isPermanentlyDenied ? openAppSettings() : _request(),
-              ),
-            ),
-            const SizedBox(height: 10),
-            GhostButton(label: 'Enter address manually', onPressed: () => Navigator.of(context).pop()),
-          ]),
-        ),
+      return _Notice(
+        icon: Icons.no_photography_outlined,
+        text: 'Camera access is needed to scan a QR code.',
+        actionLabel: perm.isPermanentlyDenied ? 'Open settings' : 'Allow camera',
+        actionIcon: perm.isPermanentlyDenied ? Icons.settings : Icons.camera_alt,
+        onAction: () => perm.isPermanentlyDenied ? openAppSettings() : _request(),
       );
+    }
+    final controller = _controller;
+    if (controller == null) {
+      return const Center(child: CircularProgressIndicator(color: AmbraColors.amber));
     }
     return Stack(fit: StackFit.expand, children: [
       MobileScanner(
-        controller: _controller,
+        controller: controller,
         onDetect: _onDetect,
-        errorBuilder: (context, error, child) => Center(
-          child: Padding(
-            padding: const EdgeInsets.all(28),
-            child: Text('Camera error (${error.errorCode.name}). Try again, or check app permissions.',
-                textAlign: TextAlign.center, style: const TextStyle(color: Colors.white70, fontSize: 14)),
-          ),
+        errorBuilder: (context, error) => _Notice(
+          icon: Icons.videocam_off_outlined,
+          text: 'The camera could not start (${error.errorCode.name}).',
+          actionLabel: 'Try again',
+          actionIcon: Icons.refresh,
+          onAction: () => controller.start(),
         ),
       ),
       Center(
@@ -132,5 +129,42 @@ class _ScanScreenState extends State<ScanScreen> {
         ),
       ),
     ]);
+  }
+}
+
+/// A centered icon + message with a primary action and an always-available
+/// "Enter address manually" escape (pops with no result).
+class _Notice extends StatelessWidget {
+  const _Notice({
+    required this.icon,
+    required this.text,
+    required this.actionLabel,
+    required this.actionIcon,
+    required this.onAction,
+  });
+
+  final IconData icon;
+  final String text;
+  final String actionLabel;
+  final IconData actionIcon;
+  final VoidCallback onAction;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(28),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Icon(icon, color: Colors.white54, size: 48),
+          const SizedBox(height: 16),
+          Text(text,
+              textAlign: TextAlign.center, style: const TextStyle(color: Colors.white70, fontSize: 15)),
+          const SizedBox(height: 20),
+          SizedBox(width: 240, child: PrimaryButton(label: actionLabel, icon: actionIcon, onPressed: onAction)),
+          const SizedBox(height: 10),
+          GhostButton(label: 'Enter address manually', onPressed: () => Navigator.of(context).pop()),
+        ]),
+      ),
+    );
   }
 }

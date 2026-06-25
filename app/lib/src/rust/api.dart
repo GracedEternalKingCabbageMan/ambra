@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `err`, `rerr`, `with_synced_wollet`, `wollet_cache`
+// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `err`, `esplora_client`, `rerr`, `with_synced_wollet`, `wollet_cache`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
 String networkName() => RustLib.instance.api.crateApiNetworkName();
@@ -16,6 +16,12 @@ String networkName() => RustLib.instance.api.crateApiNetworkName();
 /// instead of re-scanning the whole wallet.
 void setDataDir({required String path}) =>
     RustLib.instance.api.crateApiSetDataDir(path: path);
+
+/// Set the `Authorization` header for a node behind HTTP auth (a bearer token or
+/// basic-auth credentials). Pass an empty string to clear it. Applied to every
+/// Esplora request; call whenever the node or its credentials change.
+void setAuthHeader({required String value}) =>
+    RustLib.instance.api.crateApiSetAuthHeader(value: value);
 
 /// Generate a fresh 12-word BIP39 recovery phrase.
 Future<String> generateMnemonic() =>

@@ -16,6 +16,9 @@ class NodeScreen extends StatefulWidget {
 
 class _NodeScreenState extends State<NodeScreen> {
   final _url = TextEditingController(text: NodeConfig.instance.origin);
+  final _token = TextEditingController(text: NodeConfig.instance.token);
+  final _user = TextEditingController(text: NodeConfig.instance.user);
+  final _pass = TextEditingController(text: NodeConfig.instance.pass);
   bool _testing = false;
   bool _saving = false;
   bool _testOk = false;
@@ -25,7 +28,17 @@ class _NodeScreenState extends State<NodeScreen> {
   @override
   void dispose() {
     _url.dispose();
+    _token.dispose();
+    _user.dispose();
+    _pass.dispose();
     super.dispose();
+  }
+
+  /// Auth header for the credentials currently typed in the form (so a test or
+  /// save uses what the user sees), or an empty map when none are set.
+  Map<String, String> _authHeaders() {
+    final h = NodeConfig.authHeaderFor(_token.text, _user.text, _pass.text);
+    return h == null ? const {} : {'Authorization': h};
   }
 
   String _normalized() {
@@ -53,7 +66,9 @@ class _NodeScreenState extends State<NodeScreen> {
       _error = null;
     });
     try {
-      final r = await http.get(Uri.parse('$origin/api/blocks/tip/height')).timeout(const Duration(seconds: 15));
+      final r = await http
+          .get(Uri.parse('$origin/api/blocks/tip/height'), headers: _authHeaders())
+          .timeout(const Duration(seconds: 15));
       final h = int.tryParse(r.body.trim());
       setState(() {
         _testOk = r.statusCode == 200 && h != null;
@@ -78,7 +93,7 @@ class _NodeScreenState extends State<NodeScreen> {
       return;
     }
     setState(() => _saving = true);
-    await NodeConfig.instance.setOrigin(origin);
+    await NodeConfig.instance.setOrigin(origin, token: _token.text.trim(), user: _user.text.trim(), pass: _pass.text);
     if (!mounted) return;
     Navigator.of(context).pop();
     ScaffoldMessenger.of(context)
@@ -90,6 +105,9 @@ class _NodeScreenState extends State<NodeScreen> {
     if (!mounted) return;
     setState(() {
       _url.text = NodeConfig.instance.origin;
+      _token.clear();
+      _user.clear();
+      _pass.clear();
       _testMsg = null;
       _error = null;
     });
@@ -120,6 +138,20 @@ class _NodeScreenState extends State<NodeScreen> {
             'faucet also use /feerates, /prices and /faucet on the same host.',
             style: AmbraText.sub,
           ),
+          const SizedBox(height: 22),
+          const Text('Authentication (optional)', style: AmbraText.label),
+          const SizedBox(height: 8),
+          const Text(
+            'Only needed for a private node behind HTTP auth. Use an access token, or a username '
+            'and password. Leave blank for an open node.',
+            style: AmbraText.sub,
+          ),
+          const SizedBox(height: 12),
+          AmbraField(label: 'Access token', controller: _token, hint: 'Bearer token / API key', mono: true),
+          const SizedBox(height: 12),
+          AmbraField(label: 'Username', controller: _user, hint: 'for basic auth'),
+          const SizedBox(height: 12),
+          AmbraField(label: 'Password', controller: _pass, hint: 'for basic auth', obscure: true),
           const SizedBox(height: 16),
           if (_error != null)
             Padding(

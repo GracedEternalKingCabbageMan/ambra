@@ -195,6 +195,7 @@ class AmbraField extends StatelessWidget {
     this.maxLines = 1,
     this.onChanged,
     this.suffix,
+    this.obscure = false,
   });
   final String label;
   final TextEditingController? controller;
@@ -203,6 +204,7 @@ class AmbraField extends StatelessWidget {
   final int maxLines;
   final ValueChanged<String>? onChanged;
   final Widget? suffix;
+  final bool obscure;
 
   @override
   Widget build(BuildContext context) {
@@ -215,6 +217,7 @@ class AmbraField extends StatelessWidget {
           controller: controller,
           onChanged: onChanged,
           maxLines: maxLines,
+          obscureText: obscure,
           style: mono ? AmbraText.mono.copyWith(color: AmbraColors.txt) : AmbraText.body,
           decoration: InputDecoration(
             hintText: hint,

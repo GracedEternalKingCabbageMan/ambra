@@ -22,7 +22,7 @@ class ApiClient {
         : <String, String>{'address': address, 'asset': asset};
     final r = await http
         .post(Uri.parse(Backend.faucet),
-            headers: {'Content-Type': 'application/json'}, body: jsonEncode(body))
+            headers: {'Content-Type': 'application/json', ...Backend.authHeaders}, body: jsonEncode(body))
         .timeout(const Duration(seconds: 30));
     final j = jsonDecode(r.body) as Map<String, dynamic>;
     if (r.statusCode != 200) {
@@ -35,7 +35,7 @@ class ApiClient {
   /// rate = atoms-of-asset per reference unit ×1e8 (an integer, consensus-exact).
   /// Parsed losslessly as BigInt; non-integer/garbage rates are dropped.
   static Future<Map<String, BigInt>> feeRates() async {
-    final r = await http.get(Uri.parse(Backend.feerates)).timeout(const Duration(seconds: 20));
+    final r = await http.get(Uri.parse(Backend.feerates), headers: Backend.authHeaders).timeout(const Duration(seconds: 20));
     if (r.statusCode != 200) throw Exception('HTTP ${r.statusCode}');
     final j = jsonDecode(r.body) as Map<String, dynamic>;
     final out = <String, BigInt>{};
@@ -49,7 +49,7 @@ class ApiClient {
   /// Per-asset USD prices for reference-currency display (DISPLAY only).
   /// /prices = {TICKER: {price, market_cap, …}} (or a flat number).
   static Future<Map<String, double>> prices() async {
-    final r = await http.get(Uri.parse(Backend.prices)).timeout(const Duration(seconds: 20));
+    final r = await http.get(Uri.parse(Backend.prices), headers: Backend.authHeaders).timeout(const Duration(seconds: 20));
     if (r.statusCode != 200) throw Exception('HTTP ${r.statusCode}');
     final j = jsonDecode(r.body) as Map<String, dynamic>;
     final out = <String, double>{};

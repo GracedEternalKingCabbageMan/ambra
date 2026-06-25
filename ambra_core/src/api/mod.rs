@@ -40,6 +40,14 @@ pub fn set_data_dir(path: String) {
     crate::set_data_dir(path);
 }
 
+/// Set the `Authorization` header for a node behind HTTP auth (a bearer token or
+/// basic-auth credentials). Pass an empty string to clear it. Applied to every
+/// Esplora request; call whenever the node or its credentials change.
+#[flutter_rust_bridge::frb(sync)]
+pub fn set_auth_header(value: String) {
+    crate::set_auth_header(value);
+}
+
 /// Generate a fresh 12-word BIP39 recovery phrase.
 pub fn generate_mnemonic() -> Result<String> {
     crate::generate_mnemonic().map_err(err)
@@ -260,11 +268,17 @@ fn wollet_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String,
 }
 
 /// A blocking Esplora client with a 30s request timeout, so a hung connection
-/// errors out instead of holding the shared wallet lock indefinitely.
+/// errors out instead of holding the shared wallet lock indefinitely. Sends the
+/// configured `Authorization` header (set via `set_auth_header`) so a node
+/// behind HTTP auth is reachable.
 fn esplora_client(url: &str) -> std::result::Result<EsploraClient, lwk_wollet::Error> {
-    EsploraClientBuilder::new(url, crate::sequentia_testnet())
-        .timeout(30)
-        .build_blocking()
+    let mut builder = EsploraClientBuilder::new(url, crate::sequentia_testnet()).timeout(30);
+    if let Some(value) = crate::auth_header() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Authorization".to_string(), value);
+        builder = builder.headers(headers);
+    }
+    builder.build_blocking()
 }
 
 /// Sync the cached wallet (incrementally) and run `f` against it. All blockchain

@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1951033978;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -533956319;
 
 // Section: executor
 
@@ -737,6 +737,38 @@ fn wire__crate__api__receive_address_at_impl(
         },
     )
 }
+fn wire__crate__api__set_auth_header_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "set_auth_header",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_value = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok({
+                    crate::api::set_auth_header(api_value);
+                })?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
 fn wire__crate__api__set_data_dir_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -1278,12 +1310,12 @@ fn pde_ffi_dispatcher_primary_impl(
         14 => wire__crate__api__generate_mnemonic_impl(port, ptr, rust_vec_len, data_len),
         16 => wire__crate__api__receive_address_impl(port, ptr, rust_vec_len, data_len),
         17 => wire__crate__api__receive_address_at_impl(port, ptr, rust_vec_len, data_len),
-        19 => wire__crate__api__sign_pset_impl(port, ptr, rust_vec_len, data_len),
-        20 => wire__crate__api__staker_public_key_impl(port, ptr, rust_vec_len, data_len),
-        21 => wire__crate__api__sync_wallet_impl(port, ptr, rust_vec_len, data_len),
-        22 => wire__crate__api__validate_address_impl(port, ptr, rust_vec_len, data_len),
-        23 => wire__crate__api__validate_mnemonic_impl(port, ptr, rust_vec_len, data_len),
-        24 => wire__crate__api__wallet_transactions_impl(port, ptr, rust_vec_len, data_len),
+        20 => wire__crate__api__sign_pset_impl(port, ptr, rust_vec_len, data_len),
+        21 => wire__crate__api__staker_public_key_impl(port, ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__sync_wallet_impl(port, ptr, rust_vec_len, data_len),
+        23 => wire__crate__api__validate_address_impl(port, ptr, rust_vec_len, data_len),
+        24 => wire__crate__api__validate_mnemonic_impl(port, ptr, rust_vec_len, data_len),
+        25 => wire__crate__api__wallet_transactions_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -1297,7 +1329,8 @@ fn pde_ffi_dispatcher_sync_impl(
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
         15 => wire__crate__api__network_name_impl(ptr, rust_vec_len, data_len),
-        18 => wire__crate__api__set_data_dir_impl(ptr, rust_vec_len, data_len),
+        18 => wire__crate__api__set_auth_header_impl(ptr, rust_vec_len, data_len),
+        19 => wire__crate__api__set_data_dir_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
