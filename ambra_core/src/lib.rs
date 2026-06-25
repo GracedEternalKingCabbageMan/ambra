@@ -48,13 +48,33 @@ pub fn descriptor_from_mnemonic(mnemonic: &str) -> AmbraResult<String> {
     singlesig_desc(&signer, Singlesig::Wpkh, DescriptorBlindingKey::Slip77)
 }
 
+/// App data directory for wallet persistence, set once from Dart at startup via
+/// `crate::api::set_data_dir`. When present, the wallet persists its scanned
+/// state to disk (per-descriptor, encrypted) so a cold start resumes from there
+/// instead of a full re-scan.
+static DATA_DIR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Set the persistence data dir (a writable app directory). No-op if empty.
+pub fn set_data_dir(path: String) {
+    if !path.is_empty() {
+        if let Ok(mut g) = DATA_DIR.lock() {
+            *g = Some(path);
+        }
+    }
+}
+
 /// Build a watch-only wallet for `descriptor` on Sequentia testnet. Holds no
-/// keys; blockchain data enters later via `apply_update`.
+/// keys. When a data dir is set, restores prior scanned state from disk on build
+/// (and persists future updates there); otherwise starts empty.
 pub fn build_wollet(descriptor: &str) -> AmbraResult<Wollet> {
     let desc = WolletDescriptor::from_str(descriptor).map_err(|e| format!("{e:?}"))?;
-    WolletBuilder::new(sequentia_testnet(), desc)
-        .build()
-        .map_err(|e| format!("{e:?}"))
+    let builder = WolletBuilder::new(sequentia_testnet(), desc);
+    let datadir = DATA_DIR.lock().ok().and_then(|g| g.clone());
+    let builder = match datadir {
+        Some(dir) => builder.with_legacy_fs_store(&dir).map_err(|e| format!("{e:?}"))?,
+        None => builder,
+    };
+    builder.build().map_err(|e| format!("{e:?}"))
 }
 
 /// Derive the **default (non-confidential)** receive address at `index` — a

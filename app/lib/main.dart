@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'src/data/node_config.dart';
 import 'src/data/price_service.dart';
 import 'src/data/wallet_repository.dart';
+import 'src/rust/api.dart' as core;
 import 'src/rust/frb_generated.dart';
 import 'src/screens/lock_screen.dart';
 import 'src/screens/onboarding.dart';
@@ -12,6 +14,13 @@ import 'src/theme/theme.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await RustLib.init();
+  // Persist wallet state to a writable dir so cold starts resume scanned state
+  // from disk instead of a full re-scan. Best-effort: an in-memory wallet still
+  // works if this fails.
+  try {
+    final dir = await getApplicationSupportDirectory();
+    core.setDataDir(path: dir.path);
+  } catch (_) {}
   await NodeConfig.instance.load(); // apply a saved custom node before any fetch
   await WalletRepository.instance.load();
   await PriceService.instance.load();

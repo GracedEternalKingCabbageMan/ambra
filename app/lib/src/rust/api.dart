@@ -6,10 +6,16 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `build_wollet_synced`, `err`, `rerr`
+// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `err`, `rerr`, `with_synced_wollet`, `wollet_cache`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
 String networkName() => RustLib.instance.api.crateApiNetworkName();
+
+/// Point wallet persistence at the app's writable directory. Call once at
+/// startup, before any sync, so cold starts resume scanned state from disk
+/// instead of re-scanning the whole wallet.
+void setDataDir({required String path}) =>
+    RustLib.instance.api.crateApiSetDataDir(path: path);
 
 /// Generate a fresh 12-word BIP39 recovery phrase.
 Future<String> generateMnemonic() =>
@@ -105,6 +111,10 @@ Future<List<TxRow>> walletTransactions({
   mnemonic: mnemonic,
   esploraUrl: esploraUrl,
 );
+
+/// Forget any cached wallet state (called when the wallet is removed).
+Future<void> clearWalletCache() =>
+    RustLib.instance.api.crateApiClearWalletCache();
 
 /// RBF fee-bump: re-send the SAME payment at a higher fee (optionally in another
 /// asset). The replacement's reference (rfa) fee must exceed the original's.

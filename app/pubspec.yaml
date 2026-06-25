@@ -19,7 +19,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # Versioning: 0.x = pre-mainnet; minor tracks the milestone (M7 -> 0.7.0);
 # bump the build number (+N) every release, patch for fix-only builds, 1.0.0 at
 # mainnet. Keep in sync with the download filename + page.
-version: 0.7.8+15
+version: 0.7.9+16
 
 environment:
   sdk: ^3.12.2
@@ -52,6 +52,8 @@ dependencies:
   permission_handler: ^11.3.1
   # Fast local cache of last-known balances/history (shown instantly on launch).
   shared_preferences: ^2.3.2
+  # App writable dir for on-disk wallet persistence (fast cold starts).
+  path_provider: ^2.1.4
   # Open the block explorer in the device browser.
   url_launcher: ^6.3.1
 
