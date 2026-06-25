@@ -213,7 +213,7 @@ class _SendTabState extends State<SendTab> {
       '$_feeLabel isn\'t priced for fees by this node, so the fee rate is estimated. '
       'Producers may not accept it. If it stalls, speed it up or replace it (RBF) from History.';
 
-  void _snack(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+  void _snack(String m) => ScaffoldMessenger.of(context).showSnackBar(ambraSnack(m));
 
   /// Scan a QR into the recipient field. Accepts a plain address or a BIP21-style
   /// URI (scheme:address?amount=...); the build step validates the address.
@@ -288,9 +288,13 @@ class _SendTabState extends State<SendTab> {
     if (txid != null && mounted) {
       _addr.clear();
       _amount.clear();
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text('Sent · ${txid.substring(0, 16)}…'),
-        action: SnackBarAction(label: 'Copy txid', onPressed: () => Clipboard.setData(ClipboardData(text: txid))),
+      ScaffoldMessenger.of(context).showSnackBar(ambraSnack(
+        'Sent · ${txid.substring(0, 16)}…',
+        action: SnackBarAction(
+          label: 'Copy txid',
+          textColor: AmbraColors.amber,
+          onPressed: () => Clipboard.setData(ClipboardData(text: txid)),
+        ),
       ));
       _load();
     }

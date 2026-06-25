@@ -204,6 +204,7 @@ pub fn finalize_and_broadcast(mnemonic: String, esplora_url: String, pset: Strin
     let tx = wollet.finalize(&mut p).map_err(rerr)?;
     let client = esplora_client(&esplora_url).map_err(rerr)?;
     let txid = client.broadcast(&tx).map_err(rerr)?;
+    clear_scan_marks(); // spent UTXOs changed; make the next sync actually rescan
     Ok(txid.to_string())
 }
 
@@ -232,20 +233,39 @@ pub fn wallet_transactions(mnemonic: String, esplora_url: String) -> Result<Vec<
             .transactions()
             .map_err(rerr)?
             .into_iter()
-            .map(|t| TxRow {
-                txid: t.txid.to_string(),
-                height: t.height,
-                timestamp: t.timestamp.map(|ts| ts as u64),
-                kind: t.type_,
-                fee: t.fee,
-                deltas: t
+            .map(|t| {
+                // lwk's `type_` is policy-asset-centric, so an any-asset-fee send
+                // (no tSEQ delta) comes back "unknown". Re-derive the direction
+                // from the net change across ALL assets.
+                let (mut neg, mut pos) = (false, false);
+                for v in t.balance.values() {
+                    if *v < 0 {
+                        neg = true;
+                    } else if *v > 0 {
+                        pos = true;
+                    }
+                }
+                let deltas = t
                     .balance
                     .iter()
                     .map(|(a, v)| AssetDelta {
                         asset_id: a.to_string(),
                         atoms: v.to_string(),
                     })
-                    .collect(),
+                    .collect();
+                let kind = match (neg, pos) {
+                    (true, false) => "outgoing".to_string(),
+                    (false, true) => "incoming".to_string(),
+                    _ => t.type_,
+                };
+                TxRow {
+                    txid: t.txid.to_string(),
+                    height: t.height,
+                    timestamp: t.timestamp.map(|ts| ts as u64),
+                    kind,
+                    fee: t.fee,
+                    deltas,
+                }
             })
             .collect();
         Ok(rows)
@@ -265,6 +285,37 @@ fn wollet_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String,
     static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, lwk_wollet::Wollet>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// When each cached wallet was last scanned, so back-to-back ops can share a scan.
+fn last_scan() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// True if this wallet was scanned within the last few seconds (so a launch's
+/// three tabs, or a send's review-then-broadcast, reuse one scan).
+fn scanned_recently(descriptor: &str) -> bool {
+    last_scan()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(descriptor).map(|t| t.elapsed() < std::time::Duration::from_secs(10)))
+        .unwrap_or(false)
+}
+
+fn mark_scanned(descriptor: &str) {
+    if let Ok(mut m) = last_scan().lock() {
+        m.insert(descriptor.to_string(), std::time::Instant::now());
+    }
+}
+
+/// Drop all scan timestamps so the next op rescans (e.g. after broadcasting a tx,
+/// so the new balance shows promptly).
+fn clear_scan_marks() {
+    if let Ok(mut m) = last_scan().lock() {
+        m.clear();
+    }
 }
 
 /// A blocking Esplora client with a 30s request timeout, so a hung connection
@@ -297,22 +348,27 @@ fn with_synced_wollet<T>(
         let w = crate::build_wollet(&descriptor).map_err(err)?;
         guard.insert(descriptor.clone(), w);
     }
-    let mut client = esplora_client(esplora_url).map_err(rerr)?;
-    let first = scan_into(guard.get_mut(&descriptor).expect("just inserted"), &mut client);
-    match first {
-        Ok(()) => {}
-        // The persisted cache is ahead of the backend: a testnet reorg/reindex
-        // dropped blocks below our saved tip, so every update looks "too old".
-        // Discard the stale memory + disk state and rebuild from the current
-        // chain (the fresh wallet starts empty, so the next scan applies cleanly).
-        Err(lwk_wollet::Error::UpdateHeightTooOld { .. }) => {
-            guard.remove(&descriptor);
-            crate::clear_data_dir();
-            let w = crate::build_wollet(&descriptor).map_err(err)?;
-            guard.insert(descriptor.clone(), w);
-            scan_into(guard.get_mut(&descriptor).expect("just inserted"), &mut client).map_err(rerr)?;
+    // Skip the network scan when this wallet was scanned moments ago: a launch
+    // (three tabs) or a send flow (balance -> review -> broadcast) then shares one
+    // scan instead of each paying a full esplora round-trip.
+    if !scanned_recently(&descriptor) {
+        let mut client = esplora_client(esplora_url).map_err(rerr)?;
+        match scan_into(guard.get_mut(&descriptor).expect("just inserted"), &mut client) {
+            Ok(()) => {}
+            // The persisted cache is ahead of the backend: a testnet reorg/reindex
+            // dropped blocks below our saved tip, so every update looks "too old".
+            // Discard the stale memory + disk state and rebuild from the current
+            // chain (the fresh wallet starts empty, so the next scan applies cleanly).
+            Err(lwk_wollet::Error::UpdateHeightTooOld { .. }) => {
+                guard.remove(&descriptor);
+                crate::clear_data_dir();
+                let w = crate::build_wollet(&descriptor).map_err(err)?;
+                guard.insert(descriptor.clone(), w);
+                scan_into(guard.get_mut(&descriptor).expect("just inserted"), &mut client).map_err(rerr)?;
+            }
+            Err(e) => return Err(rerr(e)),
         }
-        Err(e) => return Err(rerr(e)),
+        mark_scanned(&descriptor);
     }
     let wollet = guard.get(&descriptor).expect("present after sync");
     f(wollet)
