@@ -64,7 +64,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => 1620716155;
+  int get rustContentHash => -881700767;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -90,6 +90,11 @@ abstract class RustLibApi extends BaseApi {
     required String mnemonic,
     required int index,
     required bool confidential,
+  });
+
+  Future<WalletSync> crateApiSyncWallet({
+    required String mnemonic,
+    required String esploraUrl,
   });
 
   Future<void> crateApiValidateMnemonic({required String mnemonic});
@@ -281,6 +286,40 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   );
 
   @override
+  Future<WalletSync> crateApiSyncWallet({
+    required String mnemonic,
+    required String esploraUrl,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(mnemonic, serializer);
+          sse_encode_String(esploraUrl, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 7,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_wallet_sync,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiSyncWalletConstMeta,
+        argValues: [mnemonic, esploraUrl],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSyncWalletConstMeta => const TaskConstMeta(
+    debugName: "sync_wallet",
+    argNames: ["mnemonic", "esploraUrl"],
+  );
+
+  @override
   Future<void> crateApiValidateMnemonic({required String mnemonic}) {
     return handler.executeNormal(
       NormalTask(
@@ -290,7 +329,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 7,
+            funcId: 8,
             port: port_,
           );
         },
@@ -335,9 +374,27 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  AssetBalance dco_decode_asset_balance(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2)
+      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
+    return AssetBalance(
+      assetId: dco_decode_String(arr[0]),
+      atoms: dco_decode_String(arr[1]),
+    );
+  }
+
+  @protected
   bool dco_decode_bool(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as bool;
+  }
+
+  @protected
+  List<AssetBalance> dco_decode_list_asset_balance(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_asset_balance).toList();
   }
 
   @protected
@@ -365,6 +422,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  WalletSync dco_decode_wallet_sync(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 4)
+      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    return WalletSync(
+      tipHeight: dco_decode_u_32(arr[0]),
+      tipHash: dco_decode_String(arr[1]),
+      balances: dco_decode_list_asset_balance(arr[2]),
+      nextIndex: dco_decode_u_32(arr[3]),
+    );
+  }
+
+  @protected
   AnyhowException sse_decode_AnyhowException(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var inner = sse_decode_String(deserializer);
@@ -387,9 +458,31 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  AssetBalance sse_decode_asset_balance(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_assetId = sse_decode_String(deserializer);
+    var var_atoms = sse_decode_String(deserializer);
+    return AssetBalance(assetId: var_assetId, atoms: var_atoms);
+  }
+
+  @protected
   bool sse_decode_bool(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getUint8() != 0;
+  }
+
+  @protected
+  List<AssetBalance> sse_decode_list_asset_balance(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <AssetBalance>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_asset_balance(deserializer));
+    }
+    return ans_;
   }
 
   @protected
@@ -414,6 +507,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_decode_unit(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
+  }
+
+  @protected
+  WalletSync sse_decode_wallet_sync(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_tipHeight = sse_decode_u_32(deserializer);
+    var var_tipHash = sse_decode_String(deserializer);
+    var var_balances = sse_decode_list_asset_balance(deserializer);
+    var var_nextIndex = sse_decode_u_32(deserializer);
+    return WalletSync(
+      tipHeight: var_tipHeight,
+      tipHash: var_tipHash,
+      balances: var_balances,
+      nextIndex: var_nextIndex,
+    );
   }
 
   @protected
@@ -445,9 +553,28 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_asset_balance(AssetBalance self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.assetId, serializer);
+    sse_encode_String(self.atoms, serializer);
+  }
+
+  @protected
   void sse_encode_bool(bool self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putUint8(self ? 1 : 0);
+  }
+
+  @protected
+  void sse_encode_list_asset_balance(
+    List<AssetBalance> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_asset_balance(item, serializer);
+    }
   }
 
   @protected
@@ -475,6 +602,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_encode_unit(void self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
+  }
+
+  @protected
+  void sse_encode_wallet_sync(WalletSync self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_32(self.tipHeight, serializer);
+    sse_encode_String(self.tipHash, serializer);
+    sse_encode_list_asset_balance(self.balances, serializer);
+    sse_encode_u_32(self.nextIndex, serializer);
   }
 
   @protected

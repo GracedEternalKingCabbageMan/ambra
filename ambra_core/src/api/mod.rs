@@ -6,6 +6,7 @@
 //! `flutter_rust_bridge_codegen generate`.
 
 use anyhow::Result;
+use lwk_wollet::clients::blocking::{BlockchainBackend, EsploraClient};
 
 fn err(s: String) -> anyhow::Error {
     anyhow::Error::msg(s)
@@ -60,4 +61,49 @@ pub fn validate_mnemonic(mnemonic: String) -> Result<()> {
 pub fn receive_address_at(mnemonic: String, index: u32, confidential: bool) -> Result<AddressInfo> {
     let address = crate::receive_address_at(&mnemonic, index, confidential).map_err(err)?;
     Ok(AddressInfo { address, index })
+}
+
+/// A per-asset balance: the asset id (hex) and the amount in atoms (a string to
+/// avoid any integer-precision loss across the FFI boundary).
+pub struct AssetBalance {
+    pub asset_id: String,
+    pub atoms: String,
+}
+
+/// A snapshot of the wallet after a full scan against an esplora backend.
+pub struct WalletSync {
+    pub tip_height: u32,
+    pub tip_hash: String,
+    pub balances: Vec<AssetBalance>,
+    pub next_index: u32,
+}
+
+/// Full-scan the wallet against `esplora_url`, apply the update, and return the
+/// chain tip, per-asset balances, and the next unused receive index. Runs on an
+/// FRB worker thread (off the UI thread).
+pub fn sync_wallet(mnemonic: String, esplora_url: String) -> Result<WalletSync> {
+    let descriptor = crate::descriptor_from_mnemonic(&mnemonic).map_err(err)?;
+    let mut wollet = crate::build_wollet(&descriptor).map_err(err)?;
+    let mut client = EsploraClient::new(&esplora_url, crate::sequentia_testnet())
+        .map_err(|e| err(format!("{e:?}")))?;
+    if let Some(update) = client.full_scan(&wollet).map_err(|e| err(format!("{e:?}")))? {
+        wollet.apply_update(update).map_err(|e| err(format!("{e:?}")))?;
+    }
+    let tip = wollet.tip();
+    let balances = wollet
+        .balance()
+        .map_err(|e| err(format!("{e:?}")))?
+        .iter()
+        .map(|(asset, atoms)| AssetBalance {
+            asset_id: asset.to_string(),
+            atoms: atoms.to_string(),
+        })
+        .collect();
+    let next_index = wollet.address(None).map_err(|e| err(format!("{e:?}")))?.index();
+    Ok(WalletSync {
+        tip_height: tip.height(),
+        tip_hash: tip.hash().to_string(),
+        balances,
+        next_index,
+    })
 }
