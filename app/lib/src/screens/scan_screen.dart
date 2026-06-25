@@ -103,32 +103,45 @@ class _ScanScreenState extends State<ScanScreen> {
         onDetect: _onDetect,
         errorBuilder: (context, error) => _Notice(
           icon: Icons.videocam_off_outlined,
-          text: 'The camera could not start (${error.errorCode.name}).',
+          text: 'The camera could not start (${error.errorCode.name}).${_detail(error)}',
           actionLabel: 'Try again',
           actionIcon: Icons.refresh,
           onAction: () => controller.start(),
         ),
       ),
-      Center(
-        child: Container(
-          width: 240,
-          height: 240,
-          decoration: BoxDecoration(
-            border: Border.all(color: AmbraColors.amber, width: 2),
-            borderRadius: BorderRadius.circular(16),
+      // Decorative only; must not absorb taps meant for the error card / preview.
+      IgnorePointer(
+        child: Stack(fit: StackFit.expand, children: [
+          Center(
+            child: Container(
+              width: 240,
+              height: 240,
+              decoration: BoxDecoration(
+                border: Border.all(color: AmbraColors.amber, width: 2),
+                borderRadius: BorderRadius.circular(16),
+              ),
+            ),
           ),
-        ),
-      ),
-      const Positioned(
-        left: 0,
-        right: 0,
-        bottom: 60,
-        child: Center(
-          child: Text('Point the camera at a Sequentia address QR',
-              style: TextStyle(color: Colors.white70, fontSize: 14)),
-        ),
+          const Positioned(
+            left: 0,
+            right: 0,
+            bottom: 60,
+            child: Center(
+              child: Text('Point the camera at a Sequentia address QR',
+                  style: TextStyle(color: Colors.white70, fontSize: 14)),
+            ),
+          ),
+        ]),
       ),
     ]);
+  }
+
+  /// The underlying native error (code/message), shown beneath the generic code
+  /// so a failure is diagnosable without a logcat.
+  String _detail(MobileScannerException error) {
+    final d = error.errorDetails;
+    final parts = [d?.code, d?.message].where((s) => s != null && s.trim().isNotEmpty).toList();
+    return parts.isEmpty ? '' : '\n${parts.join(' · ')}';
   }
 }
 
