@@ -46,6 +46,17 @@ Future<AddressInfo> receiveAddressAt({
   confidential: confidential,
 );
 
+/// Full-scan the wallet against `esplora_url`, apply the update, and return the
+/// chain tip, per-asset balances, and the next unused receive index. Runs on an
+/// FRB worker thread (off the UI thread).
+Future<WalletSync> syncWallet({
+  required String mnemonic,
+  required String esploraUrl,
+}) => RustLib.instance.api.crateApiSyncWallet(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+);
+
 /// A receive address together with the derivation index it came from.
 class AddressInfo {
   final String address;
@@ -63,4 +74,56 @@ class AddressInfo {
           runtimeType == other.runtimeType &&
           address == other.address &&
           index == other.index;
+}
+
+/// A per-asset balance: the asset id (hex) and the amount in atoms (a string to
+/// avoid any integer-precision loss across the FFI boundary).
+class AssetBalance {
+  final String assetId;
+  final String atoms;
+
+  const AssetBalance({required this.assetId, required this.atoms});
+
+  @override
+  int get hashCode => assetId.hashCode ^ atoms.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is AssetBalance &&
+          runtimeType == other.runtimeType &&
+          assetId == other.assetId &&
+          atoms == other.atoms;
+}
+
+/// A snapshot of the wallet after a full scan against an esplora backend.
+class WalletSync {
+  final int tipHeight;
+  final String tipHash;
+  final List<AssetBalance> balances;
+  final int nextIndex;
+
+  const WalletSync({
+    required this.tipHeight,
+    required this.tipHash,
+    required this.balances,
+    required this.nextIndex,
+  });
+
+  @override
+  int get hashCode =>
+      tipHeight.hashCode ^
+      tipHash.hashCode ^
+      balances.hashCode ^
+      nextIndex.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is WalletSync &&
+          runtimeType == other.runtimeType &&
+          tipHeight == other.tipHeight &&
+          tipHash == other.tipHash &&
+          balances == other.balances &&
+          nextIndex == other.nextIndex;
 }
