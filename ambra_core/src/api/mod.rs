@@ -31,6 +31,14 @@ pub fn network_name() -> String {
     crate::sequentia_testnet().as_str().to_string()
 }
 
+/// Point wallet persistence at the app's writable directory. Call once at
+/// startup, before any sync, so cold starts resume scanned state from disk
+/// instead of re-scanning the whole wallet.
+#[flutter_rust_bridge::frb(sync)]
+pub fn set_data_dir(path: String) {
+    crate::set_data_dir(path);
+}
+
 /// Generate a fresh 12-word BIP39 recovery phrase.
 pub fn generate_mnemonic() -> Result<String> {
     crate::generate_mnemonic().map_err(err)
