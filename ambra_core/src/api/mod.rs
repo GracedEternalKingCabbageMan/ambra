@@ -5,11 +5,22 @@
 //! Generated Dart bindings land in `app/lib/src/rust/` via
 //! `flutter_rust_bridge_codegen generate`.
 
+use std::str::FromStr;
+
 use anyhow::Result;
+use lwk_common::Signer;
+use lwk_signer::SwSigner;
 use lwk_wollet::clients::blocking::{BlockchainBackend, EsploraClient};
+use lwk_wollet::elements::pset::PartiallySignedTransaction;
+use lwk_wollet::elements::{Address, AssetId};
+use lwk_wollet::TxBuilder;
 
 fn err(s: String) -> anyhow::Error {
     anyhow::Error::msg(s)
+}
+
+fn rerr<E: std::fmt::Debug>(e: E) -> anyhow::Error {
+    anyhow::Error::msg(format!("{e:?}"))
 }
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
@@ -106,4 +117,81 @@ pub fn sync_wallet(mnemonic: String, esplora_url: String) -> Result<WalletSync> 
         balances,
         next_index,
     })
+}
+
+/// A send recipient: who, which asset, how many atoms.
+pub struct Recipient {
+    pub address: String,
+    pub asset_id: String,
+    pub satoshi: u64,
+}
+
+/// Pay the fee in a non-native asset at the node's published rate.
+pub struct FeeAsset {
+    pub asset_id: String,
+    pub rate: u64,
+}
+
+/// Quick format-level validity check of a recipient address.
+pub fn validate_address(address: String) -> Result<()> {
+    Address::from_str(&address).map(|_| ()).map_err(rerr)
+}
+
+/// Build an UNSIGNED send PSET (base64). Syncs first so the wallet has utxos.
+/// `fee_asset` pays the fee in a non-native asset at the EXACT published rate
+/// (never fabricated); `fee_rate_sat_kvb` None = builder default. RBF is on by
+/// default (so a stuck tx can be bump/CPFP-rescued later).
+pub fn build_send_tx(
+    mnemonic: String,
+    esplora_url: String,
+    recipients: Vec<Recipient>,
+    fee_rate_sat_kvb: Option<f32>,
+    fee_asset: Option<FeeAsset>,
+) -> Result<String> {
+    let descriptor = crate::descriptor_from_mnemonic(&mnemonic).map_err(err)?;
+    let mut wollet = crate::build_wollet(&descriptor).map_err(err)?;
+    let mut client = EsploraClient::new(&esplora_url, crate::sequentia_testnet()).map_err(rerr)?;
+    if let Some(update) = client.full_scan(&wollet).map_err(rerr)? {
+        wollet.apply_update(update).map_err(rerr)?;
+    }
+    let mut b = TxBuilder::new(crate::sequentia_testnet());
+    for r in &recipients {
+        let address = Address::from_str(&r.address).map_err(rerr)?;
+        let asset = AssetId::from_str(&r.asset_id).map_err(rerr)?;
+        // Sequentia defaults to explicit (tb1) recipients; confidential (tsqb1)
+        // go through the blinded path.
+        b = if address.blinding_pubkey.is_some() {
+            b.add_recipient(&address, r.satoshi, asset).map_err(rerr)?
+        } else {
+            b.add_explicit_recipient(&address, r.satoshi, asset).map_err(rerr)?
+        };
+    }
+    if let Some(fr) = fee_rate_sat_kvb {
+        b = b.fee_rate(Some(fr));
+    }
+    if let Some(fa) = &fee_asset {
+        b = b.fee_asset(AssetId::from_str(&fa.asset_id).map_err(rerr)?, fa.rate);
+    }
+    let pset = b.finish(&wollet).map_err(rerr)?;
+    Ok(pset.to_string())
+}
+
+/// Sign a PSET with the software signer (mnemonic read transiently, never
+/// cached). Returns the signed PSET as base64.
+pub fn sign_pset(mnemonic: String, pset: String) -> Result<String> {
+    let signer = SwSigner::new(&mnemonic, false).map_err(rerr)?;
+    let mut p = PartiallySignedTransaction::from_str(&pset).map_err(rerr)?;
+    signer.sign(&mut p).map_err(rerr)?;
+    Ok(p.to_string())
+}
+
+/// Finalize a signed PSET into a transaction and broadcast it. Returns the txid.
+pub fn finalize_and_broadcast(mnemonic: String, esplora_url: String, pset: String) -> Result<String> {
+    let descriptor = crate::descriptor_from_mnemonic(&mnemonic).map_err(err)?;
+    let wollet = crate::build_wollet(&descriptor).map_err(err)?;
+    let mut p = PartiallySignedTransaction::from_str(&pset).map_err(rerr)?;
+    let tx = wollet.finalize(&mut p).map_err(rerr)?;
+    let client = EsploraClient::new(&esplora_url, crate::sequentia_testnet()).map_err(rerr)?;
+    let txid = client.broadcast(&tx).map_err(rerr)?;
+    Ok(txid.to_string())
 }
