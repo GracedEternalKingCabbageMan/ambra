@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -261,13 +263,18 @@ class _SendTabState extends State<SendTab> {
       feeAsset = core.FeeAsset(assetId: _feeAsset!, rate: _feeRate(_feeAsset!));
     }
 
-    // Optional fee rate (sat/vB). Empty leaves it to the network default.
+    // Optional fee rate in the chosen asset's own units per vByte (never sat/vB,
+    // which is a Bitcoin unit). Convert it to the internal rate lwk needs:
+    // r × 10^precision × R / 1e5, where R is the asset's published rate (tSEQ, the
+    // native asset, uses the 1e8 reference scale). Empty = network default.
     double? feeRateSatKvb;
     final frText = _feeRateCtl.text.trim();
     if (frText.isNotEmpty) {
       final fr = double.tryParse(frText);
       if (fr == null || fr <= 0) return _snack('Enter a valid fee rate, or leave it blank.');
-      feeRateSatKvb = fr * 1000; // sat/vB → sat/kvB
+      final label = SeqAssets.labelFor(_feeAsset ?? SeqAssets.policy);
+      final rate = (_feeAsset == null) ? BigInt.from(100000000) : (_rateFor(_feeAsset!) ?? _refScale);
+      feeRateSatKvb = fr * math.pow(10, label.precision) * rate.toDouble() / 100000;
     }
 
     final txid = await showModalBottomSheet<String>(
@@ -372,9 +379,9 @@ class _SendTabState extends State<SendTab> {
                   style: AmbraText.sub,
                 ),
               const SizedBox(height: 16),
-              // The network fee rate (priority) in sat/vByte; the actual fee is paid
-              // in the asset above and is shown, estimated, on the review screen.
-              AmbraField(label: 'Fee rate (sat/vB, optional)', controller: _feeRateCtl, hint: '2'),
+              // The fee rate in the chosen asset's own units per vByte (e.g. OILX/vB, tSEQ/vB);
+              // the actual fee is shown, estimated, on the review screen. Blank = network default.
+              AmbraField(label: 'Fee rate ($_feeLabel/vB, optional)', controller: _feeRateCtl, hint: ''),
             ],
           ]),
         ),
