@@ -38,7 +38,7 @@ class _HistoryTabState extends State<HistoryTab> {
       });
       if (mounted) setState(() => _txs = txs);
     } catch (e) {
-      if (mounted) setState(() => _error = '$e');
+      if (mounted) setState(() => _error = friendlyError(e));
     }
   }
 
@@ -53,7 +53,7 @@ class _HistoryTabState extends State<HistoryTab> {
         const Text('History', style: AmbraText.h1),
         const SizedBox(height: 16),
         if (_error != null)
-          AmbraCard(child: Text('Could not load history: $_error', style: const TextStyle(color: AmbraColors.red)))
+          AmbraCard(child: Text(_error!, style: const TextStyle(color: AmbraColors.red)))
         else if (txs == null)
           const Padding(padding: EdgeInsets.only(top: 40), child: Center(child: CircularProgressIndicator(color: AmbraColors.amber)))
         else if (txs.isEmpty)

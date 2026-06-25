@@ -88,7 +88,7 @@ class _BalanceTabState extends State<BalanceTab> {
     } catch (e) {
       if (mounted) {
         setState(() {
-          _error = '$e';
+          _error = friendlyError(e);
           _loading = false;
         });
       }
@@ -141,7 +141,7 @@ class _BalanceTabState extends State<BalanceTab> {
             ),
           const SizedBox(height: 24),
           if (_error != null)
-            AmbraCard(child: Text('Sync failed: $_error', style: const TextStyle(color: AmbraColors.red)))
+            AmbraCard(child: Text(_error!, style: const TextStyle(color: AmbraColors.red)))
           else if (sync == null)
             const Padding(
                 padding: EdgeInsets.only(top: 40),
@@ -277,6 +277,7 @@ class _ReceiveTabState extends State<ReceiveTab> {
   int _index = 0;
   bool _confidential = false;
   String? _address;
+  String? _bitcoinAddress; // the tb1 form, shown alongside a confidential address
   String? _error;
 
   @override
@@ -288,13 +289,23 @@ class _ReceiveTabState extends State<ReceiveTab> {
   Future<void> _load() async {
     setState(() {
       _address = null;
+      _bitcoinAddress = null;
       _error = null;
     });
     try {
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) return;
       final info = await core.receiveAddressAt(mnemonic: m, index: _index, confidential: _confidential);
-      if (mounted) setState(() => _address = info.address);
+      String? bitcoin;
+      if (_confidential) {
+        bitcoin = (await core.receiveAddressAt(mnemonic: m, index: _index, confidential: false)).address;
+      }
+      if (mounted) {
+        setState(() {
+          _address = info.address;
+          _bitcoinAddress = bitcoin;
+        });
+      }
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
     }
@@ -319,7 +330,8 @@ class _ReceiveTabState extends State<ReceiveTab> {
         ],
         AmbraCard(
           child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            SectionLabel(_confidential ? 'Confidential address' : 'Address (index $_index)'),
+            SectionLabel(
+                _confidential ? 'Confidential address (index $_index)' : 'Address (index $_index)'),
             const SizedBox(height: 12),
             if (_error != null)
               Text(_error!, style: const TextStyle(color: AmbraColors.red))
@@ -328,10 +340,31 @@ class _ReceiveTabState extends State<ReceiveTab> {
                 padding: EdgeInsets.symmetric(vertical: 18),
                 child: Center(child: CircularProgressIndicator(color: AmbraColors.amber)),
               )
-            else
+            else ...[
               SelectableText(_address!, style: AmbraText.mono.copyWith(fontSize: 14)),
+              const SizedBox(height: 10),
+              Text(
+                _confidential
+                    ? 'Private — the amount and asset are hidden on-chain. This is NOT a Bitcoin address.'
+                    : 'Also receives Bitcoin (testnet4) — one address, both chains.',
+                style: AmbraText.sub,
+              ),
+            ],
           ]),
         ),
+        if (_confidential && _bitcoinAddress != null) ...[
+          const SizedBox(height: 12),
+          AmbraCard(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              const SectionLabel('Bitcoin / non-confidential address'),
+              const SizedBox(height: 12),
+              SelectableText(_bitcoinAddress!, style: AmbraText.mono.copyWith(fontSize: 14)),
+              const SizedBox(height: 10),
+              const Text('Use this transparent address to also receive Bitcoin (testnet4).',
+                  style: AmbraText.sub),
+            ]),
+          ),
+        ],
         const SizedBox(height: 14),
         Row(children: [
           Expanded(
@@ -352,7 +385,7 @@ class _ReceiveTabState extends State<ReceiveTab> {
             child: SecondaryButton(
               label: 'New address',
               icon: Icons.refresh,
-              onPressed: _confidential
+              onPressed: _address == null
                   ? null
                   : () {
                       _index++;
@@ -370,13 +403,8 @@ class _ReceiveTabState extends State<ReceiveTab> {
             _confidential = v;
             _load();
           },
-          title: const Text('Confidential (private) address', style: AmbraText.body),
-          subtitle: Text(
-            _confidential
-                ? 'tsqb… — amount and asset hidden on-chain. Not a Bitcoin address.'
-                : 'tb1… — also receives Bitcoin (testnet4). One address, both chains.',
-            style: AmbraText.sub,
-          ),
+          title: const Text('Show confidential address', style: AmbraText.body),
+          subtitle: const Text('A private address that hides the amount and asset.', style: AmbraText.sub),
         ),
       ],
     );

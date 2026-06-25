@@ -60,7 +60,7 @@ class _SendTabState extends State<SendTab> {
     } catch (e) {
       if (mounted) {
         setState(() {
-          _error = '$e';
+          _error = friendlyError(e);
           _loading = false;
         });
       }
@@ -207,7 +207,7 @@ class _SendTabState extends State<SendTab> {
             if (_loading)
               const Padding(padding: EdgeInsets.only(top: 40), child: Center(child: CircularProgressIndicator(color: AmbraColors.amber)))
             else if (_error != null)
-              AmbraCard(child: Text('Could not load wallet: $_error', style: const TextStyle(color: AmbraColors.red)))
+              AmbraCard(child: Text(_error!, style: const TextStyle(color: AmbraColors.red)))
             else ...[
               const SectionLabel('Asset'),
               const SizedBox(height: 8),
