@@ -63,7 +63,7 @@ Future<void> validateAddress({required String address}) =>
     RustLib.instance.api.crateApiValidateAddress(address: address);
 
 /// Build an UNSIGNED send PSET (base64). Syncs first so the wallet has utxos.
-/// `fee_asset` pays the fee in a non-native asset at the EXACT published rate
+/// `fee_asset` pays the fee in any accepted asset at the EXACT published rate
 /// (never fabricated); `fee_rate_sat_kvb` None = builder default. RBF is on by
 /// default (so a stuck tx can be bump/CPFP-rescued later).
 Future<String> buildSendTx({
@@ -299,7 +299,7 @@ class AssetDelta {
           atoms == other.atoms;
 }
 
-/// Pay the fee in a non-native asset at the node's published rate.
+/// Pay the fee in any accepted asset at the node's published rate.
 class FeeAsset {
   final String assetId;
   final BigInt rate;

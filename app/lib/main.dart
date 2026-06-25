@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'src/data/node_config.dart';
 import 'src/data/price_service.dart';
 import 'src/data/wallet_repository.dart';
 import 'src/rust/frb_generated.dart';
@@ -11,6 +12,7 @@ import 'src/theme/theme.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await RustLib.init();
+  await NodeConfig.instance.load(); // apply a saved custom node before any fetch
   await WalletRepository.instance.load();
   await PriceService.instance.load();
   runApp(const AmbraApp());

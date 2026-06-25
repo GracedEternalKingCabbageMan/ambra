@@ -15,7 +15,7 @@ class FaucetResult {
 class ApiClient {
   ApiClient._();
 
-  /// Request testnet coins to [address]. Empty/null [asset] = native tSEQ.
+  /// Request testnet coins to [address]. Empty/null [asset] = tSEQ.
   static Future<FaucetResult> faucet(String address, {String? asset}) async {
     final body = (asset == null || asset.isEmpty)
         ? <String, String>{'address': address}

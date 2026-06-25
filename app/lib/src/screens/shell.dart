@@ -5,6 +5,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 import '../rust/api.dart' as core;
 import '../data/config.dart';
 import '../data/format.dart';
+import '../data/node_config.dart';
 import '../data/price_service.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
@@ -12,6 +13,7 @@ import '../widgets/widgets.dart';
 import 'assets_screen.dart';
 import 'faucet_screen.dart';
 import 'history_screen.dart';
+import 'node_screen.dart';
 import 'send_screen.dart';
 import 'stake_screen.dart';
 
@@ -27,10 +29,10 @@ class _ShellState extends State<Shell> {
   @override
   Widget build(BuildContext context) {
     final tabs = <Widget>[
-      const BalanceTab(),
-      const SendTab(),
+      BalanceTab(isActive: _tab == 0),
+      SendTab(isActive: _tab == 1),
       const ReceiveTab(),
-      const HistoryTab(),
+      HistoryTab(isActive: _tab == 3),
       const MoreTab(),
     ];
     return Scaffold(
@@ -45,7 +47,8 @@ class _ShellState extends State<Shell> {
 // Balance (M3: shows network + your main receive address; live balances = M4)
 // ---------------------------------------------------------------------------
 class BalanceTab extends StatefulWidget {
-  const BalanceTab({super.key});
+  const BalanceTab({super.key, this.isActive = false});
+  final bool isActive;
   @override
   State<BalanceTab> createState() => _BalanceTabState();
 }
@@ -60,6 +63,14 @@ class _BalanceTabState extends State<BalanceTab> {
     super.initState();
     PriceService.instance.addListener(_onPrice);
     _refresh();
+  }
+
+  @override
+  void didUpdateWidget(BalanceTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Re-sync whenever this tab becomes visible (assets may have arrived while
+    // the user was on another tab).
+    if (widget.isActive && !oldWidget.isActive) _refresh();
   }
 
   void _onPrice() {
@@ -88,27 +99,39 @@ class _BalanceTabState extends State<BalanceTab> {
     } catch (e) {
       if (mounted) {
         setState(() {
-          _error = friendlyError(e);
+          if (_sync == null) _error = friendlyError(e); // keep last-good on a transient reload error
           _loading = false;
         });
       }
     }
   }
 
-  String _tseq() {
-    final hit = _sync?.balances.where((b) => b.assetId == SeqAssets.policy);
-    if (hit == null || hit.isEmpty) return '0';
-    return formatAtoms(hit.first.atoms, 8);
-  }
-
-  String _policyAtoms() {
-    final hit = _sync?.balances.where((b) => b.assetId == SeqAssets.policy);
-    return (hit == null || hit.isEmpty) ? '0' : hit.first.atoms;
+  /// Total portfolio value in the reference currency, summed across every asset
+  /// equally (no asset privileged). null if nothing held can be priced.
+  double? _totalRef() {
+    final s = _sync;
+    if (s == null) return null;
+    double sum = 0;
+    bool any = false;
+    for (final b in s.balances) {
+      final label = SeqAssets.labelFor(b.assetId);
+      final v = PriceService.instance.refValue(label.ticker, b.atoms, label.precision);
+      if (v != null) {
+        sum += v;
+        any = true;
+      }
+    }
+    return any ? sum : null;
   }
 
   @override
   Widget build(BuildContext context) {
     final sync = _sync;
+    // Only assets actually held — tSEQ is not privileged, so a 0 balance is
+    // hidden just like any other asset's would be.
+    final held = sync == null
+        ? const <core.AssetBalance>[]
+        : sync.balances.where((b) => (BigInt.tryParse(b.atoms) ?? BigInt.zero) > BigInt.zero).toList();
     return RefreshIndicator(
       onRefresh: _refresh,
       color: AmbraColors.amber,
@@ -126,18 +149,21 @@ class _BalanceTabState extends State<BalanceTab> {
             _SyncChip(loading: _loading, tip: sync?.tipHeight),
           ]),
           const SizedBox(height: 28),
-          Text('SEQUENTIA BALANCE', style: AmbraText.label),
+          Text('TOTAL BALANCE', style: AmbraText.label),
           const SizedBox(height: 6),
-          Row(crossAxisAlignment: CrossAxisAlignment.baseline, textBaseline: TextBaseline.alphabetic, children: [
-            Text(sync == null ? '—' : _tseq(), style: AmbraText.hero),
-            const SizedBox(width: 8),
-            const Text('tSEQ',
-                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: AmbraColors.amber2)),
-          ]),
-          if (sync != null && PriceService.instance.approx('tSEQ', _policyAtoms(), 8) != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 6),
-              child: Text(PriceService.instance.approx('tSEQ', _policyAtoms(), 8)!, style: AmbraText.sub),
+          Builder(builder: (_) {
+            final total = sync == null ? null : _totalRef();
+            return Row(crossAxisAlignment: CrossAxisAlignment.baseline, textBaseline: TextBaseline.alphabetic, children: [
+              Text(total == null ? '—' : PriceService.instance.fmtRef(total), style: AmbraText.hero),
+              const SizedBox(width: 8),
+              Text(PriceService.instance.ref,
+                  style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: AmbraColors.amber2)),
+            ]);
+          }),
+          if (sync != null && _totalRef() == null)
+            const Padding(
+              padding: EdgeInsets.only(top: 6),
+              child: Text('Live prices unavailable — see per-asset amounts below.', style: AmbraText.sub),
             ),
           const SizedBox(height: 24),
           if (_error != null)
@@ -146,7 +172,7 @@ class _BalanceTabState extends State<BalanceTab> {
             const Padding(
                 padding: EdgeInsets.only(top: 40),
                 child: Center(child: CircularProgressIndicator(color: AmbraColors.amber)))
-          else if (sync.balances.isEmpty)
+          else if (held.isEmpty)
             const AmbraCard(
                 child: Text(
                     'No funds yet. Get free testnet coins from the faucet (More tab), '
@@ -157,7 +183,7 @@ class _BalanceTabState extends State<BalanceTab> {
             const SizedBox(height: 10),
             AmbraCard(
               padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 16),
-              child: Column(children: [for (final b in sync.balances) _AssetRow(balance: b)]),
+              child: Column(children: [for (final b in held) _AssetRow(balance: b)]),
             ),
           ],
         ],
@@ -311,6 +337,11 @@ class _ReceiveTabState extends State<ReceiveTab> {
     }
   }
 
+  void _copy(String text, String msg) {
+    Clipboard.setData(ClipboardData(text: text));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
   @override
   Widget build(BuildContext context) {
     return ListView(
@@ -349,6 +380,13 @@ class _ReceiveTabState extends State<ReceiveTab> {
                     : 'Also receives Bitcoin (testnet4) — one address, both chains.',
                 style: AmbraText.sub,
               ),
+              const SizedBox(height: 14),
+              SecondaryButton(
+                label: _confidential ? 'Copy confidential address' : 'Copy address',
+                icon: Icons.copy,
+                onPressed: () =>
+                    _copy(_address!, _confidential ? 'Confidential address copied' : 'Address copied'),
+              ),
             ],
           ]),
         ),
@@ -357,43 +395,40 @@ class _ReceiveTabState extends State<ReceiveTab> {
           AmbraCard(
             child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
               const SectionLabel('Bitcoin / non-confidential address'),
-              const SizedBox(height: 12),
+              const SizedBox(height: 14),
+              Center(
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12)),
+                  child: QrImageView(
+                      data: _bitcoinAddress!, version: QrVersions.auto, size: 168, backgroundColor: Colors.white),
+                ),
+              ),
+              const SizedBox(height: 14),
               SelectableText(_bitcoinAddress!, style: AmbraText.mono.copyWith(fontSize: 14)),
               const SizedBox(height: 10),
               const Text('Use this transparent address to also receive Bitcoin (testnet4).',
                   style: AmbraText.sub),
+              const SizedBox(height: 14),
+              SecondaryButton(
+                label: 'Copy Bitcoin address',
+                icon: Icons.copy,
+                onPressed: () => _copy(_bitcoinAddress!, 'Bitcoin address copied'),
+              ),
             ]),
           ),
         ],
         const SizedBox(height: 14),
-        Row(children: [
-          Expanded(
-            child: SecondaryButton(
-              label: 'Copy',
-              icon: Icons.copy,
-              onPressed: _address == null
-                  ? null
-                  : () {
-                      Clipboard.setData(ClipboardData(text: _address!));
-                      ScaffoldMessenger.of(context)
-                          .showSnackBar(const SnackBar(content: Text('Address copied')));
-                    },
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: SecondaryButton(
-              label: 'New address',
-              icon: Icons.refresh,
-              onPressed: _address == null
-                  ? null
-                  : () {
-                      _index++;
-                      _load();
-                    },
-            ),
-          ),
-        ]),
+        SecondaryButton(
+          label: _confidential ? 'New addresses' : 'New address',
+          icon: Icons.refresh,
+          onPressed: _address == null
+              ? null
+              : () {
+                  _index++;
+                  _load();
+                },
+        ),
         const SizedBox(height: 18),
         SwitchListTile(
           contentPadding: EdgeInsets.zero,
@@ -471,13 +506,24 @@ class MoreTab extends StatelessWidget {
       children: [
         const Text('More', style: AmbraText.h1),
         const SizedBox(height: 20),
-        AmbraCard(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            SectionLabel('Network'),
-            const SizedBox(height: 12),
-            const _Kv('Network', 'sequentia-testnet'),
-            const _Kv('Explorer API', Backend.esplora),
-          ]),
+        ListenableBuilder(
+          listenable: NodeConfig.instance,
+          builder: (context, _) => AmbraCard(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              const SectionLabel('Node'),
+              const SizedBox(height: 12),
+              const _Kv('Network', 'sequentia-testnet'),
+              _Kv('Node', NodeConfig.instance.origin),
+              _Kv('Source', NodeConfig.instance.isDefault ? 'Default (public testnet)' : 'Custom'),
+              const SizedBox(height: 12),
+              SecondaryButton(
+                label: 'Change node',
+                icon: Icons.dns_outlined,
+                onPressed: () =>
+                    Navigator.of(context).push(MaterialPageRoute(builder: (_) => const NodeScreen())),
+              ),
+            ]),
+          ),
         ),
         const SizedBox(height: 14),
         AmbraCard(

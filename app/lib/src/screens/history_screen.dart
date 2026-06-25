@@ -1,16 +1,19 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../rust/api.dart' as core;
 import '../data/config.dart';
 import '../data/format.dart';
+import '../data/price_service.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 import 'rescue_screen.dart';
 
 class HistoryTab extends StatefulWidget {
-  const HistoryTab({super.key});
+  const HistoryTab({super.key, this.isActive = false});
+  final bool isActive;
   @override
   State<HistoryTab> createState() => _HistoryTabState();
 }
@@ -25,6 +28,14 @@ class _HistoryTabState extends State<HistoryTab> {
     _load();
   }
 
+  @override
+  void didUpdateWidget(HistoryTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Re-pull when the tab is opened so newly-confirmed/received txs show up
+    // without restarting the app.
+    if (widget.isActive && !oldWidget.isActive) _load();
+  }
+
   Future<void> _load() async {
     try {
       final m = await WalletRepository.instance.readMnemonic();
@@ -36,9 +47,14 @@ class _HistoryTabState extends State<HistoryTab> {
         if (b.height == null) return 1;
         return b.height!.compareTo(a.height!);
       });
-      if (mounted) setState(() => _txs = txs);
+      if (mounted) {
+        setState(() {
+          _txs = txs;
+          _error = null;
+        });
+      }
     } catch (e) {
-      if (mounted) setState(() => _error = friendlyError(e));
+      if (mounted && _txs == null) setState(() => _error = friendlyError(e)); // keep last-good on reload
     }
   }
 
@@ -104,16 +120,11 @@ class _TxRowView extends StatelessWidget {
 
     return InkWell(
       onTap: () async {
-        if (tx.height == null) {
-          final txid = await showRescueActions(context, tx);
-          if (txid != null && context.mounted) {
-            ScaffoldMessenger.of(context)
-                .showSnackBar(SnackBar(content: Text('Rescue broadcast — ${txid.substring(0, 16)}…')));
-            onRescued();
-          }
-        } else {
-          Clipboard.setData(ClipboardData(text: tx.txid));
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Transaction id copied')));
+        final rescuedTxid = await showTxDetail(context, tx);
+        if (rescuedTxid != null && context.mounted) {
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text('Rescue broadcast — ${rescuedTxid.substring(0, 16)}…')));
+          onRescued();
         }
       },
       child: Padding(
@@ -168,4 +179,181 @@ class _Badge extends StatelessWidget {
         ),
         child: Text(text, style: TextStyle(color: fg, fontSize: 10, fontWeight: FontWeight.w700, letterSpacing: 0.4)),
       );
+}
+
+// ---------------------------------------------------------------------------
+// Transaction detail — full breakdown + explorer link, opened on tap.
+// Returns a txid if a rescue was broadcast from here (caller refreshes).
+// ---------------------------------------------------------------------------
+Future<String?> showTxDetail(BuildContext context, core.TxRow tx) {
+  return showModalBottomSheet<String>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: AmbraColors.panel,
+    shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+    builder: (_) => _TxDetailSheet(tx: tx),
+  );
+}
+
+String _kindTitle(String kind) {
+  switch (kind) {
+    case 'incoming':
+      return 'Received';
+    case 'outgoing':
+      return 'Sent';
+    case 'issuance':
+      return 'Asset issuance';
+    case 'reissuance':
+      return 'Asset reissuance';
+    case 'burn':
+      return 'Burn';
+    case 'redeposit':
+      return 'Internal transfer';
+    default:
+      return 'Transaction';
+  }
+}
+
+String _fmtTime(BigInt? ts) {
+  if (ts == null) return '—';
+  final d = DateTime.fromMillisecondsSinceEpoch(ts.toInt() * 1000).toLocal();
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${d.year}-${two(d.month)}-${two(d.day)} ${two(d.hour)}:${two(d.minute)}';
+}
+
+class _TxDetailSheet extends StatelessWidget {
+  const _TxDetailSheet({required this.tx});
+  final core.TxRow tx;
+
+  Future<void> _openExplorer(BuildContext context) async {
+    final url = Uri.parse(Backend.explorerTx(tx.txid));
+    try {
+      if (await launchUrl(url, mode: LaunchMode.externalApplication)) return;
+    } catch (_) {/* no browser / blocked — fall through to copy */}
+    if (context.mounted) {
+      Clipboard.setData(ClipboardData(text: url.toString()));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Couldn\'t open a browser — explorer link copied')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final (fg, bg, badge) = _badgeFor(tx.kind);
+    final settled = tx.height != null;
+    final showFee = tx.fee > BigInt.zero &&
+        (tx.kind == 'outgoing' || tx.kind == 'burn' || tx.kind == 'issuance' || tx.kind == 'reissuance');
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+        child: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Row(children: [
+              _Badge(text: badge, fg: fg, bg: bg),
+              const SizedBox(width: 12),
+              Text(_kindTitle(tx.kind), style: AmbraText.h1),
+            ]),
+            const SizedBox(height: 18),
+            AmbraCard(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+              child: Column(children: [
+                _DetailRow('Status', settled ? 'Settled · block ${tx.height}' : 'Pending — not yet in a block'),
+                _DetailRow('Date', _fmtTime(tx.timestamp)),
+                _DetailRow('Network', 'sequentia-testnet'),
+                if (showFee) _DetailRow('Network fee', '${formatAtoms(tx.fee.toString(), 8)} tSEQ'),
+              ]),
+            ),
+            const SizedBox(height: 14),
+            const SectionLabel('Amount'),
+            const SizedBox(height: 8),
+            AmbraCard(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+              child: Column(children: [for (final d in tx.deltas) _DeltaRow(delta: d)]),
+            ),
+            const SizedBox(height: 14),
+            const SectionLabel('Transaction ID'),
+            const SizedBox(height: 8),
+            SelectableText(tx.txid, style: AmbraText.mono.copyWith(fontSize: 13)),
+            const SizedBox(height: 16),
+            SecondaryButton(label: 'View in explorer', icon: Icons.open_in_new, onPressed: () => _openExplorer(context)),
+            const SizedBox(height: 10),
+            SecondaryButton(
+              label: 'Copy transaction id',
+              icon: Icons.copy,
+              onPressed: () {
+                Clipboard.setData(ClipboardData(text: tx.txid));
+                ScaffoldMessenger.of(context)
+                    .showSnackBar(const SnackBar(content: Text('Transaction id copied')));
+              },
+            ),
+            if (!settled) ...[
+              const SizedBox(height: 10),
+              PrimaryButton(
+                label: 'Speed up / bump fee',
+                icon: Icons.bolt,
+                onPressed: () async {
+                  final txid = await showRescueActions(context, tx);
+                  if (txid != null && context.mounted) Navigator.of(context).pop(txid);
+                },
+              ),
+            ],
+            const SizedBox(height: 6),
+            GhostButton(label: 'Close', onPressed: () => Navigator.of(context).pop()),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+class _DetailRow extends StatelessWidget {
+  const _DetailRow(this.k, this.v);
+  final String k;
+  final String v;
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 10),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          SizedBox(width: 96, child: Text(k, style: AmbraText.sub)),
+          Expanded(child: Text(v, textAlign: TextAlign.right, style: AmbraText.body)),
+        ]),
+      );
+}
+
+class _DeltaRow extends StatelessWidget {
+  const _DeltaRow({required this.delta});
+  final core.AssetDelta delta;
+  @override
+  Widget build(BuildContext context) {
+    final label = SeqAssets.labelFor(delta.assetId);
+    final atoms = BigInt.tryParse(delta.atoms) ?? BigInt.zero;
+    final neg = atoms.isNegative;
+    final amount = '${neg ? '' : '+'}${formatAtoms(atoms.toString(), label.precision)} ${label.ticker}';
+    final approx = PriceService.instance.approx(label.ticker, atoms.toString(), label.precision);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Row(children: [
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(label.ticker,
+                style: const TextStyle(color: AmbraColors.txt, fontWeight: FontWeight.w600, fontSize: 14)),
+            if (label.subtitle != null) ...[
+              const SizedBox(height: 2),
+              Text(label.subtitle!, style: AmbraText.sub, maxLines: 1, overflow: TextOverflow.ellipsis),
+            ],
+          ]),
+        ),
+        const SizedBox(width: 10),
+        Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
+          Text(amount,
+              style: AmbraText.mono.copyWith(
+                  color: neg ? AmbraColors.amber2 : AmbraColors.green, fontWeight: FontWeight.w700, fontSize: 14)),
+          if (approx != null) ...[
+            const SizedBox(height: 2),
+            Text(approx, style: AmbraText.sub),
+          ],
+        ]),
+      ]),
+    );
+  }
 }

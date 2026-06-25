@@ -10,7 +10,8 @@ import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 
 class SendTab extends StatefulWidget {
-  const SendTab({super.key});
+  const SendTab({super.key, this.isActive = false});
+  final bool isActive;
   @override
   State<SendTab> createState() => _SendTabState();
 }
@@ -21,7 +22,8 @@ class _SendTabState extends State<SendTab> {
   List<core.AssetBalance> _balances = [];
   Map<String, BigInt> _feeRates = {};
   String _assetId = SeqAssets.policy;
-  String? _feeAsset; // null = native tSEQ
+  String? _feeAsset; // null = pay the fee in tSEQ (the builder's default)
+  bool _feeManual = false; // true once the user explicitly picks a fee asset
   bool _loading = true;
   String? _error;
 
@@ -32,11 +34,26 @@ class _SendTabState extends State<SendTab> {
   }
 
   @override
+  void didUpdateWidget(SendTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Re-sync when the tab is opened so newly-received assets are sendable
+    // without restarting the app. Form fields are preserved across the reload.
+    if (widget.isActive && !oldWidget.isActive) _load();
+  }
+
+  @override
   void dispose() {
     _addr.dispose();
     _amount.dispose();
     super.dispose();
   }
+
+  /// Asset ids the wallet actually holds (balance > 0). tSEQ is not privileged,
+  /// so it only appears here when funded — just like every other asset.
+  List<String> _heldIds() => _balances
+      .where((b) => (BigInt.tryParse(b.atoms) ?? BigInt.zero) > BigInt.zero)
+      .map((b) => b.assetId)
+      .toList();
 
   Future<void> _load() async {
     try {
@@ -46,21 +63,30 @@ class _SendTabState extends State<SendTab> {
       Map<String, BigInt> rates = {};
       try {
         rates = await ApiClient.feeRates();
-      } catch (_) {/* fee asset unavailable; native fee still works */}
+      } catch (_) {/* fee-rate list unavailable; the default tSEQ fee still works */}
       if (!mounted) return;
       setState(() {
         _balances = s.balances;
         _feeRates = rates;
-        final hasPolicy = s.balances.any((b) => b.assetId == SeqAssets.policy);
-        _assetId = hasPolicy
-            ? SeqAssets.policy
-            : (s.balances.isNotEmpty ? s.balances.first.assetId : SeqAssets.policy);
+        // Default the send asset to one you hold (keep the current choice if it's
+        // still funded). Never default to tSEQ when its balance is 0.
+        final held = _heldIds();
+        if (!held.contains(_assetId)) {
+          _assetId = held.isNotEmpty ? held.first : SeqAssets.policy;
+        }
+        // Default the fee to the asset being sent (asset-agnostic). Keep the
+        // user's manual fee choice while they still hold it; otherwise re-apply
+        // the default for the current send asset.
+        if (_feeManual && _feeAsset != null && !_heldIds().contains(_feeAsset)) {
+          _feeManual = false;
+        }
+        if (!_feeManual) _feeAsset = _defaultFeeFor(_assetId);
         _loading = false;
       });
     } catch (e) {
       if (mounted) {
         setState(() {
-          _error = friendlyError(e);
+          if (_balances.isEmpty) _error = friendlyError(e); // keep last-good on a transient reload error
           _loading = false;
         });
       }
@@ -81,30 +107,50 @@ class _SendTabState extends State<SendTab> {
     return _feeRates[t] ?? _feeRates[hex]; // already filtered to >0 in feeRates()
   }
 
-  /// Owned, fee-priced, and actually funded (a different asset can't pay the fee).
-  List<String> _feeEligible() => _balances
-      .map((b) => b.assetId)
-      .where((id) =>
-          id != SeqAssets.policy &&
-          _rateFor(id) != null &&
-          (BigInt.tryParse(_balanceOf(id)) ?? BigInt.zero) > BigInt.zero)
-      .toList();
-
   String get _feeLabel => _feeAsset == null ? 'tSEQ' : SeqAssets.labelFor(_feeAsset!).ticker;
 
+  /// 1:1 reference-unit fallback rate (atoms-per-rfa × 1e8) for an asset the node
+  /// doesn't price — so the fee still builds and the relay/producers decide.
+  static final BigInt _refScale = BigInt.from(100000000);
+
+  /// Every asset you hold is a valid fee option — no asset is privileged. The
+  /// '' sentinel = the policy asset (tSEQ), one option among equals.
+  List<String> _feeOptions() => _heldIds().map((id) => id == SeqAssets.policy ? '' : id).toList();
+
+  /// The fee defaults to the asset being sent (asset-agnostic). null = pay in
+  /// tSEQ, only when tSEQ is what you're sending.
+  String? _defaultFeeFor(String assetId) => assetId == SeqAssets.policy ? null : assetId;
+
+  /// Build rate for the chosen fee asset: the node's published rate, or a 1:1
+  /// reference fallback when the node doesn't price it (the tx still builds).
+  BigInt _feeRate(String assetId) => _rateFor(assetId) ?? _refScale;
+
+  /// True when the chosen fee asset isn't priced by the node (estimated rate).
+  bool get _feeUnpriced => _feeAsset != null && _rateFor(_feeAsset!) == null;
+
   Future<void> _pickAsset() async {
-    final picked = await _assetSheet('Choose asset', _balances.map((b) => b.assetId).toList(), withBalances: true);
-    if (picked != null) setState(() => _assetId = picked);
+    final picked = await _assetSheet('Choose asset', _heldIds(), withBalances: true);
+    if (picked != null) {
+      setState(() {
+        _assetId = picked;
+        // Re-apply the "fee in the asset being sent" default for the new asset.
+        _feeManual = false;
+        _feeAsset = _defaultFeeFor(picked);
+      });
+    }
   }
 
   Future<void> _pickFee() async {
-    // '' sentinel = native tSEQ.
-    final ids = ['', ..._feeEligible()];
-    final picked = await _assetSheet('Pay fee in', ids, nativeLabel: 'tSEQ (native)');
-    if (picked != null) setState(() => _feeAsset = picked.isEmpty ? null : picked);
+    final picked = await _assetSheet('Pay fee in', _feeOptions());
+    if (picked != null) {
+      setState(() {
+        _feeManual = true;
+        _feeAsset = picked.isEmpty ? null : picked;
+      });
+    }
   }
 
-  Future<String?> _assetSheet(String title, List<String> ids, {bool withBalances = false, String? nativeLabel}) {
+  Future<String?> _assetSheet(String title, List<String> ids, {bool withBalances = false}) {
     return showModalBottomSheet<String>(
       context: context,
       backgroundColor: AmbraColors.panel,
@@ -114,7 +160,7 @@ class _SendTabState extends State<SendTab> {
           Padding(padding: const EdgeInsets.all(16), child: Text(title, style: AmbraText.title)),
           for (final id in ids)
             ListTile(
-              title: Text(id.isEmpty ? (nativeLabel ?? 'tSEQ') : SeqAssets.labelFor(id).ticker, style: AmbraText.body),
+              title: Text(id.isEmpty ? 'tSEQ' : SeqAssets.labelFor(id).ticker, style: AmbraText.body),
               trailing: withBalances
                   ? Text(formatAtoms(_balanceOf(id), SeqAssets.labelFor(id).precision), style: AmbraText.mono)
                   : null,
@@ -133,6 +179,12 @@ class _SendTabState extends State<SendTab> {
     return '0';
   }
 
+  /// Warning copy when the chosen fee asset isn't priced by this node — the rate
+  /// is estimated and producers may reject it (rescue via RBF).
+  String _feeUnpricedMessage() =>
+      '$_feeLabel isn\'t priced for fees by this node, so the fee rate is estimated. '
+      'Producers may not accept it — if it stalls, speed it up or replace it (RBF) from History.';
+
   void _snack(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
 
   Future<void> _review() async {
@@ -149,22 +201,16 @@ class _SendTabState extends State<SendTab> {
     // fee), so the user isn't asked to authorize a doomed payment.
     core.FeeAsset? feeAsset;
     if (_feeAsset == null) {
-      if (_assetId == SeqAssets.policy) {
-        if (atoms == bal) {
-          return _snack('Leave a little tSEQ for the network fee — send a bit less.');
-        }
-      } else {
-        final tseq = BigInt.tryParse(_balanceOf(SeqAssets.policy)) ?? BigInt.zero;
-        if (tseq <= BigInt.zero) {
-          return _snack('You need some tSEQ for the network fee. Use the faucet, or pay the fee in ${label.ticker}.');
-        }
+      // Paying in the policy asset (tSEQ) — only happens when you're sending it;
+      // leave a little behind for the fee.
+      if (_assetId == SeqAssets.policy && atoms == bal) {
+        return _snack('Leave a little tSEQ for the network fee — send a bit less.');
       }
     } else {
-      final rate = _rateFor(_feeAsset!);
-      if (rate == null) return _snack('No published fee rate for $_feeLabel');
       final feeBal = BigInt.tryParse(_balanceOf(_feeAsset!)) ?? BigInt.zero;
       if (feeBal <= BigInt.zero) return _snack('You have no $_feeLabel to pay the fee with.');
-      feeAsset = core.FeeAsset(assetId: _feeAsset!, rate: rate);
+      // Priced → node rate; unpriced → 1:1 reference fallback so the tx builds.
+      feeAsset = core.FeeAsset(assetId: _feeAsset!, rate: _feeRate(_feeAsset!));
     }
 
     final txid = await showModalBottomSheet<String>(
@@ -197,7 +243,9 @@ class _SendTabState extends State<SendTab> {
   Widget build(BuildContext context) {
     final label = SeqAssets.labelFor(_assetId);
     final bal = _selected;
-    final canFeeAsset = _feeEligible().isNotEmpty;
+    final held = _heldIds();
+    final canPickFee = _feeOptions().length > 1; // more than one held asset to choose from
+    final canSend = !_loading && _error == null && held.isNotEmpty;
     return Column(
       children: [
         Expanded(
@@ -208,13 +256,19 @@ class _SendTabState extends State<SendTab> {
               const Padding(padding: EdgeInsets.only(top: 40), child: Center(child: CircularProgressIndicator(color: AmbraColors.amber)))
             else if (_error != null)
               AmbraCard(child: Text(_error!, style: const TextStyle(color: AmbraColors.red)))
+            else if (held.isEmpty)
+              const AmbraCard(
+                  child: Text(
+                      'No assets to send yet. Get free testnet coins from the faucet (More tab), '
+                      'or receive funds to your address.',
+                      style: AmbraText.muted))
             else ...[
               const SectionLabel('Asset'),
               const SizedBox(height: 8),
               _PickerField(
                 label: label.ticker,
                 trailing: bal == null ? null : 'balance ${formatAtoms(bal.atoms, label.precision)}',
-                onTap: _balances.isEmpty ? null : _pickAsset,
+                onTap: _pickAsset,
               ),
               const SizedBox(height: 18),
               AmbraField(label: 'Recipient address', controller: _addr, hint: 'tb1… or tsqb1…', mono: true),
@@ -225,21 +279,24 @@ class _SendTabState extends State<SendTab> {
               const SizedBox(height: 8),
               _PickerField(
                 label: _feeLabel,
-                trailing: canFeeAsset ? 'any accepted asset' : 'native',
-                onTap: canFeeAsset ? _pickFee : null,
+                trailing: canPickFee ? 'any asset you hold' : null,
+                onTap: canPickFee ? _pickFee : null,
               ),
               const SizedBox(height: 10),
-              Text(
-                _feeAsset == null
-                    ? 'Fee paid natively in tSEQ.'
-                    : 'Fee paid in $_feeLabel at the producer\'s published rate. '
-                        'Confirmation depends on producers accepting it.',
-                style: AmbraText.sub,
-              ),
+              if (_feeUnpriced)
+                WarnCallout(_feeUnpricedMessage())
+              else
+                Text(
+                  _feeAsset == null
+                      ? 'Fee paid in tSEQ at the network rate.'
+                      : 'Fee paid in $_feeLabel at the node\'s published rate. '
+                          'Confirmation depends on producers accepting it.',
+                  style: AmbraText.sub,
+                ),
             ],
           ]),
         ),
-        if (!_loading && _error == null)
+        if (canSend)
           BottomActionBar(children: [
             PrimaryButton(label: 'Review & send', icon: Icons.north_east, onPressed: _review),
           ]),
