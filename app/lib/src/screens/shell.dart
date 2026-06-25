@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import '../rust/api.dart' as core;
 import '../data/config.dart';
+import '../data/format.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
@@ -36,44 +37,147 @@ class _ShellState extends State<Shell> {
 // ---------------------------------------------------------------------------
 // Balance (M3: shows network + your main receive address; live balances = M4)
 // ---------------------------------------------------------------------------
-class BalanceTab extends StatelessWidget {
+class BalanceTab extends StatefulWidget {
   const BalanceTab({super.key});
   @override
+  State<BalanceTab> createState() => _BalanceTabState();
+}
+
+class _BalanceTabState extends State<BalanceTab> {
+  core.WalletSync? _sync;
+  String? _error;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+  }
+
+  Future<void> _refresh() async {
+    if (mounted) setState(() => _error = null);
+    try {
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) return;
+      final s = await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
+      if (mounted) {
+        setState(() {
+          _sync = s;
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = '$e';
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  String _tseq() {
+    final hit = _sync?.balances.where((b) => b.assetId == SeqAssets.policy);
+    if (hit == null || hit.isEmpty) return '0';
+    return formatAtoms(hit.first.atoms, 8);
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
-      children: [
-        Row(children: [
-          const BrandMark(size: 34),
-          const SizedBox(width: 12),
-          const Text('Ambra', style: AmbraText.title),
-          const Spacer(),
-          Text('sequentia · testnet', style: AmbraText.sub),
-        ]),
-        const SizedBox(height: 28),
-        Text('TOTAL VALUE', style: AmbraText.label),
-        const SizedBox(height: 6),
-        Row(crossAxisAlignment: CrossAxisAlignment.baseline, textBaseline: TextBaseline.alphabetic, children: const [
-          Text('—', style: AmbraText.hero),
-          SizedBox(width: 8),
-          Text('USD', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: AmbraColors.amber2)),
-        ]),
-        const SizedBox(height: 24),
-        const AmbraCard(
-          child: Row(children: [
-            Icon(Icons.sync, color: AmbraColors.dim, size: 20),
-            SizedBox(width: 12),
-            Expanded(
-              child: Text(
-                'Live multi-asset balances and history arrive in the next build. '
-                'Your wallet is created and secured — receive funds on the Receive tab.',
-                style: AmbraText.muted,
-              ),
+    final sync = _sync;
+    return RefreshIndicator(
+      onRefresh: _refresh,
+      color: AmbraColors.amber,
+      backgroundColor: AmbraColors.panel,
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+        children: [
+          Row(children: [
+            const BrandMark(size: 34),
+            const SizedBox(width: 12),
+            const Text('Ambra', style: AmbraText.title),
+            const Spacer(),
+            _SyncChip(loading: _loading, tip: sync?.tipHeight),
+          ]),
+          const SizedBox(height: 28),
+          Text('SEQUENTIA BALANCE', style: AmbraText.label),
+          const SizedBox(height: 6),
+          Row(crossAxisAlignment: CrossAxisAlignment.baseline, textBaseline: TextBaseline.alphabetic, children: [
+            Text(sync == null ? '—' : _tseq(), style: AmbraText.hero),
+            const SizedBox(width: 8),
+            const Text('tSEQ',
+                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: AmbraColors.amber2)),
+          ]),
+          const SizedBox(height: 24),
+          if (_error != null)
+            AmbraCard(child: Text('Sync failed: $_error', style: const TextStyle(color: AmbraColors.red)))
+          else if (sync == null)
+            const Padding(
+                padding: EdgeInsets.only(top: 40),
+                child: Center(child: CircularProgressIndicator(color: AmbraColors.amber)))
+          else if (sync.balances.isEmpty)
+            const AmbraCard(
+                child: Text(
+                    'No funds yet. Get free testnet coins from the faucet (More tab), '
+                    'or share your address on Receive.',
+                    style: AmbraText.muted))
+          else ...[
+            Text('ASSETS', style: AmbraText.label),
+            const SizedBox(height: 10),
+            AmbraCard(
+              padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 16),
+              child: Column(children: [for (final b in sync.balances) _AssetRow(balance: b)]),
             ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _AssetRow extends StatelessWidget {
+  const _AssetRow({required this.balance});
+  final core.AssetBalance balance;
+  @override
+  Widget build(BuildContext context) {
+    final label = SeqAssets.labelFor(balance.assetId);
+    final amount = formatAtoms(balance.atoms, label.precision);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Row(children: [
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(label.ticker,
+                style: const TextStyle(color: AmbraColors.txt, fontWeight: FontWeight.w600, fontSize: 15)),
+            const SizedBox(height: 2),
+            Text(label.subtitle ?? balance.assetId,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: label.subtitle != null ? AmbraText.sub : AmbraText.mono.copyWith(fontSize: 11)),
           ]),
         ),
-      ],
+        const SizedBox(width: 12),
+        Text(amount,
+            style: AmbraText.mono.copyWith(color: AmbraColors.txt, fontSize: 15, fontWeight: FontWeight.w700)),
+      ]),
     );
+  }
+}
+
+class _SyncChip extends StatelessWidget {
+  const _SyncChip({required this.loading, this.tip});
+  final bool loading;
+  final int? tip;
+  @override
+  Widget build(BuildContext context) {
+    return Row(mainAxisSize: MainAxisSize.min, children: [
+      if (loading)
+        const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 1.6, color: AmbraColors.dim))
+      else
+        Container(width: 7, height: 7, decoration: const BoxDecoration(color: AmbraColors.green, shape: BoxShape.circle)),
+      const SizedBox(width: 7),
+      Text(tip == null ? 'syncing' : 'block $tip', style: AmbraText.sub),
+    ]);
   }
 }
 
