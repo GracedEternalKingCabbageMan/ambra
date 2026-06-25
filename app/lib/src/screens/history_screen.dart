@@ -7,6 +7,7 @@ import '../data/format.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
+import 'rescue_screen.dart';
 
 class HistoryTab extends StatefulWidget {
   const HistoryTab({super.key});
@@ -60,7 +61,7 @@ class _HistoryTabState extends State<HistoryTab> {
         else
           AmbraCard(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-            child: Column(children: [for (final t in txs) _TxRowView(tx: t)]),
+            child: Column(children: [for (final t in txs) _TxRowView(tx: t, onRescued: () => _load())]),
           ),
       ]),
     );
@@ -68,8 +69,9 @@ class _HistoryTabState extends State<HistoryTab> {
 }
 
 class _TxRowView extends StatelessWidget {
-  const _TxRowView({required this.tx});
+  const _TxRowView({required this.tx, required this.onRescued});
   final core.TxRow tx;
+  final VoidCallback onRescued;
 
   core.AssetDelta? _top() {
     core.AssetDelta? top;
@@ -101,9 +103,18 @@ class _TxRowView extends StatelessWidget {
     final when = tx.height == null ? 'unconfirmed' : 'block ${tx.height}';
 
     return InkWell(
-      onTap: () {
-        Clipboard.setData(ClipboardData(text: tx.txid));
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Transaction id copied')));
+      onTap: () async {
+        if (tx.height == null) {
+          final txid = await showRescueActions(context, tx);
+          if (txid != null && context.mounted) {
+            ScaffoldMessenger.of(context)
+                .showSnackBar(SnackBar(content: Text('Rescue broadcast — ${txid.substring(0, 16)}…')));
+            onRescued();
+          }
+        } else {
+          Clipboard.setData(ClipboardData(text: tx.txid));
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Transaction id copied')));
+        }
       },
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 12),
