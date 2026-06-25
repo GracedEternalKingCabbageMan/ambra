@@ -9,6 +9,7 @@ import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 import 'faucet_screen.dart';
+import 'history_screen.dart';
 import 'send_screen.dart';
 
 class Shell extends StatefulWidget {
@@ -26,7 +27,7 @@ class _ShellState extends State<Shell> {
       const BalanceTab(),
       const SendTab(),
       const ReceiveTab(),
-      const _ComingTab(title: 'History', icon: Icons.receipt_long, note: 'Transaction history lands with sending (M5).'),
+      const HistoryTab(),
       const MoreTab(),
     ];
     return Scaffold(
@@ -419,32 +420,6 @@ class _Kv extends StatelessWidget {
           Expanded(child: Text(v, style: AmbraText.mono, textAlign: TextAlign.right)),
         ]),
       );
-}
-
-class _ComingTab extends StatelessWidget {
-  const _ComingTab({required this.title, required this.icon, required this.note});
-  final String title;
-  final IconData icon;
-  final String note;
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.all(24),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const SizedBox(height: 4),
-        Text(title, style: AmbraText.h1),
-        const Spacer(),
-        Center(
-          child: Column(children: [
-            Icon(icon, size: 40, color: AmbraColors.line),
-            const SizedBox(height: 16),
-            Text(note, textAlign: TextAlign.center, style: AmbraText.muted),
-          ]),
-        ),
-        const Spacer(),
-      ]),
-    );
-  }
 }
 
 // ---------------------------------------------------------------------------

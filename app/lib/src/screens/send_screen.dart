@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../rust/api.dart' as core;
+import '../data/api_client.dart';
 import '../data/config.dart';
 import '../data/format.dart';
 import '../data/wallet_repository.dart';
@@ -18,7 +19,9 @@ class _SendTabState extends State<SendTab> {
   final _addr = TextEditingController();
   final _amount = TextEditingController();
   List<core.AssetBalance> _balances = [];
+  Map<String, num> _feeRates = {};
   String _assetId = SeqAssets.policy;
+  String? _feeAsset; // null = native tSEQ
   bool _loading = true;
   String? _error;
 
@@ -40,9 +43,14 @@ class _SendTabState extends State<SendTab> {
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) return;
       final s = await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
+      Map<String, num> rates = {};
+      try {
+        rates = await ApiClient.feeRates();
+      } catch (_) {/* fee asset unavailable; native fee still works */}
       if (!mounted) return;
       setState(() {
         _balances = s.balances;
+        _feeRates = rates;
         final hasPolicy = s.balances.any((b) => b.assetId == SeqAssets.policy);
         _assetId = hasPolicy
             ? SeqAssets.policy
@@ -66,26 +74,58 @@ class _SendTabState extends State<SendTab> {
     return null;
   }
 
+  /// The published fee rate (atoms per reference unit) for an asset, keyed in
+  /// /feerates by ticker or hex (deployments vary). null = not fee-priced.
+  num? _rateFor(String hex) {
+    final t = SeqAssets.labelFor(hex).ticker;
+    final r = _feeRates[t] ?? _feeRates[hex];
+    return (r != null && r > 0) ? r : null;
+  }
+
+  List<String> _feeEligible() =>
+      _balances.map((b) => b.assetId).where((id) => id != SeqAssets.policy && _rateFor(id) != null).toList();
+
+  String get _feeLabel => _feeAsset == null ? 'tSEQ' : SeqAssets.labelFor(_feeAsset!).ticker;
+
   Future<void> _pickAsset() async {
-    final picked = await showModalBottomSheet<String>(
+    final picked = await _assetSheet('Choose asset', _balances.map((b) => b.assetId).toList(), withBalances: true);
+    if (picked != null) setState(() => _assetId = picked);
+  }
+
+  Future<void> _pickFee() async {
+    // '' sentinel = native tSEQ.
+    final ids = ['', ..._feeEligible()];
+    final picked = await _assetSheet('Pay fee in', ids, nativeLabel: 'tSEQ (native)');
+    if (picked != null) setState(() => _feeAsset = picked.isEmpty ? null : picked);
+  }
+
+  Future<String?> _assetSheet(String title, List<String> ids, {bool withBalances = false, String? nativeLabel}) {
+    return showModalBottomSheet<String>(
       context: context,
       backgroundColor: AmbraColors.panel,
-      shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
       builder: (_) => SafeArea(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          const Padding(padding: EdgeInsets.all(16), child: Text('Choose asset', style: AmbraText.title)),
-          for (final b in _balances)
+          Padding(padding: const EdgeInsets.all(16), child: Text(title, style: AmbraText.title)),
+          for (final id in ids)
             ListTile(
-              title: Text(SeqAssets.labelFor(b.assetId).ticker, style: AmbraText.body),
-              trailing: Text(formatAtoms(b.atoms, SeqAssets.labelFor(b.assetId).precision), style: AmbraText.mono),
-              onTap: () => Navigator.pop(context, b.assetId),
+              title: Text(id.isEmpty ? (nativeLabel ?? 'tSEQ') : SeqAssets.labelFor(id).ticker, style: AmbraText.body),
+              trailing: withBalances
+                  ? Text(formatAtoms(_balanceOf(id), SeqAssets.labelFor(id).precision), style: AmbraText.mono)
+                  : null,
+              onTap: () => Navigator.pop(context, id),
             ),
           const SizedBox(height: 8),
         ]),
       ),
     );
-    if (picked != null) setState(() => _assetId = picked);
+  }
+
+  String _balanceOf(String id) {
+    for (final b in _balances) {
+      if (b.assetId == id) return b.atoms;
+    }
+    return '0';
   }
 
   void _snack(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
@@ -99,18 +139,26 @@ class _SendTabState extends State<SendTab> {
     final bal = BigInt.tryParse(_selected?.atoms ?? '0') ?? BigInt.zero;
     if (atoms > bal) return _snack('Amount exceeds your ${label.ticker} balance');
 
+    core.FeeAsset? feeAsset;
+    if (_feeAsset != null) {
+      final rate = _rateFor(_feeAsset!);
+      if (rate == null) return _snack('No published fee rate for $_feeLabel');
+      feeAsset = core.FeeAsset(assetId: _feeAsset!, rate: BigInt.from(rate));
+    }
+
     final txid = await showModalBottomSheet<String>(
       context: context,
       isScrollControlled: true,
       backgroundColor: AmbraColors.panel,
-      shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
       builder: (_) => _ReviewSheet(
         address: addr,
         assetId: _assetId,
         atoms: atoms,
         ticker: label.ticker,
         amountStr: formatAtoms(atoms.toString(), label.precision),
+        feeAsset: feeAsset,
+        feeLabel: _feeLabel,
       ),
     );
     if (txid != null && mounted) {
@@ -128,6 +176,7 @@ class _SendTabState extends State<SendTab> {
   Widget build(BuildContext context) {
     final label = SeqAssets.labelFor(_assetId);
     final bal = _selected;
+    final canFeeAsset = _feeEligible().isNotEmpty;
     return Column(
       children: [
         Expanded(
@@ -141,33 +190,31 @@ class _SendTabState extends State<SendTab> {
             else ...[
               const SectionLabel('Asset'),
               const SizedBox(height: 8),
-              InkWell(
-                borderRadius: BorderRadius.circular(AmbraRadii.input),
+              _PickerField(
+                label: label.ticker,
+                trailing: bal == null ? null : 'balance ${formatAtoms(bal.atoms, label.precision)}',
                 onTap: _balances.isEmpty ? null : _pickAsset,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
-                  decoration: BoxDecoration(
-                    color: AmbraColors.panelDeep,
-                    border: Border.all(color: AmbraColors.line),
-                    borderRadius: BorderRadius.circular(AmbraRadii.input),
-                  ),
-                  child: Row(children: [
-                    Text(label.ticker, style: AmbraText.body),
-                    const Spacer(),
-                    if (bal != null)
-                      Text('balance ${formatAtoms(bal.atoms, label.precision)}', style: AmbraText.sub),
-                    const SizedBox(width: 8),
-                    const Icon(Icons.expand_more, color: AmbraColors.dim, size: 20),
-                  ]),
-                ),
               ),
               const SizedBox(height: 18),
               AmbraField(label: 'Recipient address', controller: _addr, hint: 'tb1… or tsqb1…', mono: true),
               const SizedBox(height: 18),
               AmbraField(label: 'Amount (${label.ticker})', controller: _amount, hint: '0.0'),
-              const SizedBox(height: 12),
-              Text('Fee is paid in the network default for now; any-asset fees + a reference value come next.',
-                  style: AmbraText.sub),
+              const SizedBox(height: 18),
+              const SectionLabel('Pay fee in'),
+              const SizedBox(height: 8),
+              _PickerField(
+                label: _feeLabel,
+                trailing: canFeeAsset ? 'any accepted asset' : 'native',
+                onTap: canFeeAsset ? _pickFee : null,
+              ),
+              const SizedBox(height: 10),
+              Text(
+                _feeAsset == null
+                    ? 'Fee paid natively in tSEQ.'
+                    : 'Fee paid in $_feeLabel at the producer\'s published rate. '
+                        'Confirmation depends on producers accepting it.',
+                style: AmbraText.sub,
+              ),
             ],
           ]),
         ),
@@ -180,6 +227,34 @@ class _SendTabState extends State<SendTab> {
   }
 }
 
+class _PickerField extends StatelessWidget {
+  const _PickerField({required this.label, this.trailing, this.onTap});
+  final String label;
+  final String? trailing;
+  final VoidCallback? onTap;
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(AmbraRadii.input),
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+        decoration: BoxDecoration(
+          color: AmbraColors.panelDeep,
+          border: Border.all(color: AmbraColors.line),
+          borderRadius: BorderRadius.circular(AmbraRadii.input),
+        ),
+        child: Row(children: [
+          Text(label, style: AmbraText.body),
+          const Spacer(),
+          if (trailing != null) Text(trailing!, style: AmbraText.sub),
+          if (onTap != null) ...[const SizedBox(width: 8), const Icon(Icons.expand_more, color: AmbraColors.dim, size: 20)],
+        ]),
+      ),
+    );
+  }
+}
+
 class _ReviewSheet extends StatefulWidget {
   const _ReviewSheet({
     required this.address,
@@ -187,12 +262,16 @@ class _ReviewSheet extends StatefulWidget {
     required this.atoms,
     required this.ticker,
     required this.amountStr,
+    required this.feeAsset,
+    required this.feeLabel,
   });
   final String address;
   final String assetId;
   final BigInt atoms;
   final String ticker;
   final String amountStr;
+  final core.FeeAsset? feeAsset;
+  final String feeLabel;
 
   @override
   State<_ReviewSheet> createState() => _ReviewSheetState();
@@ -222,6 +301,7 @@ class _ReviewSheetState extends State<_ReviewSheet> {
         mnemonic: m,
         esploraUrl: Backend.esplora,
         recipients: [core.Recipient(address: widget.address, assetId: widget.assetId, satoshi: widget.atoms)],
+        feeAsset: widget.feeAsset,
       );
       final signed = await core.signPset(mnemonic: m, pset: pset);
       final txid = await core.finalizeAndBroadcast(mnemonic: m, esploraUrl: Backend.esplora, pset: signed);
@@ -250,7 +330,7 @@ class _ReviewSheetState extends State<_ReviewSheet> {
               _Row('Amount', '${widget.amountStr} ${widget.ticker}'),
               _Row('To', widget.address, mono: true),
               _Row('Network', 'sequentia-testnet'),
-              const _Row('Fee', 'network default'),
+              _Row('Fee paid in', widget.feeLabel),
             ]),
           ),
           const SizedBox(height: 14),
@@ -274,7 +354,7 @@ class _Row extends StatelessWidget {
   Widget build(BuildContext context) => Padding(
         padding: const EdgeInsets.symmetric(vertical: 10),
         child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          SizedBox(width: 80, child: Text(k, style: AmbraText.sub)),
+          SizedBox(width: 90, child: Text(k, style: AmbraText.sub)),
           Expanded(child: Text(v, textAlign: TextAlign.right, style: mono ? AmbraText.mono : AmbraText.body)),
         ]),
       );

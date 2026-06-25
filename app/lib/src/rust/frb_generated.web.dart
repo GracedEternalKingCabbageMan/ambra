@@ -33,6 +33,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AssetBalance dco_decode_asset_balance(dynamic raw);
 
   @protected
+  AssetDelta dco_decode_asset_delta(dynamic raw);
+
+  @protected
   bool dco_decode_bool(dynamic raw);
 
   @protected
@@ -40,6 +43,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   FeeAsset dco_decode_box_autoadd_fee_asset(dynamic raw);
+
+  @protected
+  int dco_decode_box_autoadd_u_32(dynamic raw);
+
+  @protected
+  BigInt dco_decode_box_autoadd_u_64(dynamic raw);
 
   @protected
   double dco_decode_f_32(dynamic raw);
@@ -51,10 +60,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<AssetBalance> dco_decode_list_asset_balance(dynamic raw);
 
   @protected
+  List<AssetDelta> dco_decode_list_asset_delta(dynamic raw);
+
+  @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
 
   @protected
   List<Recipient> dco_decode_list_recipient(dynamic raw);
+
+  @protected
+  List<TxRow> dco_decode_list_tx_row(dynamic raw);
 
   @protected
   double? dco_decode_opt_box_autoadd_f_32(dynamic raw);
@@ -63,7 +78,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   FeeAsset? dco_decode_opt_box_autoadd_fee_asset(dynamic raw);
 
   @protected
+  int? dco_decode_opt_box_autoadd_u_32(dynamic raw);
+
+  @protected
+  BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw);
+
+  @protected
   Recipient dco_decode_recipient(dynamic raw);
+
+  @protected
+  TxRow dco_decode_tx_row(dynamic raw);
 
   @protected
   int dco_decode_u_32(dynamic raw);
@@ -93,6 +117,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AssetBalance sse_decode_asset_balance(SseDeserializer deserializer);
 
   @protected
+  AssetDelta sse_decode_asset_delta(SseDeserializer deserializer);
+
+  @protected
   bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
@@ -100,6 +127,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   FeeAsset sse_decode_box_autoadd_fee_asset(SseDeserializer deserializer);
+
+  @protected
+  int sse_decode_box_autoadd_u_32(SseDeserializer deserializer);
+
+  @protected
+  BigInt sse_decode_box_autoadd_u_64(SseDeserializer deserializer);
 
   @protected
   double sse_decode_f_32(SseDeserializer deserializer);
@@ -113,10 +146,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  List<AssetDelta> sse_decode_list_asset_delta(SseDeserializer deserializer);
+
+  @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
 
   @protected
   List<Recipient> sse_decode_list_recipient(SseDeserializer deserializer);
+
+  @protected
+  List<TxRow> sse_decode_list_tx_row(SseDeserializer deserializer);
 
   @protected
   double? sse_decode_opt_box_autoadd_f_32(SseDeserializer deserializer);
@@ -125,7 +164,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   FeeAsset? sse_decode_opt_box_autoadd_fee_asset(SseDeserializer deserializer);
 
   @protected
+  int? sse_decode_opt_box_autoadd_u_32(SseDeserializer deserializer);
+
+  @protected
+  BigInt? sse_decode_opt_box_autoadd_u_64(SseDeserializer deserializer);
+
+  @protected
   Recipient sse_decode_recipient(SseDeserializer deserializer);
+
+  @protected
+  TxRow sse_decode_tx_row(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_32(SseDeserializer deserializer);
@@ -161,6 +209,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_asset_balance(AssetBalance self, SseSerializer serializer);
 
   @protected
+  void sse_encode_asset_delta(AssetDelta self, SseSerializer serializer);
+
+  @protected
   void sse_encode_bool(bool self, SseSerializer serializer);
 
   @protected
@@ -173,6 +224,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_u_32(int self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_u_64(BigInt self, SseSerializer serializer);
+
+  @protected
   void sse_encode_f_32(double self, SseSerializer serializer);
 
   @protected
@@ -181,6 +238,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_list_asset_balance(
     List<AssetBalance> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_asset_delta(
+    List<AssetDelta> self,
     SseSerializer serializer,
   );
 
@@ -197,6 +260,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_tx_row(List<TxRow> self, SseSerializer serializer);
+
+  @protected
   void sse_encode_opt_box_autoadd_f_32(double? self, SseSerializer serializer);
 
   @protected
@@ -206,7 +272,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_u_32(int? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_box_autoadd_u_64(BigInt? self, SseSerializer serializer);
+
+  @protected
   void sse_encode_recipient(Recipient self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_tx_row(TxRow self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_32(int self, SseSerializer serializer);

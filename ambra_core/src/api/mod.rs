@@ -195,3 +195,52 @@ pub fn finalize_and_broadcast(mnemonic: String, esplora_url: String, pset: Strin
     let txid = client.broadcast(&tx).map_err(rerr)?;
     Ok(txid.to_string())
 }
+
+/// A signed per-asset delta on a transaction (atoms as a string; may be negative).
+pub struct AssetDelta {
+    pub asset_id: String,
+    pub atoms: String,
+}
+
+/// A wallet transaction history row.
+pub struct TxRow {
+    pub txid: String,
+    pub height: Option<u32>,
+    pub timestamp: Option<u64>,
+    /// "incoming" | "outgoing" | "issuance" | "reissuance" | "burn" | "redeposit" | "unknown".
+    pub kind: String,
+    pub fee: u64,
+    pub deltas: Vec<AssetDelta>,
+}
+
+/// Sync and return the wallet's transaction history (net signed per-asset deltas
+/// per tx). Ordering is left to the UI.
+pub fn wallet_transactions(mnemonic: String, esplora_url: String) -> Result<Vec<TxRow>> {
+    let descriptor = crate::descriptor_from_mnemonic(&mnemonic).map_err(err)?;
+    let mut wollet = crate::build_wollet(&descriptor).map_err(err)?;
+    let mut client = EsploraClient::new(&esplora_url, crate::sequentia_testnet()).map_err(rerr)?;
+    if let Some(update) = client.full_scan(&wollet).map_err(rerr)? {
+        wollet.apply_update(update).map_err(rerr)?;
+    }
+    let rows = wollet
+        .transactions()
+        .map_err(rerr)?
+        .into_iter()
+        .map(|t| TxRow {
+            txid: t.txid.to_string(),
+            height: t.height,
+            timestamp: t.timestamp.map(|ts| ts as u64),
+            kind: t.type_,
+            fee: t.fee,
+            deltas: t
+                .balance
+                .iter()
+                .map(|(a, v)| AssetDelta {
+                    asset_id: a.to_string(),
+                    atoms: v.to_string(),
+                })
+                .collect(),
+        })
+        .collect();
+    Ok(rows)
+}

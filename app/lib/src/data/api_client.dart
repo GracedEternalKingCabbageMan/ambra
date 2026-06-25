@@ -30,4 +30,13 @@ class ApiClient {
     }
     return FaucetResult('${j['amount']}', '${j['asset']}', '${j['txid']}');
   }
+
+  /// The producer fee-acceptance set: {("bitcoin"=tSEQ | ticker | hex): rate}.
+  /// rate = atoms-of-asset per reference unit ×1e8.
+  static Future<Map<String, num>> feeRates() async {
+    final r = await http.get(Uri.parse(Backend.feerates)).timeout(const Duration(seconds: 20));
+    if (r.statusCode != 200) throw Exception('HTTP ${r.statusCode}');
+    final j = jsonDecode(r.body) as Map<String, dynamic>;
+    return j.map((k, v) => MapEntry(k, v is num ? v : num.parse('$v')));
+  }
 }

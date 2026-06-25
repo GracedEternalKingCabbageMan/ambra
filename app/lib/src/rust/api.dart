@@ -95,6 +95,16 @@ Future<String> finalizeAndBroadcast({
   pset: pset,
 );
 
+/// Sync and return the wallet's transaction history (net signed per-asset deltas
+/// per tx). Ordering is left to the UI.
+Future<List<TxRow>> walletTransactions({
+  required String mnemonic,
+  required String esploraUrl,
+}) => RustLib.instance.api.crateApiWalletTransactions(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+);
+
 /// A receive address together with the derivation index it came from.
 class AddressInfo {
   final String address;
@@ -129,6 +139,25 @@ class AssetBalance {
   bool operator ==(Object other) =>
       identical(this, other) ||
       other is AssetBalance &&
+          runtimeType == other.runtimeType &&
+          assetId == other.assetId &&
+          atoms == other.atoms;
+}
+
+/// A signed per-asset delta on a transaction (atoms as a string; may be negative).
+class AssetDelta {
+  final String assetId;
+  final String atoms;
+
+  const AssetDelta({required this.assetId, required this.atoms});
+
+  @override
+  int get hashCode => assetId.hashCode ^ atoms.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is AssetDelta &&
           runtimeType == other.runtimeType &&
           assetId == other.assetId &&
           atoms == other.atoms;
@@ -176,6 +205,48 @@ class Recipient {
           address == other.address &&
           assetId == other.assetId &&
           satoshi == other.satoshi;
+}
+
+/// A wallet transaction history row.
+class TxRow {
+  final String txid;
+  final int? height;
+  final BigInt? timestamp;
+
+  /// "incoming" | "outgoing" | "issuance" | "reissuance" | "burn" | "redeposit" | "unknown".
+  final String kind;
+  final BigInt fee;
+  final List<AssetDelta> deltas;
+
+  const TxRow({
+    required this.txid,
+    this.height,
+    this.timestamp,
+    required this.kind,
+    required this.fee,
+    required this.deltas,
+  });
+
+  @override
+  int get hashCode =>
+      txid.hashCode ^
+      height.hashCode ^
+      timestamp.hashCode ^
+      kind.hashCode ^
+      fee.hashCode ^
+      deltas.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is TxRow &&
+          runtimeType == other.runtimeType &&
+          txid == other.txid &&
+          height == other.height &&
+          timestamp == other.timestamp &&
+          kind == other.kind &&
+          fee == other.fee &&
+          deltas == other.deltas;
 }
 
 /// A snapshot of the wallet after a full scan against an esplora backend.
