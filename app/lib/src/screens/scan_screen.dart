@@ -1,59 +1,134 @@
+import 'dart:typed_data';
+
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:zxing2/qrcode.dart';
 
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 
-/// Full-screen camera QR scanner. Requests the camera permission up front and
-/// recovers gracefully if it is denied or the camera fails to start. Pops the
-/// first decoded payload (raw string); the caller parses out the address.
-/// Returns null if the user backs out or chooses to type the address instead.
+/// Full-screen QR scanner built on the first-party camera (CameraX preview) and
+/// a pure-Dart ZXing decoder, so it needs no Google ML Kit or Play Services.
+/// Pops the first decoded payload (raw string); the caller parses out the
+/// address. Returns null if the user backs out or types the address instead.
 class ScanScreen extends StatefulWidget {
   const ScanScreen({super.key});
   @override
   State<ScanScreen> createState() => _ScanScreenState();
 }
 
-class _ScanScreenState extends State<ScanScreen> {
-  MobileScannerController? _controller;
+class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
+  CameraController? _controller;
   PermissionStatus? _perm;
-  bool _handled = false;
+  String? _error;
+  bool _busy = false; // a decode is in flight (frames are skipped meanwhile)
+  bool _handled = false; // a code was found; ignore further frames
+  DateTime _lastDecode = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
   void initState() {
     super.initState();
-    _request();
-  }
-
-  Future<void> _request() async {
-    final status = await Permission.camera.request();
-    if (!mounted) return;
-    setState(() {
-      _perm = status;
-      if (status.isGranted) {
-        // QR-only and de-duplicated; the widget auto-starts the camera and
-        // drives its lifecycle (start/stop on resume/pause).
-        _controller ??= MobileScannerController(
-          formats: const [BarcodeFormat.qrCode],
-          detectionSpeed: DetectionSpeed.noDuplicates,
-        );
-      }
-    });
+    WidgetsBinding.instance.addObserver(this);
+    _start();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _controller?.dispose();
     super.dispose();
   }
 
-  void _onDetect(BarcodeCapture capture) {
-    if (_handled) return;
-    final code = capture.barcodes.isEmpty ? null : capture.barcodes.first.rawValue;
-    if (code != null && code.trim().isNotEmpty) {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final c = _controller;
+    if (c == null || !c.value.isInitialized) return;
+    if (state == AppLifecycleState.resumed) {
+      _start(); // re-acquire the camera after returning to the foreground
+    } else if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
+      c.dispose();
+      _controller = null;
+    }
+  }
+
+  Future<void> _start() async {
+    final status = await Permission.camera.request();
+    if (!mounted) return;
+    setState(() {
+      _perm = status;
+      _error = null;
+    });
+    if (!status.isGranted) return;
+    try {
+      final cams = await availableCameras();
+      if (cams.isEmpty) throw Exception('no camera found');
+      final back = cams.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.back,
+        orElse: () => cams.first,
+      );
+      final c = CameraController(
+        back,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.yuv420,
+      );
+      await c.initialize();
+      if (!mounted) {
+        await c.dispose();
+        return;
+      }
+      await c.startImageStream(_onFrame);
+      setState(() => _controller = c);
+    } catch (e) {
+      if (mounted) setState(() => _error = 'The camera could not start. $e');
+    }
+  }
+
+  void _onFrame(CameraImage image) {
+    if (_busy || _handled) return;
+    final now = DateTime.now();
+    if (now.difference(_lastDecode).inMilliseconds < 220) return; // ease CPU/battery
+    _lastDecode = now;
+    _busy = true;
+    String? code;
+    try {
+      code = _decode(image);
+    } catch (_) {
+      code = null;
+    }
+    if (code != null && code.trim().isNotEmpty && !_handled && mounted) {
       _handled = true;
+      _controller?.stopImageStream();
       Navigator.of(context).pop(code.trim());
+      return;
+    }
+    _busy = false;
+  }
+
+  /// Decode a QR from the frame's luminance (Y) plane. Returns null when there's
+  /// no readable QR in the frame.
+  String? _decode(CameraImage image) {
+    final plane = image.planes.first; // Y (luminance) for yuv420
+    final w = image.width;
+    final h = image.height;
+    final bytes = plane.bytes;
+    final stride = plane.bytesPerRow; // may exceed width (row padding)
+    final pixels = Int32List(w * h);
+    for (int y = 0; y < h; y++) {
+      final row = y * stride;
+      final out = y * w;
+      for (int x = 0; x < w; x++) {
+        final lum = bytes[row + x];
+        pixels[out + x] = 0xff000000 | (lum << 16) | (lum << 8) | lum;
+      }
+    }
+    final bitmap = BinaryBitmap(HybridBinarizer(RGBLuminanceSource(w, h, pixels)));
+    final hints = DecodeHints()..put(DecodeHintType.tryHarder);
+    try {
+      return QRCodeReader().decode(bitmap, hints: hints).text;
+    } on ReaderException {
+      return null; // no / unreadable QR in this frame
     }
   }
 
@@ -67,13 +142,6 @@ class _ScanScreenState extends State<ScanScreen> {
         elevation: 0,
         title: const Text('Scan address', style: AmbraText.title),
         iconTheme: const IconThemeData(color: Colors.white),
-        actions: [
-          if (_controller != null)
-            IconButton(
-              icon: const Icon(Icons.flash_on, color: Colors.white),
-              onPressed: () => _controller!.toggleTorch(),
-            ),
-        ],
       ),
       body: _body(),
     );
@@ -90,26 +158,35 @@ class _ScanScreenState extends State<ScanScreen> {
         text: 'Camera access is needed to scan a QR code.',
         actionLabel: perm.isPermanentlyDenied ? 'Open settings' : 'Allow camera',
         actionIcon: perm.isPermanentlyDenied ? Icons.settings : Icons.camera_alt,
-        onAction: () => perm.isPermanentlyDenied ? openAppSettings() : _request(),
+        onAction: () => perm.isPermanentlyDenied ? openAppSettings() : _start(),
+      );
+    }
+    if (_error != null) {
+      return _Notice(
+        icon: Icons.videocam_off_outlined,
+        text: _error!,
+        actionLabel: 'Try again',
+        actionIcon: Icons.refresh,
+        onAction: _start,
       );
     }
     final controller = _controller;
-    if (controller == null) {
+    if (controller == null || !controller.value.isInitialized) {
       return const Center(child: CircularProgressIndicator(color: AmbraColors.amber));
     }
+    final preview = controller.value.previewSize;
     return Stack(fit: StackFit.expand, children: [
-      MobileScanner(
-        controller: controller,
-        onDetect: _onDetect,
-        errorBuilder: (context, error) => _Notice(
-          icon: Icons.videocam_off_outlined,
-          text: 'The camera could not start (${error.errorCode.name}).${_detail(error)}',
-          actionLabel: 'Try again',
-          actionIcon: Icons.refresh,
-          onAction: () => controller.start(),
+      // Cover the screen with the preview (previewSize is in sensor/landscape
+      // orientation, so width/height are swapped for the portrait scaffold).
+      FittedBox(
+        fit: BoxFit.cover,
+        child: SizedBox(
+          width: preview?.height ?? 1080,
+          height: preview?.width ?? 1920,
+          child: CameraPreview(controller),
         ),
       ),
-      // Decorative only; must not absorb taps meant for the error card / preview.
+      // Decorative only; must not absorb taps.
       IgnorePointer(
         child: Stack(fit: StackFit.expand, children: [
           Center(
@@ -134,14 +211,6 @@ class _ScanScreenState extends State<ScanScreen> {
         ]),
       ),
     ]);
-  }
-
-  /// The underlying native error (code/message), shown beneath the generic code
-  /// so a failure is diagnosable without a logcat.
-  String _detail(MobileScannerException error) {
-    final d = error.errorDetails;
-    final parts = [d?.code, d?.message].where((s) => s != null && s.trim().isNotEmpty).toList();
-    return parts.isEmpty ? '' : '\n${parts.join(' · ')}';
   }
 }
 
