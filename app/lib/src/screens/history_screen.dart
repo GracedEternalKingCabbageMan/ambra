@@ -6,6 +6,7 @@ import '../rust/api.dart' as core;
 import '../data/config.dart';
 import '../data/format.dart';
 import '../data/price_service.dart';
+import '../data/wallet_cache.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
@@ -25,7 +26,13 @@ class _HistoryTabState extends State<HistoryTab> {
   @override
   void initState() {
     super.initState();
-    if (widget.isActive) _load(); // lazy: load when first opened (also reloads on activation)
+    _loadCached(); // show last-known history at once, refresh below
+    _load(); // eager: load at launch (also reloads on activation)
+  }
+
+  Future<void> _loadCached() async {
+    final txs = await WalletCache.loadTxs();
+    if (txs != null && mounted && _txs == null) setState(() => _txs = txs);
   }
 
   @override
@@ -47,6 +54,7 @@ class _HistoryTabState extends State<HistoryTab> {
         if (b.height == null) return 1;
         return b.height!.compareTo(a.height!);
       });
+      WalletCache.saveTxs(txs); // persist for the next launch
       if (mounted) {
         setState(() {
           _txs = txs;

@@ -32,7 +32,7 @@ class _SendTabState extends State<SendTab> {
   @override
   void initState() {
     super.initState();
-    if (widget.isActive) _load(); // lazy: load when first opened (also reloads on activation)
+    _load(); // eager: load at launch (also reloads on activation)
   }
 
   @override

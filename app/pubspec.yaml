@@ -19,7 +19,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # Versioning: 0.x = pre-mainnet; minor tracks the milestone (M7 -> 0.7.0);
 # bump the build number (+N) every release, patch for fix-only builds, 1.0.0 at
 # mainnet. Keep in sync with the download filename + page.
-version: 0.7.7+14
+version: 0.7.8+15
 
 environment:
   sdk: ^3.12.2
@@ -48,6 +48,10 @@ dependencies:
   qr_flutter: ^4.1.0
   # Camera QR scanning for the send recipient address.
   mobile_scanner: ^5.2.3
+  # Explicit camera-permission flow for the QR scanner.
+  permission_handler: ^11.3.1
+  # Fast local cache of last-known balances/history (shown instantly on launch).
+  shared_preferences: ^2.3.2
   # Open the block explorer in the device browser.
   url_launcher: ^6.3.1
 
