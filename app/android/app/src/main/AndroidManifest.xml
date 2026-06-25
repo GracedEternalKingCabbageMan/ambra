@@ -36,6 +36,12 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- Use the Skia renderer instead of Impeller: Impeller fails to create
+             the camera preview texture on some devices, which surfaces as the QR
+             scanner's "camera could not start (genericError)". -->
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableImpeller"
+            android:value="false" />
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and
