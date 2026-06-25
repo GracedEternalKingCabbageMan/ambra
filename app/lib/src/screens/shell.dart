@@ -7,6 +7,7 @@ import '../data/config.dart';
 import '../data/format.dart';
 import '../data/node_config.dart';
 import '../data/price_service.dart';
+import '../data/wallet_cache.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
@@ -55,6 +56,7 @@ class BalanceTab extends StatefulWidget {
 
 class _BalanceTabState extends State<BalanceTab> {
   core.WalletSync? _sync;
+  List<core.AssetBalance>? _cachedBalances; // last-known, shown instantly while syncing
   String? _error;
   bool _loading = true;
 
@@ -62,7 +64,13 @@ class _BalanceTabState extends State<BalanceTab> {
   void initState() {
     super.initState();
     PriceService.instance.addListener(_onPrice);
-    if (widget.isActive) _refresh(); // lazy: non-active tabs load on activation
+    _loadCached(); // show outdated balances at once, refresh below
+    _refresh(); // eager: every tab loads at launch (cheap now that the wallet is cached)
+  }
+
+  Future<void> _loadCached() async {
+    final b = await WalletCache.loadBalances();
+    if (b != null && mounted && _sync == null) setState(() => _cachedBalances = b);
   }
 
   @override
@@ -90,6 +98,7 @@ class _BalanceTabState extends State<BalanceTab> {
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) return;
       final s = await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
+      WalletCache.saveBalances(s.balances); // persist for the next launch
       if (mounted) {
         setState(() {
           _sync = s;
@@ -99,7 +108,8 @@ class _BalanceTabState extends State<BalanceTab> {
     } catch (e) {
       if (mounted) {
         setState(() {
-          if (_sync == null) _error = friendlyError(e); // keep last-good on a transient reload error
+          // Surface an error only when there's nothing (not even stale data) to show.
+          if (_sync == null && _cachedBalances == null) _error = friendlyError(e);
           _loading = false;
         });
       }
@@ -108,12 +118,10 @@ class _BalanceTabState extends State<BalanceTab> {
 
   /// Total portfolio value in the reference currency, summed across every asset
   /// equally (no asset privileged). null if nothing held can be priced.
-  double? _totalRef() {
-    final s = _sync;
-    if (s == null) return null;
+  double? _totalRef(List<core.AssetBalance> balances) {
     double sum = 0;
     bool any = false;
-    for (final b in s.balances) {
+    for (final b in balances) {
       final label = SeqAssets.labelFor(b.assetId);
       final v = PriceService.instance.refValue(label.ticker, b.atoms, label.precision);
       if (v != null) {
@@ -126,12 +134,14 @@ class _BalanceTabState extends State<BalanceTab> {
 
   @override
   Widget build(BuildContext context) {
-    final sync = _sync;
-    // Only assets actually held — tSEQ is not privileged, so a 0 balance is
-    // hidden just like any other asset's would be.
-    final held = sync == null
+    // Prefer fresh sync data; fall back to cached balances so a launch shows the
+    // last-known values instantly instead of a spinner. tSEQ is not privileged,
+    // so a 0 balance is hidden like any other asset's.
+    final balances = _sync?.balances ?? _cachedBalances;
+    final held = balances == null
         ? const <core.AssetBalance>[]
-        : sync.balances.where((b) => (BigInt.tryParse(b.atoms) ?? BigInt.zero) > BigInt.zero).toList();
+        : balances.where((b) => (BigInt.tryParse(b.atoms) ?? BigInt.zero) > BigInt.zero).toList();
+    final total = balances == null ? null : _totalRef(balances);
     return RefreshIndicator(
       onRefresh: _refresh,
       color: AmbraColors.amber,
@@ -146,29 +156,26 @@ class _BalanceTabState extends State<BalanceTab> {
             const Spacer(),
             _RefChip(ref: PriceService.instance.ref),
             const SizedBox(width: 10),
-            _SyncChip(loading: _loading, tip: sync?.tipHeight),
+            _SyncChip(loading: _loading, tip: _sync?.tipHeight),
           ]),
           const SizedBox(height: 28),
           Text('TOTAL BALANCE', style: AmbraText.label),
           const SizedBox(height: 6),
-          Builder(builder: (_) {
-            final total = sync == null ? null : _totalRef();
-            return Row(crossAxisAlignment: CrossAxisAlignment.baseline, textBaseline: TextBaseline.alphabetic, children: [
-              Text(total == null ? '—' : PriceService.instance.fmtRef(total), style: AmbraText.hero),
-              const SizedBox(width: 8),
-              Text(PriceService.instance.ref,
-                  style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: AmbraColors.amber2)),
-            ]);
-          }),
-          if (sync != null && _totalRef() == null)
+          Row(crossAxisAlignment: CrossAxisAlignment.baseline, textBaseline: TextBaseline.alphabetic, children: [
+            Text(total == null ? '—' : PriceService.instance.fmtRef(total), style: AmbraText.hero),
+            const SizedBox(width: 8),
+            Text(PriceService.instance.ref,
+                style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: AmbraColors.amber2)),
+          ]),
+          if (balances != null && total == null)
             const Padding(
               padding: EdgeInsets.only(top: 6),
               child: Text('Live prices unavailable; see per-asset amounts below.', style: AmbraText.sub),
             ),
           const SizedBox(height: 24),
-          if (_error != null)
+          if (_error != null && balances == null)
             AmbraCard(child: Text(_error!, style: const TextStyle(color: AmbraColors.red)))
-          else if (sync == null)
+          else if (balances == null)
             const Padding(
                 padding: EdgeInsets.only(top: 40),
                 child: Center(child: CircularProgressIndicator(color: AmbraColors.amber)))
@@ -496,7 +503,10 @@ class MoreTab extends StatelessWidget {
         ],
       ),
     );
-    if (confirm == true) await WalletRepository.instance.removeWallet();
+    if (confirm == true) {
+      await WalletRepository.instance.removeWallet();
+      await WalletCache.clear();
+    }
   }
 
   Future<void> _toggleLock(BuildContext context, bool on) async {
@@ -615,7 +625,7 @@ class MoreTab extends StatelessWidget {
         ),
         const SizedBox(height: 20),
         Center(
-          child: Text('Lightning · T-DEX · Managed assets (coming soon)', style: AmbraText.sub),
+          child: Text('Ambra v$kAppVersion · Sequentia testnet', style: AmbraText.sub),
         ),
       ],
     );
