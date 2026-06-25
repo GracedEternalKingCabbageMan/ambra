@@ -1,13 +1,35 @@
-/// Backend the wallet talks to (Sequentia testnet box). Overridable later.
+/// Backend node the wallet talks to. Defaults to the public Sequentia testnet
+/// node; users can point Ambra at their own (persisted via [NodeConfig]). Every
+/// endpoint derives from the active [origin], so switching nodes is one change.
 class Backend {
   Backend._();
-  static const origin = 'http://159.195.15.140';
-  static const esplora = '$origin/api';
-  static const testnet4 = '$origin/testnet4/api';
-  static const feerates = '$origin/feerates';
-  static const prices = '$origin/prices';
-  static const registry = '$origin/registry/index.minimal.json';
-  static const faucet = '$origin/faucet';
+
+  /// The public Sequentia testnet node (the default backend).
+  static const defaultOrigin = 'http://159.195.15.140';
+
+  static String _origin = defaultOrigin;
+  static String get origin => _origin;
+  static set origin(String v) => _origin = _normalize(v);
+  static bool get isDefault => _origin == defaultOrigin;
+
+  static String get esplora => '$_origin/api';
+  static String get testnet4 => '$_origin/testnet4/api';
+  static String get feerates => '$_origin/feerates';
+  static String get prices => '$_origin/prices';
+  static String get registry => '$_origin/registry/index.minimal.json';
+  static String get faucet => '$_origin/faucet';
+
+  /// Public block-explorer (Esplora SPA) page for a transaction.
+  static String explorerTx(String txid) => '$_origin/explorer/tx/$txid';
+
+  /// Trim whitespace and trailing slashes so endpoint concatenation stays clean.
+  static String _normalize(String v) {
+    var s = v.trim();
+    while (s.endsWith('/')) {
+      s = s.substring(0, s.length - 1);
+    }
+    return s;
+  }
 }
 
 class AssetLabel {
@@ -25,7 +47,7 @@ class SeqAssets {
 
   static const _builtin = <String, AssetLabel>{
     'c8eccacf0953e1931cd31e434d8319101cc36e6c38b0e2104d8687552fae3e40':
-        AssetLabel('tSEQ', 8, subtitle: 'Sequentia native asset'),
+        AssetLabel('tSEQ', 8, subtitle: 'Sequentia'),
     'dc7f45fcfeb17c8ae74e284472d85543395f50e88f4a36cb652e8102703b7027':
         AssetLabel('USDX', 8, subtitle: 'USD Stablecoin'),
     'f7a756b4e966623065543e52b754324629295c895046a0916a939898ad373667':

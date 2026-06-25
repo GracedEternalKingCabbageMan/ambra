@@ -128,7 +128,7 @@ pub struct Recipient {
     pub satoshi: u64,
 }
 
-/// Pay the fee in a non-native asset at the node's published rate.
+/// Pay the fee in any accepted asset at the node's published rate.
 pub struct FeeAsset {
     pub asset_id: String,
     pub rate: u64,
@@ -143,7 +143,7 @@ pub fn validate_address(address: String) -> Result<()> {
 }
 
 /// Build an UNSIGNED send PSET (base64). Syncs first so the wallet has utxos.
-/// `fee_asset` pays the fee in a non-native asset at the EXACT published rate
+/// `fee_asset` pays the fee in any accepted asset at the EXACT published rate
 /// (never fabricated); `fee_rate_sat_kvb` None = builder default. RBF is on by
 /// default (so a stuck tx can be bump/CPFP-rescued later).
 pub fn build_send_tx(

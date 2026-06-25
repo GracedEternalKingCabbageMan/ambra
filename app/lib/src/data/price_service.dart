@@ -55,14 +55,25 @@ class PriceService extends ChangeNotifier {
     return _priceUsd(_ref);
   }
 
-  /// "≈ 1.23 USD" for an asset amount, or null if it can't be priced.
-  String? approx(String ticker, String atoms, int precision) {
+  /// Numeric value of an asset amount in the reference currency, or null if it
+  /// can't be priced. Used to total a multi-asset portfolio without privileging
+  /// any single asset.
+  double? refValue(String ticker, String atoms, int precision) {
     final p = _priceUsd(ticker);
     final rp = _refPriceUsd();
     if (p == null || rp == null || rp == 0) return null;
     final amt = (BigInt.tryParse(atoms) ?? BigInt.zero).toDouble() / math.pow(10, precision);
-    return '≈ ${_fmt(amt * p / rp)} $_ref';
+    return amt * p / rp;
   }
+
+  /// "≈ 1.23 USD" for an asset amount, or null if it can't be priced.
+  String? approx(String ticker, String atoms, int precision) {
+    final v = refValue(ticker, atoms, precision);
+    return v == null ? null : '≈ ${_fmt(v)} $_ref';
+  }
+
+  /// Format a reference-currency value (digits only; caller appends [ref]).
+  String fmtRef(double v) => _fmt(v);
 
   String _fmt(double v) {
     final abs = v.abs();

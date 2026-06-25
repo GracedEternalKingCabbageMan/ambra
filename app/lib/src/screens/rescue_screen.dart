@@ -60,7 +60,7 @@ class _RescueFeeSheetState extends State<_RescueFeeSheet> {
   final _rate = TextEditingController(text: '1000');
   List<core.AssetBalance> _balances = [];
   Map<String, BigInt> _feeRates = {};
-  String? _feeAsset; // null = native tSEQ
+  String? _feeAsset; // null = pay the fee in tSEQ (the builder's default)
   bool _loading = true;
   bool _busy = false;
   String? _error;
@@ -143,7 +143,7 @@ class _RescueFeeSheetState extends State<_RescueFeeSheet> {
           const Padding(padding: EdgeInsets.all(16), child: Text('Pay fee in', style: AmbraText.title)),
           for (final id in ids)
             ListTile(
-              title: Text(id.isEmpty ? 'tSEQ (native)' : SeqAssets.labelFor(id).ticker, style: AmbraText.body),
+              title: Text(id.isEmpty ? 'tSEQ' : SeqAssets.labelFor(id).ticker, style: AmbraText.body),
               onTap: () => Navigator.pop(context, id),
             ),
           const SizedBox(height: 8),
