@@ -40,6 +40,9 @@ dependencies:
   # Non-custodial key storage + app lock.
   flutter_secure_storage: ^9.2.4
   local_auth: ^2.3.0
+  # Sidecar HTTP (faucet, registry, prices) + receive QR.
+  http: ^1.2.2
+  qr_flutter: ^4.1.0
 
 dev_dependencies:
   flutter_test:

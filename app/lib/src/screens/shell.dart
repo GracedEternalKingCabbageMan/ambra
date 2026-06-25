@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 
 import '../rust/api.dart' as core;
 import '../data/config.dart';
@@ -7,6 +8,7 @@ import '../data/format.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
+import 'faucet_screen.dart';
 
 class Shell extends StatefulWidget {
   const Shell({super.key});
@@ -224,6 +226,16 @@ class _ReceiveTabState extends State<ReceiveTab> {
       children: [
         const Text('Receive', style: AmbraText.h1),
         const SizedBox(height: 20),
+        if (_address != null) ...[
+          Center(
+            child: Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12)),
+              child: QrImageView(data: _address!, version: QrVersions.auto, size: 224, backgroundColor: Colors.white),
+            ),
+          ),
+          const SizedBox(height: 18),
+        ],
         AmbraCard(
           child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
             SectionLabel(_confidential ? 'Confidential address' : 'Address (index $_index)'),
@@ -356,6 +368,19 @@ class MoreTab extends StatelessWidget {
             const SizedBox(height: 12),
             const _Kv('Network', 'sequentia-testnet'),
             const _Kv('Explorer API', Backend.esplora),
+          ]),
+        ),
+        const SizedBox(height: 14),
+        AmbraCard(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            const SectionLabel('Testnet'),
+            const SizedBox(height: 12),
+            SecondaryButton(
+              label: 'Get testnet coins (faucet)',
+              icon: Icons.water_drop_outlined,
+              onPressed: () =>
+                  Navigator.of(context).push(MaterialPageRoute(builder: (_) => const FaucetScreen())),
+            ),
           ]),
         ),
         const SizedBox(height: 14),

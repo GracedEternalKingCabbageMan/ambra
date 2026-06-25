@@ -1,0 +1,33 @@
+import 'dart:convert';
+
+import 'package:http/http.dart' as http;
+
+import 'config.dart';
+
+class FaucetResult {
+  FaucetResult(this.amount, this.asset, this.txid);
+  final String amount;
+  final String asset;
+  final String txid;
+}
+
+/// Thin HTTP client for the box sidecars (faucet now; registry/prices next).
+class ApiClient {
+  ApiClient._();
+
+  /// Request testnet coins to [address]. Empty/null [asset] = native tSEQ.
+  static Future<FaucetResult> faucet(String address, {String? asset}) async {
+    final body = (asset == null || asset.isEmpty)
+        ? <String, String>{'address': address}
+        : <String, String>{'address': address, 'asset': asset};
+    final r = await http
+        .post(Uri.parse(Backend.faucet),
+            headers: {'Content-Type': 'application/json'}, body: jsonEncode(body))
+        .timeout(const Duration(seconds: 30));
+    final j = jsonDecode(r.body) as Map<String, dynamic>;
+    if (r.statusCode != 200) {
+      throw Exception(j['error']?.toString() ?? 'HTTP ${r.statusCode}');
+    }
+    return FaucetResult('${j['amount']}', '${j['asset']}', '${j['txid']}');
+  }
+}
