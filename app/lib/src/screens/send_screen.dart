@@ -187,7 +187,7 @@ class _SendTabState extends State<SendTab> {
   /// is estimated and producers may reject it (rescue via RBF).
   String _feeUnpricedMessage() =>
       '$_feeLabel isn\'t priced for fees by this node, so the fee rate is estimated. '
-      'Producers may not accept it — if it stalls, speed it up or replace it (RBF) from History.';
+      'Producers may not accept it. If it stalls, speed it up or replace it (RBF) from History.';
 
   void _snack(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
 
@@ -208,7 +208,7 @@ class _SendTabState extends State<SendTab> {
       // Paying in the policy asset (tSEQ) — only happens when you're sending it;
       // leave a little behind for the fee.
       if (_assetId == SeqAssets.policy && atoms == bal) {
-        return _snack('Leave a little tSEQ for the network fee — send a bit less.');
+        return _snack('Leave a little tSEQ for the network fee; send a bit less.');
       }
     } else {
       final feeBal = BigInt.tryParse(_balanceOf(_feeAsset!)) ?? BigInt.zero;
@@ -236,7 +236,7 @@ class _SendTabState extends State<SendTab> {
       _addr.clear();
       _amount.clear();
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text('Sent — ${txid.substring(0, 16)}…'),
+        content: Text('Sent · ${txid.substring(0, 16)}…'),
         action: SnackBarAction(label: 'Copy txid', onPressed: () => Clipboard.setData(ClipboardData(text: txid))),
       ));
       _load();
@@ -379,7 +379,7 @@ class _ReviewSheetState extends State<_ReviewSheet> {
       if (!ok) {
         setState(() {
           _busy = false;
-          _error = 'Authentication failed or cancelled — payment not sent.';
+          _error = 'Authentication failed or cancelled; payment not sent.';
         });
         return;
       }

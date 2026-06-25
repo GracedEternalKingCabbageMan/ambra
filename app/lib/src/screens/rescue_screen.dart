@@ -226,7 +226,7 @@ class _RescueFeeSheetState extends State<_RescueFeeSheet> {
                 Text(
                   _isBump
                       ? 'Re-broadcasts the same payment with a higher fee. Must exceed the original (in reference value).'
-                      : 'Spends the stuck output with a high-fee child to pull both in. Can\'t fix a wrong fee asset — use Replace.',
+                      : 'Spends the stuck output with a high-fee child to pull both in. Can\'t fix a wrong fee asset; use Replace.',
                   style: AmbraText.sub,
                 ),
                 const SizedBox(height: 18),
@@ -269,7 +269,7 @@ String _pretty(Object e) {
   if (low.contains('not enough additional fees') ||
       low.contains('replacement') ||
       low.contains('bad-txns-spends-conflicting')) {
-    return 'The new fee must exceed the original — raise the fee rate and try again.';
+    return 'The new fee must exceed the original; raise the fee rate and try again.';
   }
   if (low.contains('insufficient')) {
     return 'Not enough funds for the higher fee. Try a smaller fee, or pay it in another accepted asset.';

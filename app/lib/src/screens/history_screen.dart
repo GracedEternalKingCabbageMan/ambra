@@ -123,7 +123,7 @@ class _TxRowView extends StatelessWidget {
         final rescuedTxid = await showTxDetail(context, tx);
         if (rescuedTxid != null && context.mounted) {
           ScaffoldMessenger.of(context)
-              .showSnackBar(SnackBar(content: Text('Rescue broadcast — ${rescuedTxid.substring(0, 16)}…')));
+              .showSnackBar(SnackBar(content: Text('Rescue broadcast · ${rescuedTxid.substring(0, 16)}…')));
           onRescued();
         }
       },
@@ -233,7 +233,7 @@ class _TxDetailSheet extends StatelessWidget {
     if (context.mounted) {
       Clipboard.setData(ClipboardData(text: url.toString()));
       ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('Couldn\'t open a browser — explorer link copied')));
+          .showSnackBar(const SnackBar(content: Text('Couldn\'t open a browser; explorer link copied')));
     }
   }
 
@@ -257,7 +257,7 @@ class _TxDetailSheet extends StatelessWidget {
             AmbraCard(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
               child: Column(children: [
-                _DetailRow('Status', settled ? 'Settled · block ${tx.height}' : 'Pending — not yet in a block'),
+                _DetailRow('Status', settled ? 'Settled · block ${tx.height}' : 'Pending; not yet in a block'),
                 _DetailRow('Date', _fmtTime(tx.timestamp)),
                 _DetailRow('Network', 'sequentia-testnet'),
                 if (showFee) _DetailRow('Network fee', '${formatAtoms(tx.fee.toString(), 8)} tSEQ'),
