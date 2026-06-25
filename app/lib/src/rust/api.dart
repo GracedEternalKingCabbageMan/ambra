@@ -170,6 +170,77 @@ Future<double> cpfpSuggestedFeerate({
   targetFeerate: targetFeerate,
 );
 
+/// Issue a brand-new asset: mint `asset_sats` of it plus `token_sats` reissuance
+/// tokens, both to this wallet. The new asset's id appears after the tx
+/// confirms and the wallet re-syncs.
+Future<String> buildIssueTx({
+  required String mnemonic,
+  required String esploraUrl,
+  required BigInt assetSats,
+  required BigInt tokenSats,
+  double? feeRateSatKvb,
+}) => RustLib.instance.api.crateApiBuildIssueTx(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  assetSats: assetSats,
+  tokenSats: tokenSats,
+  feeRateSatKvb: feeRateSatKvb,
+);
+
+/// Reissue more of an existing asset (needs its reissuance token in this wallet).
+Future<String> buildReissueTx({
+  required String mnemonic,
+  required String esploraUrl,
+  required String assetId,
+  required BigInt satoshi,
+  double? feeRateSatKvb,
+}) => RustLib.instance.api.crateApiBuildReissueTx(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  assetId: assetId,
+  satoshi: satoshi,
+  feeRateSatKvb: feeRateSatKvb,
+);
+
+/// Permanently destroy `satoshi` atoms of an asset.
+Future<String> buildBurnTx({
+  required String mnemonic,
+  required String esploraUrl,
+  required String assetId,
+  required BigInt satoshi,
+  double? feeRateSatKvb,
+}) => RustLib.instance.api.crateApiBuildBurnTx(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  assetId: assetId,
+  satoshi: satoshi,
+  feeRateSatKvb: feeRateSatKvb,
+);
+
+/// The 33-byte staker public key (compressed hex) at m/2/0 — the key a stake is
+/// bonded to (the wallet controls the matching private key to later unbond).
+Future<String> stakerPublicKey({required String mnemonic}) =>
+    RustLib.instance.api.crateApiStakerPublicKey(mnemonic: mnemonic);
+
+/// Bond `satoshi` atoms of tSEQ into the canonical CSV-locked staking script for
+/// `staker_pubkey` (33-byte hex). Enforces the 40,000-tSEQ minimum. The output
+/// is non-confidential (only explicit stake confers weight).
+Future<String> buildStakeTx({
+  required String mnemonic,
+  required String esploraUrl,
+  required String stakerPubkey,
+  required int csv,
+  required BigInt satoshi,
+  double? feeRateSatKvb,
+}) => RustLib.instance.api.crateApiBuildStakeTx(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  stakerPubkey: stakerPubkey,
+  csv: csv,
+  satoshi: satoshi,
+  feeRateSatKvb: feeRateSatKvb,
+);
+
 /// A receive address together with the derivation index it came from.
 class AddressInfo {
   final String address;

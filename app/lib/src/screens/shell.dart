@@ -9,9 +9,11 @@ import '../data/price_service.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
+import 'assets_screen.dart';
 import 'faucet_screen.dart';
 import 'history_screen.dart';
 import 'send_screen.dart';
+import 'stake_screen.dart';
 
 class Shell extends StatefulWidget {
   const Shell({super.key});
@@ -475,10 +477,27 @@ class MoreTab extends StatelessWidget {
             DangerButton(label: 'Remove wallet', onPressed: () => _remove(context)),
           ]),
         ),
+        const SizedBox(height: 14),
+        AmbraCard(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            const SectionLabel('Assets & staking'),
+            const SizedBox(height: 12),
+            SecondaryButton(
+              label: 'Issue / manage assets',
+              icon: Icons.toll,
+              onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const AssetsScreen())),
+            ),
+            const SizedBox(height: 10),
+            SecondaryButton(
+              label: 'Stake tSEQ',
+              icon: Icons.lock_outline,
+              onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const StakeScreen())),
+            ),
+          ]),
+        ),
         const SizedBox(height: 20),
         Center(
-          child: Text('Lightning · T-DEX · Managed assets — coming soon',
-              style: AmbraText.sub),
+          child: Text('Lightning · T-DEX · Managed assets — coming soon', style: AmbraText.sub),
         ),
       ],
     );

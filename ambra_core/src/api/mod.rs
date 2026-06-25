@@ -12,7 +12,9 @@ use lwk_common::Signer;
 use lwk_signer::SwSigner;
 use lwk_wollet::clients::blocking::{BlockchainBackend, EsploraClient};
 use lwk_wollet::elements::pset::PartiallySignedTransaction;
+use lwk_wollet::bitcoin::bip32::{ChildNumber, DerivationPath};
 use lwk_wollet::elements::{Address, AssetId, Txid};
+use lwk_wollet::secp256k1::PublicKey;
 use lwk_wollet::TxBuilder;
 
 fn err(s: String) -> anyhow::Error {
@@ -347,4 +349,90 @@ pub fn cpfp_suggested_feerate(
     wollet
         .cpfp_suggested_feerate(Txid::from_str(&parent_txid).map_err(rerr)?, target_feerate)
         .map_err(rerr)
+}
+
+// --- M7: asset issuance / reissue / burn + staking --------------------------
+
+/// Issue a brand-new asset: mint `asset_sats` of it plus `token_sats` reissuance
+/// tokens, both to this wallet. The new asset's id appears after the tx
+/// confirms and the wallet re-syncs.
+pub fn build_issue_tx(
+    mnemonic: String,
+    esplora_url: String,
+    asset_sats: u64,
+    token_sats: u64,
+    fee_rate_sat_kvb: Option<f32>,
+) -> Result<String> {
+    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
+    let b = TxBuilder::new(crate::sequentia_testnet())
+        .issue_asset(asset_sats, None, token_sats, None, None)
+        .map_err(rerr)?;
+    apply_fee_and_finish(b, &wollet, fee_rate_sat_kvb, None)
+}
+
+/// Reissue more of an existing asset (needs its reissuance token in this wallet).
+pub fn build_reissue_tx(
+    mnemonic: String,
+    esplora_url: String,
+    asset_id: String,
+    satoshi: u64,
+    fee_rate_sat_kvb: Option<f32>,
+) -> Result<String> {
+    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
+    let asset = AssetId::from_str(&asset_id).map_err(rerr)?;
+    let b = TxBuilder::new(crate::sequentia_testnet())
+        .reissue_asset(asset, satoshi, None, None)
+        .map_err(rerr)?;
+    apply_fee_and_finish(b, &wollet, fee_rate_sat_kvb, None)
+}
+
+/// Permanently destroy `satoshi` atoms of an asset.
+pub fn build_burn_tx(
+    mnemonic: String,
+    esplora_url: String,
+    asset_id: String,
+    satoshi: u64,
+    fee_rate_sat_kvb: Option<f32>,
+) -> Result<String> {
+    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
+    let asset = AssetId::from_str(&asset_id).map_err(rerr)?;
+    let b = TxBuilder::new(crate::sequentia_testnet())
+        .add_burn(satoshi, asset)
+        .map_err(rerr)?;
+    apply_fee_and_finish(b, &wollet, fee_rate_sat_kvb, None)
+}
+
+/// The 33-byte staker public key (compressed hex) at m/2/0 — the key a stake is
+/// bonded to (the wallet controls the matching private key to later unbond).
+pub fn staker_public_key(mnemonic: String) -> Result<String> {
+    let signer = SwSigner::new(&mnemonic, false).map_err(rerr)?;
+    let path = DerivationPath::from(vec![
+        ChildNumber::Normal { index: 2 },
+        ChildNumber::Normal { index: 0 },
+    ]);
+    let xpub = signer.derive_xpub(&path).map_err(rerr)?;
+    Ok(xpub.public_key.to_string())
+}
+
+/// Minimum blocksigner stake: 40,000 tSEQ (0.01% of supply), 8 decimals.
+const MIN_STAKE_ATOMS: u64 = 4_000_000_000_000;
+
+/// Bond `satoshi` atoms of tSEQ into the canonical CSV-locked staking script for
+/// `staker_pubkey` (33-byte hex). Enforces the 40,000-tSEQ minimum. The output
+/// is non-confidential (only explicit stake confers weight).
+pub fn build_stake_tx(
+    mnemonic: String,
+    esplora_url: String,
+    staker_pubkey: String,
+    csv: u32,
+    satoshi: u64,
+    fee_rate_sat_kvb: Option<f32>,
+) -> Result<String> {
+    if satoshi < MIN_STAKE_ATOMS {
+        return Err(err("minimum stake is 40,000 tSEQ".to_string()));
+    }
+    let wollet = build_wollet_synced(&mnemonic, &esplora_url)?;
+    let pubkey = PublicKey::from_str(&staker_pubkey).map_err(rerr)?.serialize();
+    let b = TxBuilder::new(crate::sequentia_testnet()).add_stake_output(&pubkey, csv, satoshi);
+    apply_fee_and_finish(b, &wollet, fee_rate_sat_kvb, None)
 }
