@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'src/data/price_service.dart';
 import 'src/data/wallet_repository.dart';
 import 'src/rust/frb_generated.dart';
 import 'src/screens/lock_screen.dart';
@@ -11,6 +12,7 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await RustLib.init();
   await WalletRepository.instance.load();
+  await PriceService.instance.load();
   runApp(const AmbraApp());
 }
 

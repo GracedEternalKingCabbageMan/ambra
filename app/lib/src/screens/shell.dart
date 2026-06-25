@@ -5,6 +5,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 import '../rust/api.dart' as core;
 import '../data/config.dart';
 import '../data/format.dart';
+import '../data/price_service.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
@@ -55,11 +56,23 @@ class _BalanceTabState extends State<BalanceTab> {
   @override
   void initState() {
     super.initState();
+    PriceService.instance.addListener(_onPrice);
     _refresh();
+  }
+
+  void _onPrice() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    PriceService.instance.removeListener(_onPrice);
+    super.dispose();
   }
 
   Future<void> _refresh() async {
     if (mounted) setState(() => _error = null);
+    PriceService.instance.refreshPrices();
     try {
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) return;
@@ -86,6 +99,11 @@ class _BalanceTabState extends State<BalanceTab> {
     return formatAtoms(hit.first.atoms, 8);
   }
 
+  String _policyAtoms() {
+    final hit = _sync?.balances.where((b) => b.assetId == SeqAssets.policy);
+    return (hit == null || hit.isEmpty) ? '0' : hit.first.atoms;
+  }
+
   @override
   Widget build(BuildContext context) {
     final sync = _sync;
@@ -101,6 +119,8 @@ class _BalanceTabState extends State<BalanceTab> {
             const SizedBox(width: 12),
             const Text('Ambra', style: AmbraText.title),
             const Spacer(),
+            _RefChip(ref: PriceService.instance.ref),
+            const SizedBox(width: 10),
             _SyncChip(loading: _loading, tip: sync?.tipHeight),
           ]),
           const SizedBox(height: 28),
@@ -112,6 +132,11 @@ class _BalanceTabState extends State<BalanceTab> {
             const Text('tSEQ',
                 style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: AmbraColors.amber2)),
           ]),
+          if (sync != null && PriceService.instance.approx('tSEQ', _policyAtoms(), 8) != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(PriceService.instance.approx('tSEQ', _policyAtoms(), 8)!, style: AmbraText.sub),
+            ),
           const SizedBox(height: 24),
           if (_error != null)
             AmbraCard(child: Text('Sync failed: $_error', style: const TextStyle(color: AmbraColors.red)))
@@ -161,8 +186,16 @@ class _AssetRow extends StatelessWidget {
           ]),
         ),
         const SizedBox(width: 12),
-        Text(amount,
-            style: AmbraText.mono.copyWith(color: AmbraColors.txt, fontSize: 15, fontWeight: FontWeight.w700)),
+        Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
+          Text(amount,
+              style: AmbraText.mono.copyWith(color: AmbraColors.txt, fontSize: 15, fontWeight: FontWeight.w700)),
+          if (PriceService.instance.approx(label.ticker, balance.atoms, label.precision) != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(PriceService.instance.approx(label.ticker, balance.atoms, label.precision)!,
+                  style: AmbraText.sub),
+            ),
+        ]),
       ]),
     );
   }
@@ -183,6 +216,50 @@ class _SyncChip extends StatelessWidget {
       Text(tip == null ? 'syncing' : 'block $tip', style: AmbraText.sub),
     ]);
   }
+}
+
+class _RefChip extends StatelessWidget {
+  const _RefChip({required this.ref});
+  final String ref;
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(999),
+      onTap: () => _showRefSheet(context),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(border: Border.all(color: AmbraColors.line), borderRadius: BorderRadius.circular(999)),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Text(ref, style: const TextStyle(color: AmbraColors.amber2, fontSize: 12, fontWeight: FontWeight.w600)),
+          const SizedBox(width: 3),
+          const Icon(Icons.expand_more, color: AmbraColors.dim, size: 16),
+        ]),
+      ),
+    );
+  }
+}
+
+void _showRefSheet(BuildContext context) {
+  showModalBottomSheet<void>(
+    context: context,
+    backgroundColor: AmbraColors.panel,
+    shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+    builder: (_) => SafeArea(
+      child: ListView(shrinkWrap: true, children: [
+        const Padding(padding: EdgeInsets.all(16), child: Text('Show values in', style: AmbraText.title)),
+        for (final r in PriceService.instance.refOptions())
+          ListTile(
+            title: Text(r, style: AmbraText.body),
+            trailing: r == PriceService.instance.ref ? const Icon(Icons.check, color: AmbraColors.amber) : null,
+            onTap: () {
+              PriceService.instance.setRef(r);
+              Navigator.pop(context);
+            },
+          ),
+        const SizedBox(height: 8),
+      ]),
+    ),
+  );
 }
 
 // ---------------------------------------------------------------------------

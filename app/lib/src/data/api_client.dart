@@ -45,4 +45,23 @@ class ApiClient {
     });
     return out;
   }
+
+  /// Per-asset USD prices for reference-currency display (DISPLAY only).
+  /// /prices = {TICKER: {price, market_cap, …}} (or a flat number).
+  static Future<Map<String, double>> prices() async {
+    final r = await http.get(Uri.parse(Backend.prices)).timeout(const Duration(seconds: 20));
+    if (r.statusCode != 200) throw Exception('HTTP ${r.statusCode}');
+    final j = jsonDecode(r.body) as Map<String, dynamic>;
+    final out = <String, double>{};
+    j.forEach((k, v) {
+      double? p;
+      if (v is Map && v['price'] is num) {
+        p = (v['price'] as num).toDouble();
+      } else if (v is num) {
+        p = v.toDouble();
+      }
+      if (p != null && p > 0) out[k.toUpperCase()] = p;
+    });
+    return out;
+  }
 }
