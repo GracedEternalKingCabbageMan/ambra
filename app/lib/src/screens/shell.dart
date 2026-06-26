@@ -18,6 +18,7 @@ import 'history_screen.dart';
 import 'node_screen.dart';
 import 'send_screen.dart';
 import 'stake_screen.dart';
+import 'swap_screen.dart';
 
 class Shell extends StatefulWidget {
   const Shell({super.key});
@@ -34,7 +35,8 @@ class _ShellState extends State<Shell> {
       BalanceTab(isActive: _tab == 0),
       SendTab(isActive: _tab == 1),
       const ReceiveTab(),
-      HistoryTab(isActive: _tab == 3),
+      SwapTab(isActive: _tab == 3),
+      HistoryTab(isActive: _tab == 4),
       const MoreTab(),
     ];
     return Scaffold(
@@ -758,6 +760,7 @@ class _BottomBar extends StatelessWidget {
     (Icons.account_balance_wallet_outlined, 'Balance'),
     (Icons.north_east, 'Send'),
     (Icons.qr_code, 'Receive'),
+    (Icons.swap_horiz, 'Swap'),
     (Icons.receipt_long_outlined, 'History'),
     (Icons.more_horiz, 'More'),
   ];

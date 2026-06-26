@@ -1,5 +1,5 @@
 /// App version shown in the More footer. Bump alongside pubspec on release.
-const kAppVersion = '0.8.0';
+const kAppVersion = '0.9.0';
 
 /// Backend node the wallet talks to. Defaults to the public Sequentia testnet
 /// node; users can point Ambra at their own (persisted via [NodeConfig]). Every
@@ -17,6 +17,7 @@ class Backend {
 
   static String get esplora => '$_origin/api';
   static String get testnet4 => '$_origin/testnet4/api';
+  static String get dex => '$_origin/dex'; // SeqDEX daemon (grpc-gateway REST) reverse-proxy
   static String get feerates => '$_origin/feerates';
   static String get prices => '$_origin/prices';
   static String get registry => '$_origin/registry/index.minimal.json';

@@ -84,6 +84,44 @@ Future<BtcTx> btcPrepare({
 Future<String> btcBroadcast({required String t4Api, required String txHex}) =>
     RustLib.instance.api.crateApiBtcBroadcast(t4Api: t4Api, txHex: txHex);
 
+/// Build the taker (proposer) half of a SeqDEX same-chain swap. `asset_*` are
+/// display hex; amounts are atoms. The fee folds into the funded `asset_p` leg
+/// when `fee_asset == asset_p`. Returns the swap id + the SwapRequest JSON to
+/// hand to the daemon's ProposeTrade.
+Future<SeqdexSwapRequestOut> seqdexBuildSwapRequest({
+  required String mnemonic,
+  required String esploraUrl,
+  required String assetP,
+  required BigInt amountP,
+  required String assetR,
+  required BigInt amountR,
+  required String feeAsset,
+  required BigInt feeAmount,
+}) => RustLib.instance.api.crateApiSeqdexBuildSwapRequest(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  assetP: assetP,
+  amountP: amountP,
+  assetR: assetR,
+  amountR: amountR,
+  feeAsset: feeAsset,
+  feeAmount: feeAmount,
+);
+
+/// Sign the maker's SwapAccept PSET (base64) and return the stripped, signed PSET
+/// (base64) for /v1/trade/complete. Runs through the synced wallet so add_details
+/// can recognise the taker's own input by its scriptPubKey (else it's skipped and
+/// left unsigned). The maker's signatures on its inputs are preserved.
+Future<String> seqdexSignAccept({
+  required String mnemonic,
+  required String esploraUrl,
+  required String acceptPset,
+}) => RustLib.instance.api.crateApiSeqdexSignAccept(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  acceptPset: acceptPset,
+);
+
 /// Full-scan the wallet against `esplora_url`, apply the update, and return the
 /// chain tip, per-asset balances, and the next unused receive index. Runs on an
 /// FRB worker thread (off the UI thread).
@@ -479,6 +517,26 @@ class Recipient {
           address == other.address &&
           assetId == other.assetId &&
           satoshi == other.satoshi;
+}
+
+/// The taker half of a same-chain swap: the random swap id + the SwapRequest JSON
+/// to POST to the daemon's /v1/trade/propose.
+class SeqdexSwapRequestOut {
+  final String id;
+  final String swapRequestJson;
+
+  const SeqdexSwapRequestOut({required this.id, required this.swapRequestJson});
+
+  @override
+  int get hashCode => id.hashCode ^ swapRequestJson.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SeqdexSwapRequestOut &&
+          runtimeType == other.runtimeType &&
+          id == other.id &&
+          swapRequestJson == other.swapRequestJson;
 }
 
 /// A wallet transaction history row.

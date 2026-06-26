@@ -143,6 +143,66 @@ pub fn btc_broadcast(t4_api: String, tx_hex: String) -> Result<String> {
     crate::btc::broadcast(&t4_api, &tx_hex).map_err(err)
 }
 
+// --- SeqDEX same-chain atomic swap --------------------------------------------
+
+/// The taker half of a same-chain swap: the random swap id + the SwapRequest JSON
+/// to POST to the daemon's /v1/trade/propose.
+pub struct SeqdexSwapRequestOut {
+    pub id: String,
+    pub swap_request_json: String,
+}
+
+/// Build the taker (proposer) half of a SeqDEX same-chain swap. `asset_*` are
+/// display hex; amounts are atoms. The fee folds into the funded `asset_p` leg
+/// when `fee_asset == asset_p`. Returns the swap id + the SwapRequest JSON to
+/// hand to the daemon's ProposeTrade.
+#[allow(clippy::too_many_arguments)]
+pub fn seqdex_build_swap_request(
+    mnemonic: String,
+    esplora_url: String,
+    asset_p: String,
+    amount_p: u64,
+    asset_r: String,
+    amount_r: u64,
+    fee_asset: String,
+    fee_amount: u64,
+) -> Result<SeqdexSwapRequestOut> {
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let opts = lwk_wollet::SeqdexSwapRequestOpts {
+            asset_p: AssetId::from_str(&asset_p).map_err(rerr)?,
+            amount_p,
+            asset_r: AssetId::from_str(&asset_r).map_err(rerr)?,
+            amount_r,
+            // seqdex_swap_request needs the CONFIDENTIAL address: the maker blinds
+            // the receive + change outputs to its blinding key (else NotConfidentialAddress).
+            receive_address: wollet.address(None).map_err(rerr)?.address().clone(),
+            fee_asset: AssetId::from_str(&fee_asset).map_err(rerr)?,
+            fee_amount,
+        };
+        let req = wollet.seqdex_swap_request(&opts).map_err(rerr)?;
+        let swap_request_json = crate::seqdex::swap_request_json(&req).map_err(err)?;
+        Ok(SeqdexSwapRequestOut { id: req.id, swap_request_json })
+    })
+}
+
+/// Sign the maker's SwapAccept PSET (base64) and return the stripped, signed PSET
+/// (base64) for /v1/trade/complete. Runs through the synced wallet so add_details
+/// can recognise the taker's own input by its scriptPubKey (else it's skipped and
+/// left unsigned). The maker's signatures on its inputs are preserved.
+pub fn seqdex_sign_accept(mnemonic: String, esplora_url: String, accept_pset: String) -> Result<String> {
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let mut pset = PartiallySignedTransaction::from_str(&accept_pset).map_err(rerr)?;
+        // The bare swap PSET carries no bip32 derivation; re-attach the taker
+        // input's keypath from the wallet descriptor so the signer can sign it.
+        wollet.add_details(&mut pset).map_err(rerr)?;
+        let signer = SwSigner::new(&mnemonic, false).map_err(rerr)?;
+        signer.sign(&mut pset).map_err(rerr)?;
+        // The daemon's go-elements parser rejects the elements-rs bip32/xpub fields;
+        // strip them (the partial signatures stay) before CompleteTrade.
+        crate::seqdex::strip_bip32(&pset.to_string()).map_err(err)
+    })
+}
+
 /// A per-asset balance: the asset id (hex) and the amount in atoms (a string to
 /// avoid any integer-precision loss across the FFI boundary).
 pub struct AssetBalance {

@@ -99,6 +99,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Recipient dco_decode_recipient(dynamic raw);
 
   @protected
+  SeqdexSwapRequestOut dco_decode_seqdex_swap_request_out(dynamic raw);
+
+  @protected
   TxRow dco_decode_tx_row(dynamic raw);
 
   @protected
@@ -195,6 +198,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Recipient sse_decode_recipient(SseDeserializer deserializer);
+
+  @protected
+  SeqdexSwapRequestOut sse_decode_seqdex_swap_request_out(
+    SseDeserializer deserializer,
+  );
 
   @protected
   TxRow sse_decode_tx_row(SseDeserializer deserializer);
@@ -315,6 +323,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_recipient(Recipient self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_seqdex_swap_request_out(
+    SeqdexSwapRequestOut self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_tx_row(TxRow self, SseSerializer serializer);
