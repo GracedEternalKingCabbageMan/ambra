@@ -262,18 +262,22 @@ pub struct AnchorEvidence {
 
 /// Generate the swap preimage + hashlock.
 pub fn xchain_new_secret() -> XchainSecret {
-    let (secret_hex, hash_hex) = crate::xchain::new_secret();
+    let (secret_hex, hash_hex) = lwk_wollet::btc::xchain::new_secret();
     XchainSecret { secret_hex, hash_hex }
 }
 
 /// Alice's SEQ-leg claim pubkey (the HTLC claim key; secret stays in the core).
 pub fn xchain_seq_claim_pubkey(mnemonic: String) -> Result<String> {
-    crate::xchain::seq_claim_keypair(&mnemonic).map(|(_, p)| p).map_err(err)
+    lwk_wollet::btc::xchain::seq_claim_keypair(&btc_params(), &mnemonic, lwk_wollet::btc::xchain::PathMode::Canonical)
+        .map(|(_, p)| p)
+        .map_err(rerr)
 }
 
 /// Alice's BTC-leg refund pubkey.
 pub fn xchain_btc_refund_pubkey(mnemonic: String) -> Result<String> {
-    crate::xchain::btc_refund_keypair(&mnemonic).map(|(_, p)| p).map_err(err)
+    lwk_wollet::btc::xchain::btc_refund_keypair(&btc_params(), &mnemonic, lwk_wollet::btc::xchain::PathMode::Canonical)
+        .map(|(_, p)| p)
+        .map_err(rerr)
 }
 
 /// Build the BTC HTLC the wallet will fund: redeemScript + P2SH address/spk.
@@ -306,7 +310,15 @@ pub fn xchain_seq_redeem_script(
     maker_seq_refund_pub_hex: String,
     seq_locktime: u32,
 ) -> Result<String> {
-    crate::xchain::seq_redeem_script_hex(&mnemonic, &hash_hex, &maker_seq_refund_pub_hex, seq_locktime).map_err(err)
+    lwk_wollet::btc::xchain::seq_redeem_script_hex(
+        &btc_params(),
+        &mnemonic,
+        lwk_wollet::btc::xchain::PathMode::Canonical,
+        &hash_hex,
+        &maker_seq_refund_pub_hex,
+        seq_locktime,
+    )
+    .map_err(rerr)
 }
 
 /// Locate the BTC HTLC funding output by its P2SH scriptPubKey on testnet4.
@@ -330,8 +342,14 @@ pub fn xchain_verify_seq_leg_safe(
     t4_api: String,
     min_depth: i64,
 ) -> Result<AnchorEvidence> {
-    let e = crate::xchain::verify_seq_leg_safe(&seq_esplora, &seq_block_hash, btc_leg_height, &t4_api, min_depth)
-        .map_err(err)?;
+    let e = lwk_wollet::btc::xchain::blocking::verify_seq_leg_safe(
+        &seq_esplora,
+        &seq_block_hash,
+        btc_leg_height,
+        &t4_api,
+        min_depth,
+    )
+    .map_err(rerr)?;
     Ok(AnchorEvidence {
         seq_anchor_height: e.seq_anchor_height,
         btc_leg_height: e.btc_leg_height,
@@ -358,8 +376,10 @@ pub fn xchain_seq_claim(
     fee: u64,
     preimage_hex: String,
 ) -> Result<String> {
-    crate::xchain::seq_claim(
+    lwk_wollet::btc::xchain::seq_claim(
+        &btc_params(),
         &mnemonic,
+        lwk_wollet::btc::xchain::PathMode::Canonical,
         &seq_txid,
         seq_vout,
         seq_amount,
@@ -371,12 +391,12 @@ pub fn xchain_seq_claim(
         fee,
         &preimage_hex,
     )
-    .map_err(err)
+    .map_err(rerr)
 }
 
 /// Broadcast a raw SEQ (Elements) tx hex; returns the txid.
 pub fn xchain_seq_broadcast(seq_esplora: String, tx_hex: String) -> Result<String> {
-    crate::xchain::seq_broadcast(&seq_esplora, &tx_hex).map_err(err)
+    lwk_wollet::btc::xchain::blocking::seq_broadcast(&seq_esplora, &tx_hex).map_err(rerr)
 }
 
 /// Build the BTC HTLC refund (CLTV/ELSE branch), valid once the chain tip reaches
@@ -392,7 +412,12 @@ pub fn xchain_btc_refund(
     redeem_script_hex: String,
     locktime: u32,
 ) -> Result<String> {
-    let (sk, _) = crate::xchain::btc_refund_keypair(&mnemonic).map_err(err)?;
+    let (sk, _) = lwk_wollet::btc::xchain::btc_refund_keypair(
+        &btc_params(),
+        &mnemonic,
+        lwk_wollet::btc::xchain::PathMode::Canonical,
+    )
+    .map_err(rerr)?;
     let redeem = lwk_wollet::bitcoin::ScriptBuf::from_hex(&redeem_script_hex).map_err(rerr)?;
     let dest = lwk_wollet::bitcoin::Address::from_str(&dest_address)
         .map_err(|_| err("invalid Bitcoin address".to_string()))?

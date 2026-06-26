@@ -21,8 +21,8 @@ pub mod api;
 // implementation; api/mod.rs calls into it directly.
 /// SeqDEX same-chain atomic swap helpers (JSON serializer + bip32 strip).
 mod seqdex;
-/// SeqDEX cross-chain (BTC<->SEQ asset) swap glue — keys, reveal gate, claim.
-mod xchain;
+// The cross-chain (BTC<->SEQ asset) swap glue now lives in the kit
+// (lwk_wollet::btc::xchain); api/mod.rs's xchain_* shims call into it.
 mod frb_generated;
 
 use std::str::FromStr;
