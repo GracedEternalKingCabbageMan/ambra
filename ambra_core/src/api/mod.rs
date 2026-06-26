@@ -27,6 +27,12 @@ fn rerr<E: std::fmt::Debug>(e: E) -> anyhow::Error {
     anyhow::Error::msg(format!("{e:?}"))
 }
 
+/// The kit's address parameters for the Bitcoin parent chain (testnet4): shared
+/// coin_type 1 / `tb` HRP with the Sequentia side.
+fn btc_params() -> lwk_wollet::btc::addr::ChainAddressParams {
+    lwk_wollet::btc::addr::ChainAddressParams::testnet()
+}
+
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
 #[flutter_rust_bridge::frb(sync)]
 pub fn network_name() -> String {
@@ -117,7 +123,7 @@ pub struct BtcTx {
 /// Scan the wallet's Bitcoin (testnet4) keychain; returns the balance and the
 /// cycling indices. `t4_api` is the testnet4 esplora base (e.g. `<node>/testnet4/api`).
 pub fn btc_sync(mnemonic: String, t4_api: String) -> Result<BtcBalance> {
-    let s = crate::btc::scan(&mnemonic, &t4_api).map_err(err)?;
+    let s = lwk_wollet::btc::wallet::scan(&btc_params(), &mnemonic, &t4_api).map_err(rerr)?;
     Ok(BtcBalance {
         balance_sats: s.balance_sats.to_string(),
         external_next: s.external_next,
@@ -135,13 +141,14 @@ pub fn btc_prepare(
     amount_sats: u64,
     fee_rate: f64,
 ) -> Result<BtcTx> {
-    let p = crate::btc::prepare(&mnemonic, &t4_api, &address, amount_sats, fee_rate).map_err(err)?;
+    let p = lwk_wollet::btc::wallet::prepare(&btc_params(), &mnemonic, &t4_api, &address, amount_sats, fee_rate)
+        .map_err(rerr)?;
     Ok(BtcTx { hex: p.hex, txid: p.txid, fee_sats: p.fee_sats.to_string(), vsize: p.vsize, inputs: p.inputs })
 }
 
 /// Broadcast a prepared Bitcoin testnet4 transaction hex; returns the txid.
 pub fn btc_broadcast(t4_api: String, tx_hex: String) -> Result<String> {
-    crate::btc::broadcast(&t4_api, &tx_hex).map_err(err)
+    lwk_wollet::btc::wallet::broadcast(&t4_api, &tx_hex).map_err(rerr)
 }
 
 // --- SeqDEX same-chain atomic swap --------------------------------------------
@@ -276,14 +283,14 @@ pub fn xchain_btc_htlc(
     refund_pub_hex: String,
     locktime: u32,
 ) -> Result<BtcHtlcInfo> {
-    let redeem = crate::btc_htlc::build_htlc_redeem_script(
+    let redeem = lwk_wollet::btc::htlc::build_htlc_redeem_script(
         &hexbytes(&hash_hex)?,
         &hexbytes(&claim_pub_hex)?,
         &hexbytes(&refund_pub_hex)?,
         locktime,
     )
-    .map_err(err)?;
-    let (address, spk) = crate::btc_htlc::htlc_p2sh(&redeem).map_err(err)?;
+    .map_err(rerr)?;
+    let (address, spk) = lwk_wollet::btc::htlc::htlc_p2sh(&redeem).map_err(rerr)?;
     Ok(BtcHtlcInfo {
         redeem_script_hex: redeem.to_hex_string(),
         p2sh_address: address.to_string(),
@@ -304,7 +311,7 @@ pub fn xchain_seq_redeem_script(
 
 /// Locate the BTC HTLC funding output by its P2SH scriptPubKey on testnet4.
 pub fn xchain_find_btc_funding(t4_api: String, txid: String, p2sh_spk_hex: String) -> Result<BtcFunding> {
-    let f = crate::btc::find_htlc_funding(&t4_api, &txid, &p2sh_spk_hex).map_err(err)?;
+    let f = lwk_wollet::btc::wallet::find_htlc_funding(&t4_api, &txid, &p2sh_spk_hex).map_err(rerr)?;
     Ok(BtcFunding {
         vout: f.vout,
         value_sats: f.value_sats.to_string(),
@@ -391,14 +398,14 @@ pub fn xchain_btc_refund(
         .map_err(|_| err("invalid Bitcoin address".to_string()))?
         .require_network(lwk_wollet::bitcoin::Network::Testnet)
         .map_err(|_| err("address is not a Bitcoin testnet (tb1) address".to_string()))?;
-    let spend = crate::btc_htlc::BtcHtlcSpend {
+    let spend = lwk_wollet::btc::htlc::BtcHtlcSpend {
         txid: btc_txid,
         vout: btc_vout,
         amount_sats: btc_amount_sats,
         dest_spk: dest.script_pubkey(),
         fee_sats,
     };
-    crate::btc_htlc::build_refund_tx(&redeem, &spend, locktime, &sk).map_err(err)
+    lwk_wollet::btc::htlc::build_refund_tx(&redeem, &spend, locktime, &sk).map_err(rerr)
 }
 
 /// A per-asset balance: the asset id (hex) and the amount in atoms (a string to

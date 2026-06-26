@@ -16,10 +16,9 @@
 
 /// flutter_rust_bridge API surface consumed by the Flutter (Dart) app.
 pub mod api;
-/// Bitcoin parent-chain (testnet4) wallet — the dual-chain half (same keychain).
-mod btc;
-/// Bitcoin-leg HTLC for cross-chain SeqDEX swaps (redeemScript + P2SH + refund).
-mod btc_htlc;
+// The Bitcoin parent-chain wallet + HTLC leg now live in the kit
+// (lwk_wollet::btc, feature `btc-blocking`) so every Sequentia wallet shares one
+// implementation; api/mod.rs calls into it directly.
 /// SeqDEX same-chain atomic swap helpers (JSON serializer + bip32 strip).
 mod seqdex;
 /// SeqDEX cross-chain (BTC<->SEQ asset) swap glue — keys, reveal gate, claim.
