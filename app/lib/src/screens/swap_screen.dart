@@ -11,6 +11,7 @@ import '../data/wallet_repository.dart';
 import '../rust/api.dart' as core;
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
+import 'xchain_swap_screen.dart';
 
 /// SeqDEX same-chain swap: pay one Sequentia asset, receive another. (Cross-chain
 /// BTC<->asset swaps are a later phase.) One composer — pick what you pay + an
@@ -368,6 +369,12 @@ class _SwapTabState extends State<SwapTab> {
           const Text('Swap', style: AmbraText.h1),
           const SizedBox(height: 6),
           const Text('Trade one Sequentia asset for another at the SeqDEX maker rate.', style: AmbraText.sub),
+          const SizedBox(height: 12),
+          SecondaryButton(
+            label: 'Buy with Bitcoin (cross-chain)',
+            icon: Icons.currency_bitcoin,
+            onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const XchainSwapScreen())),
+          ),
           const SizedBox(height: 20),
           if (_loading)
             const Padding(padding: EdgeInsets.only(top: 40), child: Center(child: CircularProgressIndicator(color: AmbraColors.amber)))
