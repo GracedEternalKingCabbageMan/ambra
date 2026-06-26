@@ -13,6 +13,12 @@ import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 import 'xchain_swap_screen.dart';
 
+/// Estimated vByte size of a same-chain swap settlement tx, used to turn the
+/// optional per-vB fee rate into a fee amount. The maker assembles the final
+/// (confidential Elements) transaction, so the exact size isn't known wallet-side;
+/// this errs on the generous side and the resulting fee is shown for review.
+const int _kSwapVbytes = 3000;
+
 /// SeqDEX same-chain swap: pay one Sequentia asset, receive another. (Cross-chain
 /// BTC<->asset swaps are a later phase.) One composer — pick what you pay + an
 /// amount, pick what you receive, and the daemon's preview fills the rest.
@@ -39,7 +45,7 @@ class _SwapCache {
 
 class _SwapTabState extends State<SwapTab> {
   final _payAmount = TextEditingController();
-  final _customFeeCtl = TextEditingController(); // optional fee override, in the chosen fee asset
+  final _feeRateCtl = TextEditingController(); // optional fee override, in the chosen fee asset
   List<Market> _markets = [];
   List<core.AssetBalance> _balances = [];
   Map<String, BigInt> _feeRates = {};
@@ -56,7 +62,7 @@ class _SwapTabState extends State<SwapTab> {
   void initState() {
     super.initState();
     _payAmount.addListener(_onAmountChanged);
-    _customFeeCtl.addListener(_onAmountChanged);
+    _feeRateCtl.addListener(_onAmountChanged);
     // Hydrate from the cross-reload cache so returning from background shows the
     // composer immediately instead of a blank spinner; _load refreshes below.
     if (_SwapCache.markets != null) {
@@ -80,9 +86,9 @@ class _SwapTabState extends State<SwapTab> {
   @override
   void dispose() {
     _payAmount.removeListener(_onAmountChanged);
-    _customFeeCtl.removeListener(_onAmountChanged);
+    _feeRateCtl.removeListener(_onAmountChanged);
     _payAmount.dispose();
-    _customFeeCtl.dispose();
+    _feeRateCtl.dispose();
     super.dispose();
   }
 
@@ -269,12 +275,13 @@ class _SwapTabState extends State<SwapTab> {
 
       // The swap's NETWORK fee is the taker's (the maker turns fee_amount into the
       // settlement tx's fee output). Default to the daemon's suggestion for this
-      // asset; let the user override the amount in the chosen fee asset.
+      // asset; let the user override with a per-vB rate (in the fee asset) applied
+      // to the estimated swap size — the same any-asset, per-vB model as send.
       BigInt feeAmount = preview.feeAmount;
-      final custom = _customFeeCtl.text.trim();
-      if (custom.isNotEmpty) {
-        final c = parseAtoms(custom, SeqAssets.labelFor(feeAsset).precision);
-        if (c != null && c >= BigInt.zero) feeAmount = c;
+      final fr = double.tryParse(_feeRateCtl.text.trim());
+      if (fr != null && fr > 0) {
+        final feePrec = SeqAssets.labelFor(feeAsset).precision;
+        feeAmount = BigInt.from((fr * _kSwapVbytes * _pow10(feePrec)).ceil());
       }
 
       // Orient the legs (proven 6d-1 mapping).
@@ -334,7 +341,7 @@ class _SwapTabState extends State<SwapTab> {
         _reconcileReceive();
         // Re-default the fee to the new paid asset.
         _feeAsset = null;
-        _customFeeCtl.clear();
+        _feeRateCtl.clear();
         _quote = null;
       });
       _requote();
@@ -495,11 +502,11 @@ class _SwapTabState extends State<SwapTab> {
             _PickerRow(label: _tk(_feeAssetHex), trailing: 'any asset you hold', onTap: _pickFee),
             const SizedBox(height: 10),
             AmbraField(
-                label: 'Custom fee (${_tk(_feeAssetHex)}, optional)', controller: _customFeeCtl, hint: 'network default'),
+                label: 'Fee rate (${_tk(_feeAssetHex)}/vB, optional)', controller: _feeRateCtl, hint: 'suggested'),
             const SizedBox(height: 6),
             Text(
-              "Paid in the asset you're swapping by default; pick any asset you hold, "
-              'or set a custom amount to override the suggested fee.',
+              "Paid in the asset you're swapping by default; pick any asset you hold. Leave the rate "
+              'blank for the suggested fee, or set a per-vB rate (applied to the estimated swap size).',
               style: AmbraText.sub,
             ),
             const SizedBox(height: 18),
