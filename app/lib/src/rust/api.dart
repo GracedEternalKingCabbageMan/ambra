@@ -200,12 +200,14 @@ Future<String> buildIssueTx({
   required BigInt assetSats,
   required BigInt tokenSats,
   double? feeRateSatKvb,
+  FeeAsset? feeAsset,
 }) => RustLib.instance.api.crateApiBuildIssueTx(
   mnemonic: mnemonic,
   esploraUrl: esploraUrl,
   assetSats: assetSats,
   tokenSats: tokenSats,
   feeRateSatKvb: feeRateSatKvb,
+  feeAsset: feeAsset,
 );
 
 /// Reissue more of an existing asset (needs its reissuance token in this wallet).
@@ -215,12 +217,14 @@ Future<String> buildReissueTx({
   required String assetId,
   required BigInt satoshi,
   double? feeRateSatKvb,
+  FeeAsset? feeAsset,
 }) => RustLib.instance.api.crateApiBuildReissueTx(
   mnemonic: mnemonic,
   esploraUrl: esploraUrl,
   assetId: assetId,
   satoshi: satoshi,
   feeRateSatKvb: feeRateSatKvb,
+  feeAsset: feeAsset,
 );
 
 /// Permanently destroy `satoshi` atoms of an asset.
@@ -230,12 +234,14 @@ Future<String> buildBurnTx({
   required String assetId,
   required BigInt satoshi,
   double? feeRateSatKvb,
+  FeeAsset? feeAsset,
 }) => RustLib.instance.api.crateApiBuildBurnTx(
   mnemonic: mnemonic,
   esploraUrl: esploraUrl,
   assetId: assetId,
   satoshi: satoshi,
   feeRateSatKvb: feeRateSatKvb,
+  feeAsset: feeAsset,
 );
 
 /// The 33-byte staker public key (compressed hex) at m/2/0 — the key a stake is
@@ -253,6 +259,7 @@ Future<String> buildStakeTx({
   required int csv,
   required BigInt satoshi,
   double? feeRateSatKvb,
+  FeeAsset? feeAsset,
 }) => RustLib.instance.api.crateApiBuildStakeTx(
   mnemonic: mnemonic,
   esploraUrl: esploraUrl,
@@ -260,6 +267,7 @@ Future<String> buildStakeTx({
   csv: csv,
   satoshi: satoshi,
   feeRateSatKvb: feeRateSatKvb,
+  feeAsset: feeAsset,
 );
 
 /// A receive address together with the derivation index it came from.

@@ -73,6 +73,7 @@ fn wire__crate__api__build_burn_tx_impl(
             let api_asset_id = <String>::sse_decode(&mut deserializer);
             let api_satoshi = <u64>::sse_decode(&mut deserializer);
             let api_fee_rate_sat_kvb = <Option<f32>>::sse_decode(&mut deserializer);
+            let api_fee_asset = <Option<crate::api::FeeAsset>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
@@ -83,6 +84,7 @@ fn wire__crate__api__build_burn_tx_impl(
                             api_asset_id,
                             api_satoshi,
                             api_fee_rate_sat_kvb,
+                            api_fee_asset,
                         )?;
                         Ok(output_ok)
                     })(),
@@ -163,6 +165,7 @@ fn wire__crate__api__build_issue_tx_impl(
             let api_asset_sats = <u64>::sse_decode(&mut deserializer);
             let api_token_sats = <u64>::sse_decode(&mut deserializer);
             let api_fee_rate_sat_kvb = <Option<f32>>::sse_decode(&mut deserializer);
+            let api_fee_asset = <Option<crate::api::FeeAsset>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
@@ -173,6 +176,7 @@ fn wire__crate__api__build_issue_tx_impl(
                             api_asset_sats,
                             api_token_sats,
                             api_fee_rate_sat_kvb,
+                            api_fee_asset,
                         )?;
                         Ok(output_ok)
                     })(),
@@ -300,6 +304,7 @@ fn wire__crate__api__build_reissue_tx_impl(
             let api_asset_id = <String>::sse_decode(&mut deserializer);
             let api_satoshi = <u64>::sse_decode(&mut deserializer);
             let api_fee_rate_sat_kvb = <Option<f32>>::sse_decode(&mut deserializer);
+            let api_fee_asset = <Option<crate::api::FeeAsset>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
@@ -310,6 +315,7 @@ fn wire__crate__api__build_reissue_tx_impl(
                             api_asset_id,
                             api_satoshi,
                             api_fee_rate_sat_kvb,
+                            api_fee_asset,
                         )?;
                         Ok(output_ok)
                     })(),
@@ -391,6 +397,7 @@ fn wire__crate__api__build_stake_tx_impl(
             let api_csv = <u32>::sse_decode(&mut deserializer);
             let api_satoshi = <u64>::sse_decode(&mut deserializer);
             let api_fee_rate_sat_kvb = <Option<f32>>::sse_decode(&mut deserializer);
+            let api_fee_asset = <Option<crate::api::FeeAsset>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
@@ -402,6 +409,7 @@ fn wire__crate__api__build_stake_tx_impl(
                             api_csv,
                             api_satoshi,
                             api_fee_rate_sat_kvb,
+                            api_fee_asset,
                         )?;
                         Ok(output_ok)
                     })(),
