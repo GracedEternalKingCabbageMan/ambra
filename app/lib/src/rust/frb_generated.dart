@@ -82,6 +82,7 @@ abstract class RustLibApi extends BaseApi {
     required String assetId,
     required BigInt satoshi,
     double? feeRateSatKvb,
+    FeeAsset? feeAsset,
   });
 
   Future<String> crateApiBuildCpfpTx({
@@ -98,6 +99,7 @@ abstract class RustLibApi extends BaseApi {
     required BigInt assetSats,
     required BigInt tokenSats,
     double? feeRateSatKvb,
+    FeeAsset? feeAsset,
   });
 
   Future<String> crateApiBuildRbfBumpTx({
@@ -123,6 +125,7 @@ abstract class RustLibApi extends BaseApi {
     required String assetId,
     required BigInt satoshi,
     double? feeRateSatKvb,
+    FeeAsset? feeAsset,
   });
 
   Future<String> crateApiBuildSendTx({
@@ -140,6 +143,7 @@ abstract class RustLibApi extends BaseApi {
     required int csv,
     required BigInt satoshi,
     double? feeRateSatKvb,
+    FeeAsset? feeAsset,
   });
 
   Future<void> crateApiClearWalletCache();
@@ -216,6 +220,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     required String assetId,
     required BigInt satoshi,
     double? feeRateSatKvb,
+    FeeAsset? feeAsset,
   }) {
     return handler.executeNormal(
       NormalTask(
@@ -226,6 +231,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           sse_encode_String(assetId, serializer);
           sse_encode_u_64(satoshi, serializer);
           sse_encode_opt_box_autoadd_f_32(feeRateSatKvb, serializer);
+          sse_encode_opt_box_autoadd_fee_asset(feeAsset, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -238,7 +244,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_AnyhowException,
         ),
         constMeta: kCrateApiBuildBurnTxConstMeta,
-        argValues: [mnemonic, esploraUrl, assetId, satoshi, feeRateSatKvb],
+        argValues: [
+          mnemonic,
+          esploraUrl,
+          assetId,
+          satoshi,
+          feeRateSatKvb,
+          feeAsset,
+        ],
         apiImpl: this,
       ),
     );
@@ -246,7 +259,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   TaskConstMeta get kCrateApiBuildBurnTxConstMeta => const TaskConstMeta(
     debugName: "build_burn_tx",
-    argNames: ["mnemonic", "esploraUrl", "assetId", "satoshi", "feeRateSatKvb"],
+    argNames: [
+      "mnemonic",
+      "esploraUrl",
+      "assetId",
+      "satoshi",
+      "feeRateSatKvb",
+      "feeAsset",
+    ],
   );
 
   @override
@@ -302,6 +322,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     required BigInt assetSats,
     required BigInt tokenSats,
     double? feeRateSatKvb,
+    FeeAsset? feeAsset,
   }) {
     return handler.executeNormal(
       NormalTask(
@@ -312,6 +333,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           sse_encode_u_64(assetSats, serializer);
           sse_encode_u_64(tokenSats, serializer);
           sse_encode_opt_box_autoadd_f_32(feeRateSatKvb, serializer);
+          sse_encode_opt_box_autoadd_fee_asset(feeAsset, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -324,7 +346,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_AnyhowException,
         ),
         constMeta: kCrateApiBuildIssueTxConstMeta,
-        argValues: [mnemonic, esploraUrl, assetSats, tokenSats, feeRateSatKvb],
+        argValues: [
+          mnemonic,
+          esploraUrl,
+          assetSats,
+          tokenSats,
+          feeRateSatKvb,
+          feeAsset,
+        ],
         apiImpl: this,
       ),
     );
@@ -338,6 +367,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       "assetSats",
       "tokenSats",
       "feeRateSatKvb",
+      "feeAsset",
     ],
   );
 
@@ -444,6 +474,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     required String assetId,
     required BigInt satoshi,
     double? feeRateSatKvb,
+    FeeAsset? feeAsset,
   }) {
     return handler.executeNormal(
       NormalTask(
@@ -454,6 +485,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           sse_encode_String(assetId, serializer);
           sse_encode_u_64(satoshi, serializer);
           sse_encode_opt_box_autoadd_f_32(feeRateSatKvb, serializer);
+          sse_encode_opt_box_autoadd_fee_asset(feeAsset, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -466,7 +498,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_AnyhowException,
         ),
         constMeta: kCrateApiBuildReissueTxConstMeta,
-        argValues: [mnemonic, esploraUrl, assetId, satoshi, feeRateSatKvb],
+        argValues: [
+          mnemonic,
+          esploraUrl,
+          assetId,
+          satoshi,
+          feeRateSatKvb,
+          feeAsset,
+        ],
         apiImpl: this,
       ),
     );
@@ -474,7 +513,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   TaskConstMeta get kCrateApiBuildReissueTxConstMeta => const TaskConstMeta(
     debugName: "build_reissue_tx",
-    argNames: ["mnemonic", "esploraUrl", "assetId", "satoshi", "feeRateSatKvb"],
+    argNames: [
+      "mnemonic",
+      "esploraUrl",
+      "assetId",
+      "satoshi",
+      "feeRateSatKvb",
+      "feeAsset",
+    ],
   );
 
   @override
@@ -531,6 +577,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     required int csv,
     required BigInt satoshi,
     double? feeRateSatKvb,
+    FeeAsset? feeAsset,
   }) {
     return handler.executeNormal(
       NormalTask(
@@ -542,6 +589,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           sse_encode_u_32(csv, serializer);
           sse_encode_u_64(satoshi, serializer);
           sse_encode_opt_box_autoadd_f_32(feeRateSatKvb, serializer);
+          sse_encode_opt_box_autoadd_fee_asset(feeAsset, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -561,6 +609,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           csv,
           satoshi,
           feeRateSatKvb,
+          feeAsset,
         ],
         apiImpl: this,
       ),
@@ -576,6 +625,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       "csv",
       "satoshi",
       "feeRateSatKvb",
+      "feeAsset",
     ],
   );
 

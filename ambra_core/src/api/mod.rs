@@ -525,12 +525,13 @@ pub fn build_issue_tx(
     asset_sats: u64,
     token_sats: u64,
     fee_rate_sat_kvb: Option<f32>,
+    fee_asset: Option<FeeAsset>,
 ) -> Result<String> {
     with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
         let b = TxBuilder::new(crate::sequentia_testnet())
             .issue_asset(asset_sats, None, token_sats, None, None)
             .map_err(rerr)?;
-        apply_fee_and_finish(b, wollet, fee_rate_sat_kvb, None)
+        apply_fee_and_finish(b, wollet, fee_rate_sat_kvb, fee_asset.as_ref())
     })
 }
 
@@ -541,13 +542,14 @@ pub fn build_reissue_tx(
     asset_id: String,
     satoshi: u64,
     fee_rate_sat_kvb: Option<f32>,
+    fee_asset: Option<FeeAsset>,
 ) -> Result<String> {
     with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
         let asset = AssetId::from_str(&asset_id).map_err(rerr)?;
         let b = TxBuilder::new(crate::sequentia_testnet())
             .reissue_asset(asset, satoshi, None, None)
             .map_err(rerr)?;
-        apply_fee_and_finish(b, wollet, fee_rate_sat_kvb, None)
+        apply_fee_and_finish(b, wollet, fee_rate_sat_kvb, fee_asset.as_ref())
     })
 }
 
@@ -558,13 +560,14 @@ pub fn build_burn_tx(
     asset_id: String,
     satoshi: u64,
     fee_rate_sat_kvb: Option<f32>,
+    fee_asset: Option<FeeAsset>,
 ) -> Result<String> {
     with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
         let asset = AssetId::from_str(&asset_id).map_err(rerr)?;
         let b = TxBuilder::new(crate::sequentia_testnet())
             .add_burn(satoshi, asset)
             .map_err(rerr)?;
-        apply_fee_and_finish(b, wollet, fee_rate_sat_kvb, None)
+        apply_fee_and_finish(b, wollet, fee_rate_sat_kvb, fee_asset.as_ref())
     })
 }
 
@@ -593,6 +596,7 @@ pub fn build_stake_tx(
     csv: u32,
     satoshi: u64,
     fee_rate_sat_kvb: Option<f32>,
+    fee_asset: Option<FeeAsset>,
 ) -> Result<String> {
     if satoshi < MIN_STAKE_ATOMS {
         return Err(err("minimum stake is 40,000 tSEQ".to_string()));
@@ -600,6 +604,6 @@ pub fn build_stake_tx(
     with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
         let pubkey = PublicKey::from_str(&staker_pubkey).map_err(rerr)?.serialize();
         let b = TxBuilder::new(crate::sequentia_testnet()).add_stake_output(&pubkey, csv, satoshi);
-        apply_fee_and_finish(b, wollet, fee_rate_sat_kvb, None)
+        apply_fee_and_finish(b, wollet, fee_rate_sat_kvb, fee_asset.as_ref())
     })
 }
