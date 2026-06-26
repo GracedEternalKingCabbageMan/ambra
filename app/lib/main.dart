@@ -27,8 +27,34 @@ Future<void> main() async {
   runApp(const AmbraApp());
 }
 
-class AmbraApp extends StatelessWidget {
+class AmbraApp extends StatefulWidget {
   const AmbraApp({super.key});
+  @override
+  State<AmbraApp> createState() => _AmbraAppState();
+}
+
+class _AmbraAppState extends State<AmbraApp> with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Re-lock when the app leaves the foreground, so returning to it requires
+    // auth again (no-op unless the opt-in lock is enabled). Only on `paused`
+    // (backgrounded), not `inactive`, so the biometric prompt itself never locks.
+    if (state == AppLifecycleState.paused) {
+      WalletRepository.instance.lock();
+    }
+  }
 
   @override
   Widget build(BuildContext context) {

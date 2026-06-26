@@ -98,6 +98,7 @@ class _AssetsScreenState extends State<AssetsScreen> {
     final amt = parseAtoms(_issueAmount.text, _issuePrecision);
     final tok = BigInt.tryParse(_issueTokens.text.trim()) ?? BigInt.zero;
     if (amt == null || amt <= BigInt.zero) return _snack('Enter an amount to issue');
+    if (tok < BigInt.zero) return _snack('Reissuance token count cannot be negative');
     if (_tooBig(amt) || _tooBig(tok)) return _snack('Amount is too large');
     if (!_hasTseq) return _snack('You need some tSEQ for the network fee. Use the faucet (More tab).');
     final ok = await _confirm(

@@ -165,6 +165,12 @@ pub fn build_send_tx(
     fee_rate_sat_kvb: Option<f32>,
     fee_asset: Option<FeeAsset>,
 ) -> Result<String> {
+    if recipients.is_empty() {
+        return Err(err("add at least one recipient".to_string()));
+    }
+    if recipients.iter().any(|r| r.satoshi == 0) {
+        return Err(err("amount must be greater than zero".to_string()));
+    }
     with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
         // Parse recipients with the SEQUENTIA address params so foreign-network
         // addresses (Liquid ex1/lq1, Elements ert1, …) are REJECTED; `from_str`
@@ -341,9 +347,8 @@ fn with_synced_wollet<T>(
     f: impl FnOnce(&lwk_wollet::Wollet) -> Result<T>,
 ) -> Result<T> {
     let descriptor = crate::descriptor_from_mnemonic(mnemonic).map_err(err)?;
-    let mut guard = wollet_cache()
-        .lock()
-        .map_err(|e| err(format!("wallet cache lock: {e}")))?;
+    // Recover a poisoned lock (from a prior panic) instead of bricking every wallet op.
+    let mut guard = wollet_cache().lock().unwrap_or_else(|e| e.into_inner());
     if !guard.contains_key(&descriptor) {
         let w = crate::build_wollet(&descriptor).map_err(err)?;
         guard.insert(descriptor.clone(), w);
@@ -387,9 +392,8 @@ fn scan_into(
 
 /// Forget any cached wallet state (called when the wallet is removed).
 pub fn clear_wallet_cache() {
-    if let Ok(mut guard) = wollet_cache().lock() {
-        guard.clear();
-    }
+    let mut guard = wollet_cache().lock().unwrap_or_else(|e| e.into_inner());
+    guard.clear();
 }
 
 /// Default fee rate (2 sat/vB) for any tx that does not set its own. The lwk

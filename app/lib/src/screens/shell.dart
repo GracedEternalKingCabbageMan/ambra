@@ -541,6 +541,9 @@ class MoreTab extends StatelessWidget {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('App lock enabled.')));
       }
     } else {
+      // Disabling the lock must require auth too, or anyone holding the unlocked
+      // phone could just turn it off.
+      if (!await repo.authenticate(reason: 'Confirm to disable the app lock')) return;
       await repo.setLockEnabled(false);
     }
   }
