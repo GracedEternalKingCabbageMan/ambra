@@ -82,8 +82,10 @@ class SeqdexClient {
   /// a quote-leg amount into the base-leg amount PreviewTrade is parameterised by.
   static Future<double> basePrice(Market market, String feeAsset) async {
     final j = await _post('/v1/market/price', {'market': market.toJson(), 'fee_asset': feeAsset});
-    final sp = (pick(j, ['spot_price', 'spotPrice']) as Map?) ?? j;
-    final bp = double.tryParse('${pick(sp, ['base_price', 'basePrice'])}') ?? 0;
+    // The daemon returns {"spotPrice": <double>, ...} — a top-level number (quote
+    // units per 1 base), NOT a nested {base_price,...} object. (Casting it `as Map`
+    // is what crashed the BUY direction.)
+    final bp = double.tryParse('${pick(j, ['spot_price', 'spotPrice'])}') ?? 0;
     if (!(bp > 0)) throw Exception('no price for this market yet');
     return bp;
   }

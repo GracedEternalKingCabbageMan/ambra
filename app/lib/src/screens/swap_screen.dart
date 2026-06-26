@@ -23,13 +23,29 @@ class SwapTab extends StatefulWidget {
   State<SwapTab> createState() => _SwapTabState();
 }
 
+/// Cross-reload cache. The State is recreated whenever the app re-locks on
+/// background and the shell rebuilds, so without this the swap composer shows a
+/// full-screen spinner + refetches everything each time. Holding the last-known
+/// markets/balances + the user's selections here lets it render instantly and
+/// refresh quietly (the same instant-cached feel as the Balance tab).
+class _SwapCache {
+  static List<Market>? markets;
+  static List<core.AssetBalance>? balances;
+  static Map<String, BigInt>? feeRates;
+  static String? payAsset;
+  static String? receiveAsset;
+  static String? amount;
+}
+
 class _SwapTabState extends State<SwapTab> {
   final _payAmount = TextEditingController();
+  final _customFeeCtl = TextEditingController(); // optional fee override, in the chosen fee asset
   List<Market> _markets = [];
   List<core.AssetBalance> _balances = [];
   Map<String, BigInt> _feeRates = {};
   String? _payAsset;
   String? _receiveAsset;
+  String? _feeAsset; // chosen fee asset hex; null => default (the paid asset)
   SwapQuote? _quote;
   bool _loading = true;
   bool _quoting = false;
@@ -40,6 +56,18 @@ class _SwapTabState extends State<SwapTab> {
   void initState() {
     super.initState();
     _payAmount.addListener(_onAmountChanged);
+    _customFeeCtl.addListener(_onAmountChanged);
+    // Hydrate from the cross-reload cache so returning from background shows the
+    // composer immediately instead of a blank spinner; _load refreshes below.
+    if (_SwapCache.markets != null) {
+      _markets = _SwapCache.markets!;
+      _balances = _SwapCache.balances ?? [];
+      _feeRates = _SwapCache.feeRates ?? {};
+      _payAsset = _SwapCache.payAsset;
+      _receiveAsset = _SwapCache.receiveAsset;
+      if (_SwapCache.amount != null) _payAmount.text = _SwapCache.amount!;
+      _loading = false;
+    }
     _load();
   }
 
@@ -52,8 +80,19 @@ class _SwapTabState extends State<SwapTab> {
   @override
   void dispose() {
     _payAmount.removeListener(_onAmountChanged);
+    _customFeeCtl.removeListener(_onAmountChanged);
     _payAmount.dispose();
+    _customFeeCtl.dispose();
     super.dispose();
+  }
+
+  void _cache() {
+    _SwapCache.markets = _markets;
+    _SwapCache.balances = _balances;
+    _SwapCache.feeRates = _feeRates;
+    _SwapCache.payAsset = _payAsset;
+    _SwapCache.receiveAsset = _receiveAsset;
+    _SwapCache.amount = _payAmount.text;
   }
 
   Future<void> _load() async {
@@ -77,6 +116,7 @@ class _SwapTabState extends State<SwapTab> {
         if (_payAsset == null || !pays.contains(_payAsset)) _payAsset = pays.isNotEmpty ? pays.first : null;
         _reconcileReceive();
       });
+      _cache();
       _requote();
     } catch (e) {
       if (mounted) {
@@ -135,11 +175,25 @@ class _SwapTabState extends State<SwapTab> {
     return _feeRates[t] != null || _feeRates[hex] != null;
   }
 
-  /// Default the fee to the asset you're paying with (no asset privileged), else
-  /// tSEQ. Folded into the pay leg when it equals the pay asset.
-  String _effectiveFeeAsset() {
-    if (_payAsset != null && _acceptedFee(_payAsset!)) return _payAsset!;
-    return SeqAssets.policy;
+  /// Default the fee to the asset being paid/transferred (no asset privileged),
+  /// else tSEQ. Folded into the pay leg when it equals the pay asset.
+  String _defaultFeeAsset() => (_payAsset != null && _acceptedFee(_payAsset!)) ? _payAsset! : SeqAssets.policy;
+
+  /// The fee asset in effect: the user's explicit pick, else the default.
+  String get _feeAssetHex => _feeAsset ?? _defaultFeeAsset();
+
+  /// Held assets (positive balance) — any can pay the fee.
+  List<String> _heldAssets() =>
+      _balances.where((b) => (BigInt.tryParse(b.atoms) ?? BigInt.zero) > BigInt.zero).map((b) => b.assetId).toList();
+
+  /// Fee-asset options: the paid asset first, then any held asset, then tSEQ —
+  /// every node-accepted one, no asset privileged.
+  List<String> _feeOptions() {
+    final set = <String>{};
+    if (_payAsset != null) set.add(_payAsset!);
+    set.addAll(_heldAssets());
+    set.add(SeqAssets.policy);
+    return set.where(_acceptedFee).toList();
   }
 
   // --- routing + quoting -----------------------------------------------------
@@ -172,6 +226,7 @@ class _SwapTabState extends State<SwapTab> {
   }
 
   Future<void> _requote() async {
+    _cache(); // persist selections (asset/amount/receive) for instant resume
     final route = _route();
     final payHex = _payAsset;
     if (route == null || payHex == null) {
@@ -192,7 +247,7 @@ class _SwapTabState extends State<SwapTab> {
     try {
       final m = route.market;
       final side = route.side;
-      final feeAsset = _effectiveFeeAsset();
+      final feeAsset = _feeAssetHex;
       final basePrec = SeqAssets.labelFor(m.baseAsset).precision;
       final quotePrec = SeqAssets.labelFor(m.quoteAsset).precision;
 
@@ -212,6 +267,16 @@ class _SwapTabState extends State<SwapTab> {
 
       final preview = await SeqdexClient.preview(m, side, baseAtoms, feeAsset);
 
+      // The swap's NETWORK fee is the taker's (the maker turns fee_amount into the
+      // settlement tx's fee output). Default to the daemon's suggestion for this
+      // asset; let the user override the amount in the chosen fee asset.
+      BigInt feeAmount = preview.feeAmount;
+      final custom = _customFeeCtl.text.trim();
+      if (custom.isNotEmpty) {
+        final c = parseAtoms(custom, SeqAssets.labelFor(feeAsset).precision);
+        if (c != null && c >= BigInt.zero) feeAmount = c;
+      }
+
       // Orient the legs (proven 6d-1 mapping).
       final SwapQuote q;
       if (side == 'SELL') {
@@ -219,14 +284,14 @@ class _SwapTabState extends State<SwapTab> {
           market: m, side: side,
           assetP: m.baseAsset, amountP: baseAtoms,
           assetR: preview.counterAsset, amountR: preview.counterAtoms,
-          feeAsset: preview.feeAsset, feeAmount: preview.feeAmount,
+          feeAsset: feeAsset, feeAmount: feeAmount,
         );
       } else {
         q = SwapQuote(
           market: m, side: side,
           assetP: preview.counterAsset, amountP: preview.counterAtoms,
           assetR: m.baseAsset, amountR: baseAtoms,
-          feeAsset: preview.feeAsset, feeAmount: preview.feeAmount,
+          feeAsset: feeAsset, feeAmount: feeAmount,
         );
       }
       if (my != _reqSeq || !mounted) return; // a newer request superseded this one
@@ -267,6 +332,20 @@ class _SwapTabState extends State<SwapTab> {
       setState(() {
         _payAsset = picked;
         _reconcileReceive();
+        // Re-default the fee to the new paid asset.
+        _feeAsset = null;
+        _customFeeCtl.clear();
+        _quote = null;
+      });
+      _requote();
+    }
+  }
+
+  Future<void> _pickFee() async {
+    final picked = await _assetSheet('Pay fee in', _feeOptions(), withBalance: true);
+    if (picked != null) {
+      setState(() {
+        _feeAsset = picked;
         _quote = null;
       });
       _requote();
@@ -410,6 +489,19 @@ class _SwapTabState extends State<SwapTab> {
             const SectionLabel('You receive'),
             const SizedBox(height: 8),
             _PickerRow(label: _tk(_receiveAsset), onTap: _pickReceive),
+            const SizedBox(height: 18),
+            const SectionLabel('Network fee'),
+            const SizedBox(height: 8),
+            _PickerRow(label: _tk(_feeAssetHex), trailing: 'any asset you hold', onTap: _pickFee),
+            const SizedBox(height: 10),
+            AmbraField(
+                label: 'Custom fee (${_tk(_feeAssetHex)}, optional)', controller: _customFeeCtl, hint: 'network default'),
+            const SizedBox(height: 6),
+            Text(
+              "Paid in the asset you're swapping by default; pick any asset you hold, "
+              'or set a custom amount to override the suggested fee.',
+              style: AmbraText.sub,
+            ),
             const SizedBox(height: 18),
             AmbraCard(
               child: _quoting
