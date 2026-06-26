@@ -18,6 +18,8 @@
 pub mod api;
 /// Bitcoin parent-chain (testnet4) wallet — the dual-chain half (same keychain).
 mod btc;
+/// Bitcoin-leg HTLC for cross-chain SeqDEX swaps (redeemScript + P2SH + refund).
+mod btc_htlc;
 /// SeqDEX same-chain atomic swap helpers (JSON serializer + bip32 strip).
 mod seqdex;
 mod frb_generated;
