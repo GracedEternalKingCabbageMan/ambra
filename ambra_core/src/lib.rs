@@ -22,6 +22,8 @@ mod btc;
 mod btc_htlc;
 /// SeqDEX same-chain atomic swap helpers (JSON serializer + bip32 strip).
 mod seqdex;
+/// SeqDEX cross-chain (BTC<->SEQ asset) swap glue — keys, reveal gate, claim.
+mod xchain;
 mod frb_generated;
 
 use std::str::FromStr;

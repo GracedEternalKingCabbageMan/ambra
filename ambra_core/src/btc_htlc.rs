@@ -16,9 +16,19 @@
 //! select the ELSE branch (the generic signer won't template the OP_FALSE
 //! selector). The BTC claim is Bob's path and is not built here.
 
+use std::str::FromStr;
+
+use lwk_wollet::bitcoin::absolute::LockTime;
+use lwk_wollet::bitcoin::consensus::encode::serialize_hex;
+use lwk_wollet::bitcoin::hashes::Hash;
 use lwk_wollet::bitcoin::script::{Builder, PushBytes};
-use lwk_wollet::bitcoin::secp256k1::PublicKey;
-use lwk_wollet::bitcoin::{opcodes, Address, Network, ScriptBuf};
+use lwk_wollet::bitcoin::secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
+use lwk_wollet::bitcoin::sighash::SighashCache;
+use lwk_wollet::bitcoin::transaction::Version;
+use lwk_wollet::bitcoin::{
+    opcodes, Address, Amount, EcdsaSighashType, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
+    Witness,
+};
 
 use crate::AmbraResult;
 
@@ -76,9 +86,72 @@ pub fn htlc_p2sh(redeem: &ScriptBuf) -> AmbraResult<(Address, ScriptBuf)> {
     Ok((address, redeem.to_p2sh()))
 }
 
+/// A spend of an HTLC P2SH output: the funding outpoint, its value, where the
+/// refund pays, and the fee to subtract.
+pub struct BtcHtlcSpend {
+    pub txid: String,
+    pub vout: u32,
+    pub amount_sats: u64,
+    pub dest_spk: ScriptBuf,
+    pub fee_sats: u64,
+}
+
+/// Build + sign the BTC refund: a legacy P2SH spend of the HTLC via the ELSE/CLTV
+/// branch, paying `amount - fee` to `dest_spk`. Only valid once the chain tip
+/// reaches `locktime` (CLTV). Returns the raw tx hex to broadcast.
+///
+/// The scriptSig is `<sig> OP_0 <redeemScript>`: the empty (false) item selects
+/// the OP_ELSE branch, and the redeemScript push is what P2SH executes. The
+/// sighash is a LEGACY SIGHASH_ALL over the redeemScript (not the P2SH spk).
+pub fn build_refund_tx(
+    redeem: &ScriptBuf,
+    spend: &BtcHtlcSpend,
+    locktime: u32,
+    refund_sk: &SecretKey,
+) -> AmbraResult<String> {
+    let out_value = spend
+        .amount_sats
+        .checked_sub(spend.fee_sats)
+        .ok_or_else(|| "fee exceeds the HTLC amount".to_string())?;
+    if out_value == 0 {
+        return Err("refund output is zero after fee".into());
+    }
+    let txid = Txid::from_str(&spend.txid).map_err(map)?;
+    let mut tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::from_consensus(locktime),
+        input: vec![TxIn {
+            previous_output: OutPoint { txid, vout: spend.vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence(0xffff_fffe), // non-final (BIP68 disabled) so absolute CLTV applies
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut { value: Amount::from_sat(out_value), script_pubkey: spend.dest_spk.clone() }],
+    };
+    // Legacy SIGHASH_ALL over the redeemScript (the subscript), computed while the
+    // cache borrows &tx; then drop it before mutating the input's scriptSig.
+    let sighash = SighashCache::new(&tx)
+        .legacy_signature_hash(0, redeem, EcdsaSighashType::All.to_u32())
+        .map_err(map)?;
+    let secp = Secp256k1::new();
+    let sig = secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), refund_sk);
+    let mut sig_bytes = sig.serialize_der().to_vec();
+    sig_bytes.push(EcdsaSighashType::All.to_u32() as u8); // 0x01
+
+    tx.input[0].script_sig = Builder::new()
+        .push_slice(push_bytes(&sig_bytes)?)
+        .push_opcode(opcodes::all::OP_PUSHBYTES_0) // OP_0 / false -> selects the ELSE/CLTV branch
+        .push_slice(push_bytes(redeem.as_bytes())?)
+        .into_script();
+    Ok(serialize_hex(&tx))
+}
+
 #[cfg(test)]
 mod tests {
+    use lwk_wollet::bitcoin::consensus::encode::deserialize;
+    use lwk_wollet::bitcoin::hex::FromHex;
     use lwk_wollet::bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use lwk_wollet::bitcoin::Transaction;
 
     fn pubkey(byte: u8) -> [u8; 33] {
         let secp = Secp256k1::new();
@@ -111,5 +184,49 @@ mod tests {
         let ok = pubkey(2);
         assert!(super::build_htlc_redeem_script(&[0u8; 31], &ok, &ok, 1).is_err()); // short hash
         assert!(super::build_htlc_redeem_script(&[0u8; 32], &ok[..32], &ok, 1).is_err()); // short key
+    }
+
+    #[test]
+    fn refund_tx_shape() {
+        let secp = Secp256k1::new();
+        let refund_sk = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let refund_pub = refund_sk.public_key(&secp).serialize();
+        let redeem = super::build_htlc_redeem_script(&[0x22u8; 32], &pubkey(2), &refund_pub, 800_000).unwrap();
+        let (_addr, _spk) = super::htlc_p2sh(&redeem).unwrap();
+        let dest_spk = super::htlc_p2sh(&redeem).unwrap().1; // any spk for the structural check
+        let spend = super::BtcHtlcSpend {
+            txid: "a".repeat(64),
+            vout: 1,
+            amount_sats: 50_000,
+            dest_spk,
+            fee_sats: 2_000,
+        };
+        let hex = super::build_refund_tx(&redeem, &spend, 800_000, &refund_sk).unwrap();
+        let raw = Vec::<u8>::from_hex(&hex).unwrap();
+        let tx: Transaction = deserialize(&raw).unwrap();
+        assert_eq!(tx.version, super::Version::TWO);
+        assert_eq!(tx.lock_time.to_consensus_u32(), 800_000); // CLTV enforced
+        assert_eq!(tx.input.len(), 1);
+        assert_eq!(tx.input[0].sequence.0, 0xffff_fffe); // non-final
+        assert!(tx.input[0].witness.is_empty()); // legacy P2SH, no witness
+        assert_eq!(tx.output.len(), 1);
+        assert_eq!(tx.output[0].value.to_sat(), 48_000); // amount - fee
+        // scriptSig ends with the redeemScript push; the empty selector sits before it.
+        assert!(!tx.input[0].script_sig.is_empty());
+    }
+
+    #[test]
+    fn refund_rejects_fee_over_amount() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let redeem = super::build_htlc_redeem_script(&[0x22u8; 32], &pubkey(2), &sk.public_key(&secp).serialize(), 1).unwrap();
+        let spend = super::BtcHtlcSpend {
+            txid: "a".repeat(64),
+            vout: 0,
+            amount_sats: 1_000,
+            dest_spk: super::htlc_p2sh(&redeem).unwrap().1,
+            fee_sats: 2_000,
+        };
+        assert!(super::build_refund_tx(&redeem, &spend, 1, &sk).is_err());
     }
 }

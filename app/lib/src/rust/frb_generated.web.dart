@@ -30,6 +30,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AddressInfo dco_decode_address_info(dynamic raw);
 
   @protected
+  AnchorEvidence dco_decode_anchor_evidence(dynamic raw);
+
+  @protected
   AssetBalance dco_decode_asset_balance(dynamic raw);
 
   @protected
@@ -54,6 +57,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BtcBalance dco_decode_btc_balance(dynamic raw);
 
   @protected
+  BtcFunding dco_decode_btc_funding(dynamic raw);
+
+  @protected
+  BtcHtlcInfo dco_decode_btc_htlc_info(dynamic raw);
+
+  @protected
   BtcTx dco_decode_btc_tx(dynamic raw);
 
   @protected
@@ -64,6 +73,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   FeeAsset dco_decode_fee_asset(dynamic raw);
+
+  @protected
+  PlatformInt64 dco_decode_i_64(dynamic raw);
 
   @protected
   List<AssetBalance> dco_decode_list_asset_balance(dynamic raw);
@@ -120,6 +132,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   WalletSync dco_decode_wallet_sync(dynamic raw);
 
   @protected
+  XchainSecret dco_decode_xchain_secret(dynamic raw);
+
+  @protected
   AnyhowException sse_decode_AnyhowException(SseDeserializer deserializer);
 
   @protected
@@ -127,6 +142,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   AddressInfo sse_decode_address_info(SseDeserializer deserializer);
+
+  @protected
+  AnchorEvidence sse_decode_anchor_evidence(SseDeserializer deserializer);
 
   @protected
   AssetBalance sse_decode_asset_balance(SseDeserializer deserializer);
@@ -153,6 +171,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BtcBalance sse_decode_btc_balance(SseDeserializer deserializer);
 
   @protected
+  BtcFunding sse_decode_btc_funding(SseDeserializer deserializer);
+
+  @protected
+  BtcHtlcInfo sse_decode_btc_htlc_info(SseDeserializer deserializer);
+
+  @protected
   BtcTx sse_decode_btc_tx(SseDeserializer deserializer);
 
   @protected
@@ -163,6 +187,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   FeeAsset sse_decode_fee_asset(SseDeserializer deserializer);
+
+  @protected
+  PlatformInt64 sse_decode_i_64(SseDeserializer deserializer);
 
   @protected
   List<AssetBalance> sse_decode_list_asset_balance(
@@ -223,6 +250,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   WalletSync sse_decode_wallet_sync(SseDeserializer deserializer);
 
   @protected
+  XchainSecret sse_decode_xchain_secret(SseDeserializer deserializer);
+
+  @protected
   int sse_decode_i_32(SseDeserializer deserializer);
 
   @protected
@@ -236,6 +266,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_address_info(AddressInfo self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_anchor_evidence(
+    AnchorEvidence self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_asset_balance(AssetBalance self, SseSerializer serializer);
@@ -265,6 +301,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_btc_balance(BtcBalance self, SseSerializer serializer);
 
   @protected
+  void sse_encode_btc_funding(BtcFunding self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_btc_htlc_info(BtcHtlcInfo self, SseSerializer serializer);
+
+  @protected
   void sse_encode_btc_tx(BtcTx self, SseSerializer serializer);
 
   @protected
@@ -275,6 +317,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_fee_asset(FeeAsset self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer);
 
   @protected
   void sse_encode_list_asset_balance(
@@ -347,6 +392,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_wallet_sync(WalletSync self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_xchain_secret(XchainSecret self, SseSerializer serializer);
 
   @protected
   void sse_encode_i_32(int self, SseSerializer serializer);
