@@ -1,6 +1,6 @@
 # Ambra — build spec (v1, testnet, Android-first)
 
-Ambra is a non-custodial Sequentia wallet for Android + iOS (Flutter UI over the
+Ambra is a non-custodial Bitcoin + Sequentia wallet for Android + iOS (Flutter UI over the
 `ambra_core` Rust crate via flutter_rust_bridge, on the SWK kit). The **Sequentia
 web wallet** is the design + feature model; this is it re-shaped for a phone.
 
@@ -12,7 +12,7 @@ opening the app, every Confirm & sign, and Reveal phrase / Remove wallet.
 
 ## Finality UX (consensus law — never contradict)
 Sequentia has immediate finality: a tx is **settled the instant it lands in a
-certified block** (~30s slot). NO confirmation-count bar, NO anchor-depth gating
+certified block** (~30s slot), subject only to a Bitcoin reorg of its anchor (Bitcoin anchoring is supreme). NO confirmation-count bar, NO anchor-depth gating
 — a light wallet cannot watch Bitcoin and just mirrors backend chain state; if a
 sync reports a (rare, Bitcoin-reorg-driven) disconnect, the affected tx
 un-settles. Per-asset balances only — never a summed total across assets. Staked

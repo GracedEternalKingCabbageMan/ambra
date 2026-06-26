@@ -1,6 +1,6 @@
 # Ambra
 
-A non-custodial mobile wallet for **Sequentia** (Android + iOS), built in
+A non-custodial mobile wallet for **Bitcoin and Sequentia** (Android + iOS), built in
 **Flutter** over a shared **Rust core** (`ambra_core`) that wraps the
 [SWK](https://github.com/aejkcs50/SWK) kit — a Sequentia fork of Blockstream's
 Liquid Wallet Kit (LWK).

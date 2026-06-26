@@ -265,7 +265,7 @@ class _TxDetailSheet extends StatelessWidget {
             AmbraCard(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
               child: Column(children: [
-                _DetailRow('Status', settled ? 'Settled · block ${tx.height}' : 'Pending; not yet in a block'),
+                _DetailRow('Status', settled ? 'Settled · block ${tx.height} (anchor-bound to Bitcoin)' : 'Pending; not yet in a block'),
                 _DetailRow('Date', _fmtTime(tx.timestamp)),
                 _DetailRow('Network', 'sequentia-testnet'),
                 if (showFee) _DetailRow('Network fee', '${formatAtoms(tx.fee.toString(), 8)} tSEQ'),

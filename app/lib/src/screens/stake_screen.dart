@@ -130,7 +130,7 @@ class _StakeScreenState extends State<StakeScreen> {
           Expanded(
             child: ListView(padding: const EdgeInsets.all(20), children: [
               const Text(
-                'Bond tSEQ to participate in block production. Stake weight = the amount '
+                'Bond Sequence (tSEQ) to participate in block production. Stake weight = the amount '
                 '(no benefit to a longer lock). It uses the network minimum unbonding period.',
                 style: AmbraText.muted,
               ),

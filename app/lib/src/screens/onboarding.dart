@@ -32,13 +32,13 @@ class WelcomeScreen extends StatelessWidget {
                       const Text('Ambra', style: _wordmark),
                       const SizedBox(height: 6),
                       Row(children: [
-                        const Text('Sequentia wallet', style: AmbraText.muted),
+                        const Text('Bitcoin + Sequentia wallet', style: AmbraText.muted),
                         const SizedBox(width: 8),
                         _Pill('testnet'),
                       ]),
                       const SizedBox(height: 14),
                       const Text(
-                        'A self-custodial wallet for Sequentia: Proof-of-Stake, '
+                        'A self-custodial wallet for Bitcoin and Sequentia: Proof-of-Stake, '
                         'Bitcoin-anchored, with fees payable in any asset.',
                         style: AmbraText.muted,
                       ),

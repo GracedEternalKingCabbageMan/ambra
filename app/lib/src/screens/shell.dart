@@ -727,7 +727,7 @@ class MoreTab extends StatelessWidget {
         ),
         const SizedBox(height: 20),
         Center(
-          child: Text('Ambra v$kAppVersion · Sequentia testnet', style: AmbraText.sub),
+          child: Text('Ambra v$kAppVersion · Bitcoin testnet4 + Sequentia testnet', style: AmbraText.sub),
         ),
       ],
     );

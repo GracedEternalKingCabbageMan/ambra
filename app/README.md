@@ -1,6 +1,6 @@
 # ambra
 
-Non-custodial Sequentia wallet
+Non-custodial Bitcoin + Sequentia wallet
 
 ## Getting Started
 
