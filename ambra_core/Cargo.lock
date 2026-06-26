@@ -125,6 +125,9 @@ dependencies = [
  "lwk_common",
  "lwk_signer",
  "lwk_wollet",
+ "reqwest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

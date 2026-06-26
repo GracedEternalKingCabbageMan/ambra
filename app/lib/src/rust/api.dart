@@ -58,6 +58,32 @@ Future<AddressInfo> receiveAddressAt({
   confidential: confidential,
 );
 
+/// Scan the wallet's Bitcoin (testnet4) keychain; returns the balance and the
+/// cycling indices. `t4_api` is the testnet4 esplora base (e.g. `<node>/testnet4/api`).
+Future<BtcBalance> btcSync({required String mnemonic, required String t4Api}) =>
+    RustLib.instance.api.crateApiBtcSync(mnemonic: mnemonic, t4Api: t4Api);
+
+/// Build + sign (but DON'T broadcast) a Bitcoin testnet4 payment of `amount_sats`
+/// to `address`, at `fee_rate` sat/vB. Show the returned fee/vsize for review,
+/// then [`btc_broadcast`] the hex to send.
+Future<BtcTx> btcPrepare({
+  required String mnemonic,
+  required String t4Api,
+  required String address,
+  required BigInt amountSats,
+  required double feeRate,
+}) => RustLib.instance.api.crateApiBtcPrepare(
+  mnemonic: mnemonic,
+  t4Api: t4Api,
+  address: address,
+  amountSats: amountSats,
+  feeRate: feeRate,
+);
+
+/// Broadcast a prepared Bitcoin testnet4 transaction hex; returns the txid.
+Future<String> btcBroadcast({required String t4Api, required String txHex}) =>
+    RustLib.instance.api.crateApiBtcBroadcast(t4Api: t4Api, txHex: txHex);
+
 /// Full-scan the wallet against `esplora_url`, apply the update, and return the
 /// chain tip, per-asset balances, and the next unused receive index. Runs on an
 /// FRB worker thread (off the UI thread).
@@ -326,6 +352,70 @@ class AssetDelta {
           runtimeType == other.runtimeType &&
           assetId == other.assetId &&
           atoms == other.atoms;
+}
+
+/// Result of scanning the Bitcoin keychain: the balance (sats, as a string for
+/// FFI precision-safety) plus the next-unused indices for cross-chain address
+/// cycling (the shared receive address advances past use on EITHER chain).
+class BtcBalance {
+  final String balanceSats;
+  final int externalNext;
+  final int changeNext;
+
+  const BtcBalance({
+    required this.balanceSats,
+    required this.externalNext,
+    required this.changeNext,
+  });
+
+  @override
+  int get hashCode =>
+      balanceSats.hashCode ^ externalNext.hashCode ^ changeNext.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is BtcBalance &&
+          runtimeType == other.runtimeType &&
+          balanceSats == other.balanceSats &&
+          externalNext == other.externalNext &&
+          changeNext == other.changeNext;
+}
+
+/// A built + signed (not yet broadcast) Bitcoin transaction, for the review step.
+class BtcTx {
+  final String hex;
+  final String txid;
+  final String feeSats;
+  final BigInt vsize;
+  final int inputs;
+
+  const BtcTx({
+    required this.hex,
+    required this.txid,
+    required this.feeSats,
+    required this.vsize,
+    required this.inputs,
+  });
+
+  @override
+  int get hashCode =>
+      hex.hashCode ^
+      txid.hashCode ^
+      feeSats.hashCode ^
+      vsize.hashCode ^
+      inputs.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is BtcTx &&
+          runtimeType == other.runtimeType &&
+          hex == other.hex &&
+          txid == other.txid &&
+          feeSats == other.feeSats &&
+          vsize == other.vsize &&
+          inputs == other.inputs;
 }
 
 /// Pay the fee in any accepted asset at the node's published rate.

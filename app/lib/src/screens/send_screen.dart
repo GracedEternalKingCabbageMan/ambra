@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import '../rust/api.dart' as core;
 import '../data/api_client.dart';
+import '../data/btc_state.dart';
 import '../data/config.dart';
 import '../data/format.dart';
 import '../data/price_service.dart';
@@ -26,6 +27,7 @@ class _SendTabState extends State<SendTab> {
   final _amount = TextEditingController();
   final _feeRateCtl = TextEditingController(); // sat/vB, optional; empty = network default
   List<core.AssetBalance> _balances = [];
+  core.BtcBalance? _btc; // parent-chain (testnet4) balance, sendable like any asset
   Map<String, BigInt> _feeRates = {};
   String _assetId = SeqAssets.policy;
   String? _feeAsset; // null = pay the fee in tSEQ (the builder's default)
@@ -33,9 +35,13 @@ class _SendTabState extends State<SendTab> {
   bool _loading = true;
   String? _error;
 
+  /// The synthetic asset id for parent-chain Bitcoin in the picker/state.
+  static const _btcId = 'BTC';
+
   @override
   void initState() {
     super.initState();
+    _btc = BtcState.instance.last; // show BTC at once if the Balance tab already scanned
     _loadCached(); // render the form from last-known balances at once
     _load(); // eager: load at launch (also reloads on activation)
   }
@@ -48,9 +54,9 @@ class _SendTabState extends State<SendTab> {
     if (b == null || !mounted || _balances.isNotEmpty) return; // don't clobber a finished sync
     setState(() {
       _balances = b;
-      final held = _heldIds();
-      if (!held.contains(_assetId)) {
-        _assetId = held.isNotEmpty ? held.first : SeqAssets.policy;
+      final sendable = _sendableIds();
+      if (!sendable.contains(_assetId)) {
+        _assetId = sendable.isNotEmpty ? sendable.first : SeqAssets.policy;
       }
       if (!_feeManual) _feeAsset = _defaultFeeFor(_assetId);
       _loading = false;
@@ -80,6 +86,13 @@ class _SendTabState extends State<SendTab> {
       .map((b) => b.assetId)
       .toList();
 
+  bool get _isBtc => _assetId == _btcId;
+  bool get _hasBtc => (BigInt.tryParse(_btc?.balanceSats ?? '0') ?? BigInt.zero) > BigInt.zero;
+
+  /// Everything sendable, BTC included as a first-class asset (parent chain first
+  /// when held, so a BTC-only wallet defaults to it).
+  List<String> _sendableIds() => [if (_hasBtc) _btcId, ..._heldIds()];
+
   Future<void> _load() async {
     try {
       final m = await WalletRepository.instance.readMnemonic();
@@ -90,15 +103,27 @@ class _SendTabState extends State<SendTab> {
         final rates = await ApiClient.feeRates();
         if (mounted && rates.isNotEmpty) setState(() => _feeRates = rates);
       } catch (_) {/* fee-rate list unavailable; the default fee still works */}
+      // Scan the parent chain concurrently; a BTC failure must not block sending
+      // Sequentia assets, so it resolves to null on error.
+      final btcF = () async {
+        try {
+          return await core.btcSync(mnemonic: m, t4Api: Backend.testnet4);
+        } catch (_) {
+          return null;
+        }
+      }();
       final s = await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
+      final btc = await btcF;
       WalletCache.saveBalances(s.balances); // keep the shared cache fresh
+      if (btc != null) BtcState.instance.observe(btc: btc, seqNext: s.nextIndex);
       if (!mounted) return;
       setState(() {
         _error = null; // a successful load clears any earlier (transient) error
         _balances = s.balances;
+        if (btc != null) _btc = btc;
         // Default the send asset to one you hold (keep the current choice if it's
         // still funded). Never default to tSEQ when its balance is 0.
-        final held = _heldIds();
+        final held = _sendableIds();
         if (!held.contains(_assetId)) {
           _assetId = held.isNotEmpty ? held.first : SeqAssets.policy;
         }
@@ -160,13 +185,15 @@ class _SendTabState extends State<SendTab> {
   bool get _feeUnpriced => _feeAsset != null && _rateFor(_feeAsset!) == null;
 
   Future<void> _pickAsset() async {
-    final picked = await _assetSheet('Choose asset', _heldIds(), withBalances: true);
+    final picked = await _assetSheet('Choose asset', _sendableIds(), withBalances: true);
     if (picked != null) {
       setState(() {
         _assetId = picked;
         // Re-apply the "fee in the asset being sent" default for the new asset.
+        // (BTC pays its own fee in BTC, so the fee-asset picker doesn't apply.)
         _feeManual = false;
-        _feeAsset = _defaultFeeFor(picked);
+        _feeAsset = picked == _btcId ? null : _defaultFeeFor(picked);
+        _feeRateCtl.clear(); // the rate unit differs (sat/vB for BTC, asset/vB otherwise)
       });
     }
   }
@@ -204,6 +231,7 @@ class _SendTabState extends State<SendTab> {
   }
 
   String _balanceOf(String id) {
+    if (id == _btcId) return _btc?.balanceSats ?? '0';
     for (final b in _balances) {
       if (b.assetId == id) return b.atoms;
     }
@@ -238,6 +266,7 @@ class _SendTabState extends State<SendTab> {
   }
 
   Future<void> _review() async {
+    if (_isBtc) return _reviewBtc();
     final label = SeqAssets.labelFor(_assetId);
     final addr = _addr.text.trim();
     final atoms = parseAtoms(_amount.text, label.precision);
@@ -308,13 +337,60 @@ class _SendTabState extends State<SendTab> {
     }
   }
 
+  /// Review + send a parent-chain Bitcoin (testnet4) payment. BTC pays its own fee
+  /// in BTC (sat/vB), so there's no fee-asset market here — a different path from
+  /// the Sequentia send above.
+  Future<void> _reviewBtc() async {
+    final addr = _addr.text.trim();
+    final atoms = parseAtoms(_amount.text, 8); // BTC has 8 decimals
+    if (addr.isEmpty) return _snack('Enter a recipient address');
+    if (atoms == null || atoms <= BigInt.zero) return _snack('Enter a valid amount');
+    if (atoms >= (BigInt.one << 64)) return _snack('Amount is too large.');
+    final bal = BigInt.tryParse(_balanceOf(_btcId)) ?? BigInt.zero;
+    if (atoms > bal) return _snack('Amount exceeds your BTC balance');
+
+    double feeRate = 0; // 0 => the core uses the testnet4 default
+    final frText = _feeRateCtl.text.trim();
+    if (frText.isNotEmpty) {
+      final fr = double.tryParse(frText);
+      if (fr == null || fr <= 0) return _snack('Enter a valid fee rate (sat/vB), or leave it blank.');
+      feeRate = fr;
+    }
+
+    final txid = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AmbraColors.panel,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+      builder: (_) => _BtcReviewSheet(
+        address: addr,
+        amountSats: atoms,
+        amountStr: formatAtoms(atoms.toString(), 8),
+        feeRate: feeRate,
+      ),
+    );
+    if (txid != null && mounted) {
+      _addr.clear();
+      _amount.clear();
+      ScaffoldMessenger.of(context).showSnackBar(ambraSnack(
+        'Sent BTC · ${txid.substring(0, 16)}…',
+        action: SnackBarAction(
+          label: 'Copy txid',
+          textColor: AmbraColors.amber,
+          onPressed: () => Clipboard.setData(ClipboardData(text: txid)),
+        ),
+      ));
+      _load();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final label = SeqAssets.labelFor(_assetId);
-    final bal = _selected;
     final held = _heldIds();
     final canPickFee = _feeOptions().length > 1; // more than one held asset to choose from
-    final canSend = !_loading && _error == null && held.isNotEmpty;
+    final canSend = !_loading && _error == null && (held.isNotEmpty || _hasBtc);
+    final balStr = formatAtoms(_balanceOf(_assetId), label.precision);
     return Column(
       children: [
         Expanded(
@@ -331,7 +407,7 @@ class _SendTabState extends State<SendTab> {
                   SecondaryButton(label: 'Retry', icon: Icons.refresh, onPressed: _load),
                 ]),
               )
-            else if (held.isEmpty)
+            else if (held.isEmpty && !_hasBtc)
               const AmbraCard(
                   child: Text(
                       'No assets to send yet. Get free testnet coins from the faucet (More tab), '
@@ -342,7 +418,7 @@ class _SendTabState extends State<SendTab> {
               const SizedBox(height: 8),
               _PickerField(
                 label: label.ticker,
-                trailing: bal == null ? null : 'balance ${formatAtoms(bal.atoms, label.precision)}',
+                trailing: 'balance $balStr',
                 onTap: _pickAsset,
               ),
               const SizedBox(height: 18),
@@ -360,28 +436,36 @@ class _SendTabState extends State<SendTab> {
               const SizedBox(height: 18),
               AmbraField(label: 'Amount (${label.ticker})', controller: _amount, hint: '0.0'),
               const SizedBox(height: 18),
-              const SectionLabel('Pay fee in'),
-              const SizedBox(height: 8),
-              _PickerField(
-                label: _feeLabel,
-                trailing: canPickFee ? 'any asset you hold' : null,
-                onTap: canPickFee ? _pickFee : null,
-              ),
-              const SizedBox(height: 10),
-              if (_feeUnpriced)
-                WarnCallout(_feeUnpricedMessage())
-              else
-                Text(
-                  _feeAsset == null
-                      ? 'Fee paid in tSEQ at the network rate.'
-                      : 'Fee paid in $_feeLabel at the node\'s published rate. '
-                          'Confirmation depends on producers accepting it.',
-                  style: AmbraText.sub,
+              if (_isBtc) ...[
+                // Parent-chain Bitcoin pays its own fee in BTC (sat/vB is a Bitcoin
+                // unit and only correct here); there's no any-asset fee market.
+                const Text('Bitcoin (testnet4): the fee is paid in BTC at the rate below.', style: AmbraText.sub),
+                const SizedBox(height: 16),
+                AmbraField(label: 'Fee rate (sat/vB, optional)', controller: _feeRateCtl, hint: 'default 2'),
+              ] else ...[
+                const SectionLabel('Pay fee in'),
+                const SizedBox(height: 8),
+                _PickerField(
+                  label: _feeLabel,
+                  trailing: canPickFee ? 'any asset you hold' : null,
+                  onTap: canPickFee ? _pickFee : null,
                 ),
-              const SizedBox(height: 16),
-              // The fee rate in the chosen asset's own units per vByte (e.g. OILX/vB, tSEQ/vB);
-              // the actual fee is shown, estimated, on the review screen. Blank = network default.
-              AmbraField(label: 'Fee rate ($_feeLabel/vB, optional)', controller: _feeRateCtl, hint: ''),
+                const SizedBox(height: 10),
+                if (_feeUnpriced)
+                  WarnCallout(_feeUnpricedMessage())
+                else
+                  Text(
+                    _feeAsset == null
+                        ? 'Fee paid in tSEQ at the network rate.'
+                        : 'Fee paid in $_feeLabel at the node\'s published rate. '
+                            'Confirmation depends on producers accepting it.',
+                    style: AmbraText.sub,
+                  ),
+                const SizedBox(height: 16),
+                // The fee rate in the chosen asset's own units per vByte (e.g. OILX/vB, tSEQ/vB);
+                // the actual fee is shown, estimated, on the review screen. Blank = network default.
+                AmbraField(label: 'Fee rate ($_feeLabel/vB, optional)', controller: _feeRateCtl, hint: ''),
+              ],
             ],
           ]),
         ),
@@ -560,6 +644,139 @@ class _ReviewSheetState extends State<_ReviewSheet> {
               busy: _busy,
               icon: Icons.fingerprint,
               onPressed: (_busy || _loading || _pset == null) ? null : _confirm),
+          const SizedBox(height: 6),
+          GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
+        ]),
+      ),
+    );
+  }
+}
+
+/// Review + broadcast a parent-chain Bitcoin (testnet4) payment. Builds + signs
+/// up front (via [core.btcPrepare]) so the review shows the real fee, then
+/// broadcasts that exact transaction on confirm.
+class _BtcReviewSheet extends StatefulWidget {
+  const _BtcReviewSheet({
+    required this.address,
+    required this.amountSats,
+    required this.amountStr,
+    required this.feeRate,
+  });
+  final String address;
+  final BigInt amountSats;
+  final String amountStr;
+  final double feeRate;
+
+  @override
+  State<_BtcReviewSheet> createState() => _BtcReviewSheetState();
+}
+
+class _BtcReviewSheetState extends State<_BtcReviewSheet> {
+  bool _busy = false; // broadcasting
+  bool _loading = true; // building + signing to estimate the fee
+  String? _error;
+  core.BtcTx? _tx;
+
+  @override
+  void initState() {
+    super.initState();
+    _prepare();
+  }
+
+  Future<void> _prepare() async {
+    try {
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) throw Exception('wallet unavailable');
+      final tx = await core.btcPrepare(
+        mnemonic: m,
+        t4Api: Backend.testnet4,
+        address: widget.address,
+        amountSats: widget.amountSats,
+        feeRate: widget.feeRate,
+      );
+      if (mounted) {
+        setState(() {
+          _tx = tx;
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = _pretty(e);
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  String _feeStr() {
+    final tx = _tx!;
+    final amt = formatAtoms(tx.feeSats, 8);
+    final ref = PriceService.instance.refValue('BTC', tx.feeSats, 8);
+    final refStr = ref != null ? '  (≈ ${PriceService.instance.fmtRef(ref)} ${PriceService.instance.ref})' : '';
+    return '$amt BTC$refStr · ${tx.inputs} input${tx.inputs == 1 ? '' : 's'}, ${tx.vsize} vB';
+  }
+
+  String _totalStr() {
+    final fee = BigInt.tryParse(_tx!.feeSats) ?? BigInt.zero;
+    return '${formatAtoms((widget.amountSats + fee).toString(), 8)} BTC';
+  }
+
+  Future<void> _confirm() async {
+    final tx = _tx;
+    if (tx == null) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final ok = await WalletRepository.instance.requirePaymentAuth();
+      if (!ok) {
+        setState(() {
+          _busy = false;
+          _error = 'Authentication failed or cancelled; payment not sent.';
+        });
+        return;
+      }
+      final txid = await core.btcBroadcast(t4Api: Backend.testnet4, txHex: tx.hex);
+      if (mounted) Navigator.pop(context, txid);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = _pretty(e);
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          const Text('Confirm Bitcoin payment', style: AmbraText.h1),
+          const SizedBox(height: 18),
+          AmbraCard(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Column(children: [
+              _Row('Amount', '${widget.amountStr} BTC'),
+              _Row('To', widget.address, mono: true),
+              _Row('Network', 'Bitcoin testnet4'),
+              _Row('Network fee', _loading ? 'estimating…' : (_tx != null ? _feeStr() : 'unavailable')),
+              if (!_loading && _tx != null) _Row('Total', _totalStr()),
+            ]),
+          ),
+          const SizedBox(height: 14),
+          if (_error != null)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
+          PrimaryButton(
+              label: 'Confirm & send',
+              busy: _busy,
+              icon: Icons.fingerprint,
+              onPressed: (_busy || _loading || _tx == null) ? null : _confirm),
           const SizedBox(height: 6),
           GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
         ]),

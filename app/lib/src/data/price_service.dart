@@ -46,6 +46,8 @@ class PriceService extends ChangeNotifier {
   double? _priceUsd(String ticker) {
     final t = ticker.toUpperCase();
     if (t == 'TSEQ' || t == 'SEQ') return _prices['SEQ'];
+    // Parent-chain Bitcoin is priced under WBTC (Wrapped Bitcoin) on /prices.
+    if (t == 'BTC' || t == 'WBTC') return _prices['WBTC'] ?? _prices['BTC'];
     return _prices[t];
   }
 

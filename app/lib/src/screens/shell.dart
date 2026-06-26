@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 import '../rust/api.dart' as core;
+import '../data/btc_state.dart';
 import '../data/config.dart';
 import '../data/format.dart';
 import '../data/node_config.dart';
@@ -56,6 +57,7 @@ class BalanceTab extends StatefulWidget {
 
 class _BalanceTabState extends State<BalanceTab> {
   core.WalletSync? _sync;
+  core.BtcBalance? _btc; // parent-chain (testnet4) balance, first-class like any asset
   List<core.AssetBalance>? _cachedBalances; // last-known, shown instantly while syncing
   String? _error;
   bool _loading = true;
@@ -97,11 +99,24 @@ class _BalanceTabState extends State<BalanceTab> {
     try {
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) return;
+      // Scan both chains. Kick off the Bitcoin scan concurrently; a BTC failure
+      // must not break the Sequentia balance, so it resolves to null on error.
+      final btcF = () async {
+        try {
+          return await core.btcSync(mnemonic: m, t4Api: Backend.testnet4);
+        } catch (_) {
+          return null;
+        }
+      }();
       final s = await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
+      final btc = await btcF;
       WalletCache.saveBalances(s.balances); // persist for the next launch
+      // Feed both chains' indices into the shared cross-chain receive cycling.
+      BtcState.instance.observe(btc: btc, seqNext: s.nextIndex);
       if (mounted) {
         setState(() {
           _sync = s;
+          if (btc != null) _btc = btc;
           _loading = false;
         });
       }
@@ -129,6 +144,15 @@ class _BalanceTabState extends State<BalanceTab> {
         any = true;
       }
     }
+    // Parent-chain Bitcoin counts equally toward the portfolio total.
+    final btc = _btc;
+    if (btc != null) {
+      final v = PriceService.instance.refValue('BTC', btc.balanceSats, 8);
+      if (v != null) {
+        sum += v;
+        any = true;
+      }
+    }
     return any ? sum : null;
   }
 
@@ -142,6 +166,9 @@ class _BalanceTabState extends State<BalanceTab> {
         ? const <core.AssetBalance>[]
         : balances.where((b) => (BigInt.tryParse(b.atoms) ?? BigInt.zero) > BigInt.zero).toList();
     final total = balances == null ? null : _totalRef(balances);
+    // Bitcoin is first-class: shown when held (a 0 balance is hidden like any asset).
+    final btcSats = BigInt.tryParse(_btc?.balanceSats ?? '0') ?? BigInt.zero;
+    final hasBtc = btcSats > BigInt.zero;
     return RefreshIndicator(
       onRefresh: _refresh,
       color: AmbraColors.amber,
@@ -179,7 +206,7 @@ class _BalanceTabState extends State<BalanceTab> {
             const Padding(
                 padding: EdgeInsets.only(top: 40),
                 child: Center(child: CircularProgressIndicator(color: AmbraColors.amber)))
-          else if (held.isEmpty)
+          else if (held.isEmpty && !hasBtc)
             const AmbraCard(
                 child: Text(
                     'No funds yet. Get free testnet coins from the faucet (More tab), '
@@ -190,7 +217,10 @@ class _BalanceTabState extends State<BalanceTab> {
             const SizedBox(height: 10),
             AmbraCard(
               padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 16),
-              child: Column(children: [for (final b in held) _AssetRow(balance: b)]),
+              child: Column(children: [
+                if (hasBtc) _BtcRow(sats: _btc!.balanceSats),
+                for (final b in held) _AssetRow(balance: b),
+              ]),
             ),
           ],
         ],
@@ -229,6 +259,40 @@ class _AssetRow extends StatelessWidget {
               padding: const EdgeInsets.only(top: 2),
               child: Text(PriceService.instance.approx(label.ticker, balance.atoms, label.precision)!,
                   style: AmbraText.sub),
+            ),
+        ]),
+      ]),
+    );
+  }
+}
+
+/// The Bitcoin parent-chain balance row — first-class, same layout as [_AssetRow].
+class _BtcRow extends StatelessWidget {
+  const _BtcRow({required this.sats});
+  final String sats;
+  @override
+  Widget build(BuildContext context) {
+    final amount = formatAtoms(sats, 8);
+    final approx = PriceService.instance.approx('BTC', sats, 8);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Row(children: [
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: const [
+            Text('BTC',
+                style: TextStyle(color: AmbraColors.txt, fontWeight: FontWeight.w600, fontSize: 15)),
+            SizedBox(height: 2),
+            Text('Bitcoin testnet4', style: AmbraText.sub),
+          ]),
+        ),
+        const SizedBox(width: 12),
+        Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
+          Text(amount,
+              style: AmbraText.mono.copyWith(color: AmbraColors.txt, fontSize: 15, fontWeight: FontWeight.w700)),
+          if (approx != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(approx, style: AmbraText.sub),
             ),
         ]),
       ]),
@@ -330,7 +394,25 @@ class _ReceiveTabState extends State<ReceiveTab> {
   @override
   void initState() {
     super.initState();
+    // Start at the cross-chain unified next-unused index, and follow it forward as
+    // either chain's scan advances it (the shared address discourages reuse).
+    _index = BtcState.instance.unifiedNext;
+    BtcState.instance.addListener(_onUnified);
     _load();
+  }
+
+  void _onUnified() {
+    final next = BtcState.instance.unifiedNext;
+    if (next > _index && mounted) {
+      setState(() => _index = next);
+      _load();
+    }
+  }
+
+  @override
+  void dispose() {
+    BtcState.instance.removeListener(_onUnified);
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -447,6 +529,7 @@ class _ReceiveTabState extends State<ReceiveTab> {
               ? null
               : () {
                   _index++;
+                  BtcState.instance.bumpTo(_index); // keep the cross-chain cycle in step
                   _load();
                 },
         ),

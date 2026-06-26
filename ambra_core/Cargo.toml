@@ -28,6 +28,15 @@ lwk_common = { version = "0.18.1" }
 flutter_rust_bridge = "=2.12.0"
 anyhow = "1"
 
+# Bitcoin (parent-chain testnet4) wallet: a small esplora client + raw P2WPKH tx
+# building. The `bitcoin` crate itself comes via lwk_wollet::bitcoin (0.32), so we
+# don't depend on it directly (keeps the version in lockstep with elements). These
+# reqwest features MATCH lwk_wollet's, so cargo unifies to ONE TLS stack (rustls,
+# no OpenSSL) — Android cross-compiles cleanly, same as the Sequentia esplora path.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # The lwk_* crates are the unpublished SWK fork and depend on each other (and on
 # `elements`) BY VERSION; these path patches redirect those to the local SWK
 # checkout, and critically point `elements` at SWK's vendored rust-elements that

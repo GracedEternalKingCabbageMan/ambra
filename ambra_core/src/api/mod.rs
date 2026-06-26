@@ -93,6 +93,56 @@ pub fn receive_address_at(mnemonic: String, index: u32, confidential: bool) -> R
     Ok(AddressInfo { address, index })
 }
 
+// --- Bitcoin parent-chain (testnet4) wallet -----------------------------------
+
+/// Result of scanning the Bitcoin keychain: the balance (sats, as a string for
+/// FFI precision-safety) plus the next-unused indices for cross-chain address
+/// cycling (the shared receive address advances past use on EITHER chain).
+pub struct BtcBalance {
+    pub balance_sats: String,
+    pub external_next: u32,
+    pub change_next: u32,
+}
+
+/// A built + signed (not yet broadcast) Bitcoin transaction, for the review step.
+pub struct BtcTx {
+    pub hex: String,
+    pub txid: String,
+    pub fee_sats: String,
+    pub vsize: u64,
+    pub inputs: u32,
+}
+
+/// Scan the wallet's Bitcoin (testnet4) keychain; returns the balance and the
+/// cycling indices. `t4_api` is the testnet4 esplora base (e.g. `<node>/testnet4/api`).
+pub fn btc_sync(mnemonic: String, t4_api: String) -> Result<BtcBalance> {
+    let s = crate::btc::scan(&mnemonic, &t4_api).map_err(err)?;
+    Ok(BtcBalance {
+        balance_sats: s.balance_sats.to_string(),
+        external_next: s.external_next,
+        change_next: s.change_next,
+    })
+}
+
+/// Build + sign (but DON'T broadcast) a Bitcoin testnet4 payment of `amount_sats`
+/// to `address`, at `fee_rate` sat/vB. Show the returned fee/vsize for review,
+/// then [`btc_broadcast`] the hex to send.
+pub fn btc_prepare(
+    mnemonic: String,
+    t4_api: String,
+    address: String,
+    amount_sats: u64,
+    fee_rate: f64,
+) -> Result<BtcTx> {
+    let p = crate::btc::prepare(&mnemonic, &t4_api, &address, amount_sats, fee_rate).map_err(err)?;
+    Ok(BtcTx { hex: p.hex, txid: p.txid, fee_sats: p.fee_sats.to_string(), vsize: p.vsize, inputs: p.inputs })
+}
+
+/// Broadcast a prepared Bitcoin testnet4 transaction hex; returns the txid.
+pub fn btc_broadcast(t4_api: String, tx_hex: String) -> Result<String> {
+    crate::btc::broadcast(&t4_api, &tx_hex).map_err(err)
+}
+
 /// A per-asset balance: the asset id (hex) and the amount in atoms (a string to
 /// avoid any integer-precision loss across the FFI boundary).
 pub struct AssetBalance {

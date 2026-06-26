@@ -16,6 +16,8 @@
 
 /// flutter_rust_bridge API surface consumed by the Flutter (Dart) app.
 pub mod api;
+/// Bitcoin parent-chain (testnet4) wallet — the dual-chain half (same keychain).
+mod btc;
 mod frb_generated;
 
 use std::str::FromStr;
