@@ -400,6 +400,60 @@ pub fn broadcast(t4_api: &str, tx_hex: &str) -> AmbraResult<String> {
     Ok(body.to_string())
 }
 
+/// A located HTLC funding output on testnet4.
+pub struct HtlcFunding {
+    pub vout: u32,
+    pub value_sats: u64,
+    pub height: i64,        // -1 if unconfirmed
+    pub confirmations: i64, // 0 if unconfirmed
+}
+
+/// Find the HTLC funding output in `txid` by matching `p2sh_spk_hex`. HARD-FAILS
+/// if no output matches (never defaults to vout 0 — that could strand the lock).
+/// Reports its value + the confirmation height/depth on Alice's own testnet4 view.
+pub fn find_htlc_funding(t4_api: &str, txid: &str, p2sh_spk_hex: &str) -> AmbraResult<HtlcFunding> {
+    let base = t4_api.trim_end_matches('/');
+    let client = client()?;
+    let tx: serde_json::Value =
+        client.get(format!("{base}/tx/{txid}")).send().map_err(map)?.json().map_err(map)?;
+    let vouts = tx.get("vout").and_then(|v| v.as_array()).ok_or_else(|| "funding tx has no vout".to_string())?;
+    let mut found: Option<(u32, u64)> = None;
+    for (i, o) in vouts.iter().enumerate() {
+        let spk = o.get("scriptpubkey").and_then(|s| s.as_str()).unwrap_or("");
+        if spk.eq_ignore_ascii_case(p2sh_spk_hex) {
+            found = Some((i as u32, o.get("value").and_then(|v| v.as_u64()).unwrap_or(0)));
+            break;
+        }
+    }
+    let (vout, value_sats) = found.ok_or_else(|| "HTLC P2SH output not found in the funding tx".to_string())?;
+    let status = tx.get("status");
+    let confirmed = status.and_then(|s| s.get("confirmed")).and_then(|b| b.as_bool()).unwrap_or(false);
+    let height = if confirmed {
+        status.and_then(|s| s.get("block_height")).and_then(|h| h.as_i64()).unwrap_or(-1)
+    } else {
+        -1
+    };
+    let confirmations = if confirmed && height >= 0 {
+        let tip = client
+            .get(format!("{base}/blocks/tip/height"))
+            .send()
+            .map_err(map)?
+            .text()
+            .map_err(map)?
+            .trim()
+            .parse::<i64>()
+            .unwrap_or(-1);
+        if tip >= height {
+            tip - height + 1
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    Ok(HtlcFunding { vout, value_sats, height, confirmations })
+}
+
 #[cfg(test)]
 mod tests {
     // The whole point of the dual-chain design: the Bitcoin address derived here

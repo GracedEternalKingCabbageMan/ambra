@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `clear_scan_marks`, `err`, `esplora_client`, `last_scan`, `mark_scanned`, `rerr`, `scan_into`, `scanned_recently`, `with_synced_wollet`, `wollet_cache`
+// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `clear_scan_marks`, `err`, `esplora_client`, `hexbytes`, `last_scan`, `mark_scanned`, `rerr`, `scan_into`, `scanned_recently`, `with_synced_wollet`, `wollet_cache`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
 String networkName() => RustLib.instance.api.crateApiNetworkName();
@@ -120,6 +120,132 @@ Future<String> seqdexSignAccept({
   mnemonic: mnemonic,
   esploraUrl: esploraUrl,
   acceptPset: acceptPset,
+);
+
+/// Generate the swap preimage + hashlock.
+Future<XchainSecret> xchainNewSecret() =>
+    RustLib.instance.api.crateApiXchainNewSecret();
+
+/// Alice's SEQ-leg claim pubkey (the HTLC claim key; secret stays in the core).
+Future<String> xchainSeqClaimPubkey({required String mnemonic}) =>
+    RustLib.instance.api.crateApiXchainSeqClaimPubkey(mnemonic: mnemonic);
+
+/// Alice's BTC-leg refund pubkey.
+Future<String> xchainBtcRefundPubkey({required String mnemonic}) =>
+    RustLib.instance.api.crateApiXchainBtcRefundPubkey(mnemonic: mnemonic);
+
+/// Build the BTC HTLC the wallet will fund: redeemScript + P2SH address/spk.
+Future<BtcHtlcInfo> xchainBtcHtlc({
+  required String hashHex,
+  required String claimPubHex,
+  required String refundPubHex,
+  required int locktime,
+}) => RustLib.instance.api.crateApiXchainBtcHtlc(
+  hashHex: hashHex,
+  claimPubHex: claimPubHex,
+  refundPubHex: refundPubHex,
+  locktime: locktime,
+);
+
+/// The SEQ-leg redeemScript Alice rebuilds, as hex — compare it to the daemon's
+/// reported `seqLeg.redeemScript` (value-binding) before trusting the leg.
+Future<String> xchainSeqRedeemScript({
+  required String mnemonic,
+  required String hashHex,
+  required String makerSeqRefundPubHex,
+  required int seqLocktime,
+}) => RustLib.instance.api.crateApiXchainSeqRedeemScript(
+  mnemonic: mnemonic,
+  hashHex: hashHex,
+  makerSeqRefundPubHex: makerSeqRefundPubHex,
+  seqLocktime: seqLocktime,
+);
+
+/// Locate the BTC HTLC funding output by its P2SH scriptPubKey on testnet4.
+Future<BtcFunding> xchainFindBtcFunding({
+  required String t4Api,
+  required String txid,
+  required String p2ShSpkHex,
+}) => RustLib.instance.api.crateApiXchainFindBtcFunding(
+  t4Api: t4Api,
+  txid: txid,
+  p2ShSpkHex: p2ShSpkHex,
+);
+
+/// THE REVEAL GATE. ok == true means it is safe to broadcast the SEQ claim:
+/// the SEQ leg's Bitcoin anchor >= the BTC funding height, anchorstatus "ok",
+/// and the anchor is >= `min_depth` Bitcoin-confs deep (default D = 1).
+Future<AnchorEvidence> xchainVerifySeqLegSafe({
+  required String seqEsplora,
+  required String seqBlockHash,
+  required PlatformInt64 btcLegHeight,
+  required String t4Api,
+  required PlatformInt64 minDepth,
+}) => RustLib.instance.api.crateApiXchainVerifySeqLegSafe(
+  seqEsplora: seqEsplora,
+  seqBlockHash: seqBlockHash,
+  btcLegHeight: btcLegHeight,
+  t4Api: t4Api,
+  minDepth: minDepth,
+);
+
+/// Build the SEQ claim tx (reveals the preimage). Only call after the reveal gate
+/// passes. Returns the raw Elements tx hex to [`xchain_seq_broadcast`].
+Future<String> xchainSeqClaim({
+  required String mnemonic,
+  required String seqTxid,
+  required int seqVout,
+  required BigInt seqAmount,
+  required String seqAssetId,
+  required String destAddress,
+  required String hashHex,
+  required String makerSeqRefundPubHex,
+  required int seqLocktime,
+  required BigInt fee,
+  required String preimageHex,
+}) => RustLib.instance.api.crateApiXchainSeqClaim(
+  mnemonic: mnemonic,
+  seqTxid: seqTxid,
+  seqVout: seqVout,
+  seqAmount: seqAmount,
+  seqAssetId: seqAssetId,
+  destAddress: destAddress,
+  hashHex: hashHex,
+  makerSeqRefundPubHex: makerSeqRefundPubHex,
+  seqLocktime: seqLocktime,
+  fee: fee,
+  preimageHex: preimageHex,
+);
+
+/// Broadcast a raw SEQ (Elements) tx hex; returns the txid.
+Future<String> xchainSeqBroadcast({
+  required String seqEsplora,
+  required String txHex,
+}) => RustLib.instance.api.crateApiXchainSeqBroadcast(
+  seqEsplora: seqEsplora,
+  txHex: txHex,
+);
+
+/// Build the BTC HTLC refund (CLTV/ELSE branch), valid once the chain tip reaches
+/// `locktime`. Returns raw tx hex for [`btc_broadcast`].
+Future<String> xchainBtcRefund({
+  required String mnemonic,
+  required String btcTxid,
+  required int btcVout,
+  required BigInt btcAmountSats,
+  required String destAddress,
+  required BigInt feeSats,
+  required String redeemScriptHex,
+  required int locktime,
+}) => RustLib.instance.api.crateApiXchainBtcRefund(
+  mnemonic: mnemonic,
+  btcTxid: btcTxid,
+  btcVout: btcVout,
+  btcAmountSats: btcAmountSats,
+  destAddress: destAddress,
+  feeSats: feeSats,
+  redeemScriptHex: redeemScriptHex,
+  locktime: locktime,
 );
 
 /// Full-scan the wallet against `esplora_url`, apply the update, and return the
@@ -353,6 +479,47 @@ class AddressInfo {
           index == other.index;
 }
 
+/// The reveal-gate verdict + the evidence behind it (all from the wallet's own
+/// nodes). `ok` true means it is safe to reveal the preimage.
+class AnchorEvidence {
+  final PlatformInt64 seqAnchorHeight;
+  final PlatformInt64 btcLegHeight;
+  final PlatformInt64 btcTip;
+  final String anchorStatus;
+  final PlatformInt64 depth;
+  final bool ok;
+
+  const AnchorEvidence({
+    required this.seqAnchorHeight,
+    required this.btcLegHeight,
+    required this.btcTip,
+    required this.anchorStatus,
+    required this.depth,
+    required this.ok,
+  });
+
+  @override
+  int get hashCode =>
+      seqAnchorHeight.hashCode ^
+      btcLegHeight.hashCode ^
+      btcTip.hashCode ^
+      anchorStatus.hashCode ^
+      depth.hashCode ^
+      ok.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is AnchorEvidence &&
+          runtimeType == other.runtimeType &&
+          seqAnchorHeight == other.seqAnchorHeight &&
+          btcLegHeight == other.btcLegHeight &&
+          btcTip == other.btcTip &&
+          anchorStatus == other.anchorStatus &&
+          depth == other.depth &&
+          ok == other.ok;
+}
+
 /// A per-asset balance: the asset id (hex) and the amount in atoms (a string to
 /// avoid any integer-precision loss across the FFI boundary).
 class AssetBalance {
@@ -418,6 +585,64 @@ class BtcBalance {
           balanceSats == other.balanceSats &&
           externalNext == other.externalNext &&
           changeNext == other.changeNext;
+}
+
+/// A located BTC HTLC funding output (value as a string for FFI precision).
+class BtcFunding {
+  final int vout;
+  final String valueSats;
+  final PlatformInt64 height;
+  final PlatformInt64 confirmations;
+
+  const BtcFunding({
+    required this.vout,
+    required this.valueSats,
+    required this.height,
+    required this.confirmations,
+  });
+
+  @override
+  int get hashCode =>
+      vout.hashCode ^
+      valueSats.hashCode ^
+      height.hashCode ^
+      confirmations.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is BtcFunding &&
+          runtimeType == other.runtimeType &&
+          vout == other.vout &&
+          valueSats == other.valueSats &&
+          height == other.height &&
+          confirmations == other.confirmations;
+}
+
+/// The BTC HTLC the wallet funds: the redeemScript + its bare-P2SH address/spk.
+class BtcHtlcInfo {
+  final String redeemScriptHex;
+  final String p2ShAddress;
+  final String p2ShSpkHex;
+
+  const BtcHtlcInfo({
+    required this.redeemScriptHex,
+    required this.p2ShAddress,
+    required this.p2ShSpkHex,
+  });
+
+  @override
+  int get hashCode =>
+      redeemScriptHex.hashCode ^ p2ShAddress.hashCode ^ p2ShSpkHex.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is BtcHtlcInfo &&
+          runtimeType == other.runtimeType &&
+          redeemScriptHex == other.redeemScriptHex &&
+          p2ShAddress == other.p2ShAddress &&
+          p2ShSpkHex == other.p2ShSpkHex;
 }
 
 /// A built + signed (not yet broadcast) Bitcoin transaction, for the review step.
@@ -611,4 +836,24 @@ class WalletSync {
           tipHash == other.tipHash &&
           balances == other.balances &&
           nextIndex == other.nextIndex;
+}
+
+/// A fresh swap preimage + its SHA256 hashlock. `secret_hex` is NOT HD-derivable;
+/// the caller MUST persist it before locking any BTC.
+class XchainSecret {
+  final String secretHex;
+  final String hashHex;
+
+  const XchainSecret({required this.secretHex, required this.hashHex});
+
+  @override
+  int get hashCode => secretHex.hashCode ^ hashHex.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is XchainSecret &&
+          runtimeType == other.runtimeType &&
+          secretHex == other.secretHex &&
+          hashHex == other.hashHex;
 }

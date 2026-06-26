@@ -64,7 +64,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => -403299103;
+  int get rustContentHash => 292858247;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -237,6 +237,70 @@ abstract class RustLibApi extends BaseApi {
   Future<List<TxRow>> crateApiWalletTransactions({
     required String mnemonic,
     required String esploraUrl,
+  });
+
+  Future<BtcHtlcInfo> crateApiXchainBtcHtlc({
+    required String hashHex,
+    required String claimPubHex,
+    required String refundPubHex,
+    required int locktime,
+  });
+
+  Future<String> crateApiXchainBtcRefund({
+    required String mnemonic,
+    required String btcTxid,
+    required int btcVout,
+    required BigInt btcAmountSats,
+    required String destAddress,
+    required BigInt feeSats,
+    required String redeemScriptHex,
+    required int locktime,
+  });
+
+  Future<String> crateApiXchainBtcRefundPubkey({required String mnemonic});
+
+  Future<BtcFunding> crateApiXchainFindBtcFunding({
+    required String t4Api,
+    required String txid,
+    required String p2ShSpkHex,
+  });
+
+  Future<XchainSecret> crateApiXchainNewSecret();
+
+  Future<String> crateApiXchainSeqBroadcast({
+    required String seqEsplora,
+    required String txHex,
+  });
+
+  Future<String> crateApiXchainSeqClaim({
+    required String mnemonic,
+    required String seqTxid,
+    required int seqVout,
+    required BigInt seqAmount,
+    required String seqAssetId,
+    required String destAddress,
+    required String hashHex,
+    required String makerSeqRefundPubHex,
+    required int seqLocktime,
+    required BigInt fee,
+    required String preimageHex,
+  });
+
+  Future<String> crateApiXchainSeqClaimPubkey({required String mnemonic});
+
+  Future<String> crateApiXchainSeqRedeemScript({
+    required String mnemonic,
+    required String hashHex,
+    required String makerSeqRefundPubHex,
+    required int seqLocktime,
+  });
+
+  Future<AnchorEvidence> crateApiXchainVerifySeqLegSafe({
+    required String seqEsplora,
+    required String seqBlockHash,
+    required PlatformInt64 btcLegHeight,
+    required String t4Api,
+    required PlatformInt64 minDepth,
   });
 }
 
@@ -1417,6 +1481,435 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     argNames: ["mnemonic", "esploraUrl"],
   );
 
+  @override
+  Future<BtcHtlcInfo> crateApiXchainBtcHtlc({
+    required String hashHex,
+    required String claimPubHex,
+    required String refundPubHex,
+    required int locktime,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(hashHex, serializer);
+          sse_encode_String(claimPubHex, serializer);
+          sse_encode_String(refundPubHex, serializer);
+          sse_encode_u_32(locktime, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 32,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_btc_htlc_info,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiXchainBtcHtlcConstMeta,
+        argValues: [hashHex, claimPubHex, refundPubHex, locktime],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiXchainBtcHtlcConstMeta => const TaskConstMeta(
+    debugName: "xchain_btc_htlc",
+    argNames: ["hashHex", "claimPubHex", "refundPubHex", "locktime"],
+  );
+
+  @override
+  Future<String> crateApiXchainBtcRefund({
+    required String mnemonic,
+    required String btcTxid,
+    required int btcVout,
+    required BigInt btcAmountSats,
+    required String destAddress,
+    required BigInt feeSats,
+    required String redeemScriptHex,
+    required int locktime,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(mnemonic, serializer);
+          sse_encode_String(btcTxid, serializer);
+          sse_encode_u_32(btcVout, serializer);
+          sse_encode_u_64(btcAmountSats, serializer);
+          sse_encode_String(destAddress, serializer);
+          sse_encode_u_64(feeSats, serializer);
+          sse_encode_String(redeemScriptHex, serializer);
+          sse_encode_u_32(locktime, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 33,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiXchainBtcRefundConstMeta,
+        argValues: [
+          mnemonic,
+          btcTxid,
+          btcVout,
+          btcAmountSats,
+          destAddress,
+          feeSats,
+          redeemScriptHex,
+          locktime,
+        ],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiXchainBtcRefundConstMeta => const TaskConstMeta(
+    debugName: "xchain_btc_refund",
+    argNames: [
+      "mnemonic",
+      "btcTxid",
+      "btcVout",
+      "btcAmountSats",
+      "destAddress",
+      "feeSats",
+      "redeemScriptHex",
+      "locktime",
+    ],
+  );
+
+  @override
+  Future<String> crateApiXchainBtcRefundPubkey({required String mnemonic}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(mnemonic, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 34,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiXchainBtcRefundPubkeyConstMeta,
+        argValues: [mnemonic],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiXchainBtcRefundPubkeyConstMeta =>
+      const TaskConstMeta(
+        debugName: "xchain_btc_refund_pubkey",
+        argNames: ["mnemonic"],
+      );
+
+  @override
+  Future<BtcFunding> crateApiXchainFindBtcFunding({
+    required String t4Api,
+    required String txid,
+    required String p2ShSpkHex,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(t4Api, serializer);
+          sse_encode_String(txid, serializer);
+          sse_encode_String(p2ShSpkHex, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 35,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_btc_funding,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiXchainFindBtcFundingConstMeta,
+        argValues: [t4Api, txid, p2ShSpkHex],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiXchainFindBtcFundingConstMeta =>
+      const TaskConstMeta(
+        debugName: "xchain_find_btc_funding",
+        argNames: ["t4Api", "txid", "p2ShSpkHex"],
+      );
+
+  @override
+  Future<XchainSecret> crateApiXchainNewSecret() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 36,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_xchain_secret,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiXchainNewSecretConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiXchainNewSecretConstMeta =>
+      const TaskConstMeta(debugName: "xchain_new_secret", argNames: []);
+
+  @override
+  Future<String> crateApiXchainSeqBroadcast({
+    required String seqEsplora,
+    required String txHex,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(seqEsplora, serializer);
+          sse_encode_String(txHex, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 37,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiXchainSeqBroadcastConstMeta,
+        argValues: [seqEsplora, txHex],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiXchainSeqBroadcastConstMeta => const TaskConstMeta(
+    debugName: "xchain_seq_broadcast",
+    argNames: ["seqEsplora", "txHex"],
+  );
+
+  @override
+  Future<String> crateApiXchainSeqClaim({
+    required String mnemonic,
+    required String seqTxid,
+    required int seqVout,
+    required BigInt seqAmount,
+    required String seqAssetId,
+    required String destAddress,
+    required String hashHex,
+    required String makerSeqRefundPubHex,
+    required int seqLocktime,
+    required BigInt fee,
+    required String preimageHex,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(mnemonic, serializer);
+          sse_encode_String(seqTxid, serializer);
+          sse_encode_u_32(seqVout, serializer);
+          sse_encode_u_64(seqAmount, serializer);
+          sse_encode_String(seqAssetId, serializer);
+          sse_encode_String(destAddress, serializer);
+          sse_encode_String(hashHex, serializer);
+          sse_encode_String(makerSeqRefundPubHex, serializer);
+          sse_encode_u_32(seqLocktime, serializer);
+          sse_encode_u_64(fee, serializer);
+          sse_encode_String(preimageHex, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 38,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiXchainSeqClaimConstMeta,
+        argValues: [
+          mnemonic,
+          seqTxid,
+          seqVout,
+          seqAmount,
+          seqAssetId,
+          destAddress,
+          hashHex,
+          makerSeqRefundPubHex,
+          seqLocktime,
+          fee,
+          preimageHex,
+        ],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiXchainSeqClaimConstMeta => const TaskConstMeta(
+    debugName: "xchain_seq_claim",
+    argNames: [
+      "mnemonic",
+      "seqTxid",
+      "seqVout",
+      "seqAmount",
+      "seqAssetId",
+      "destAddress",
+      "hashHex",
+      "makerSeqRefundPubHex",
+      "seqLocktime",
+      "fee",
+      "preimageHex",
+    ],
+  );
+
+  @override
+  Future<String> crateApiXchainSeqClaimPubkey({required String mnemonic}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(mnemonic, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 39,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiXchainSeqClaimPubkeyConstMeta,
+        argValues: [mnemonic],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiXchainSeqClaimPubkeyConstMeta =>
+      const TaskConstMeta(
+        debugName: "xchain_seq_claim_pubkey",
+        argNames: ["mnemonic"],
+      );
+
+  @override
+  Future<String> crateApiXchainSeqRedeemScript({
+    required String mnemonic,
+    required String hashHex,
+    required String makerSeqRefundPubHex,
+    required int seqLocktime,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(mnemonic, serializer);
+          sse_encode_String(hashHex, serializer);
+          sse_encode_String(makerSeqRefundPubHex, serializer);
+          sse_encode_u_32(seqLocktime, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 40,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiXchainSeqRedeemScriptConstMeta,
+        argValues: [mnemonic, hashHex, makerSeqRefundPubHex, seqLocktime],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiXchainSeqRedeemScriptConstMeta =>
+      const TaskConstMeta(
+        debugName: "xchain_seq_redeem_script",
+        argNames: [
+          "mnemonic",
+          "hashHex",
+          "makerSeqRefundPubHex",
+          "seqLocktime",
+        ],
+      );
+
+  @override
+  Future<AnchorEvidence> crateApiXchainVerifySeqLegSafe({
+    required String seqEsplora,
+    required String seqBlockHash,
+    required PlatformInt64 btcLegHeight,
+    required String t4Api,
+    required PlatformInt64 minDepth,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(seqEsplora, serializer);
+          sse_encode_String(seqBlockHash, serializer);
+          sse_encode_i_64(btcLegHeight, serializer);
+          sse_encode_String(t4Api, serializer);
+          sse_encode_i_64(minDepth, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 41,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_anchor_evidence,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiXchainVerifySeqLegSafeConstMeta,
+        argValues: [seqEsplora, seqBlockHash, btcLegHeight, t4Api, minDepth],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiXchainVerifySeqLegSafeConstMeta =>
+      const TaskConstMeta(
+        debugName: "xchain_verify_seq_leg_safe",
+        argNames: [
+          "seqEsplora",
+          "seqBlockHash",
+          "btcLegHeight",
+          "t4Api",
+          "minDepth",
+        ],
+      );
+
   @protected
   AnyhowException dco_decode_AnyhowException(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
@@ -1438,6 +1931,22 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     return AddressInfo(
       address: dco_decode_String(arr[0]),
       index: dco_decode_u_32(arr[1]),
+    );
+  }
+
+  @protected
+  AnchorEvidence dco_decode_anchor_evidence(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 6)
+      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
+    return AnchorEvidence(
+      seqAnchorHeight: dco_decode_i_64(arr[0]),
+      btcLegHeight: dco_decode_i_64(arr[1]),
+      btcTip: dco_decode_i_64(arr[2]),
+      anchorStatus: dco_decode_String(arr[3]),
+      depth: dco_decode_i_64(arr[4]),
+      ok: dco_decode_bool(arr[5]),
     );
   }
 
@@ -1509,6 +2018,33 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  BtcFunding dco_decode_btc_funding(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 4)
+      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    return BtcFunding(
+      vout: dco_decode_u_32(arr[0]),
+      valueSats: dco_decode_String(arr[1]),
+      height: dco_decode_i_64(arr[2]),
+      confirmations: dco_decode_i_64(arr[3]),
+    );
+  }
+
+  @protected
+  BtcHtlcInfo dco_decode_btc_htlc_info(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 3)
+      throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
+    return BtcHtlcInfo(
+      redeemScriptHex: dco_decode_String(arr[0]),
+      p2ShAddress: dco_decode_String(arr[1]),
+      p2ShSpkHex: dco_decode_String(arr[2]),
+    );
+  }
+
+  @protected
   BtcTx dco_decode_btc_tx(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
@@ -1545,6 +2081,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       assetId: dco_decode_String(arr[0]),
       rate: dco_decode_u_64(arr[1]),
     );
+  }
+
+  @protected
+  PlatformInt64 dco_decode_i_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dcoDecodeI64(raw);
   }
 
   @protected
@@ -1693,6 +2235,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  XchainSecret dco_decode_xchain_secret(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2)
+      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
+    return XchainSecret(
+      secretHex: dco_decode_String(arr[0]),
+      hashHex: dco_decode_String(arr[1]),
+    );
+  }
+
+  @protected
   AnyhowException sse_decode_AnyhowException(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var inner = sse_decode_String(deserializer);
@@ -1712,6 +2266,25 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_address = sse_decode_String(deserializer);
     var var_index = sse_decode_u_32(deserializer);
     return AddressInfo(address: var_address, index: var_index);
+  }
+
+  @protected
+  AnchorEvidence sse_decode_anchor_evidence(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_seqAnchorHeight = sse_decode_i_64(deserializer);
+    var var_btcLegHeight = sse_decode_i_64(deserializer);
+    var var_btcTip = sse_decode_i_64(deserializer);
+    var var_anchorStatus = sse_decode_String(deserializer);
+    var var_depth = sse_decode_i_64(deserializer);
+    var var_ok = sse_decode_bool(deserializer);
+    return AnchorEvidence(
+      seqAnchorHeight: var_seqAnchorHeight,
+      btcLegHeight: var_btcLegHeight,
+      btcTip: var_btcTip,
+      anchorStatus: var_anchorStatus,
+      depth: var_depth,
+      ok: var_ok,
+    );
   }
 
   @protected
@@ -1774,6 +2347,34 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  BtcFunding sse_decode_btc_funding(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_vout = sse_decode_u_32(deserializer);
+    var var_valueSats = sse_decode_String(deserializer);
+    var var_height = sse_decode_i_64(deserializer);
+    var var_confirmations = sse_decode_i_64(deserializer);
+    return BtcFunding(
+      vout: var_vout,
+      valueSats: var_valueSats,
+      height: var_height,
+      confirmations: var_confirmations,
+    );
+  }
+
+  @protected
+  BtcHtlcInfo sse_decode_btc_htlc_info(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_redeemScriptHex = sse_decode_String(deserializer);
+    var var_p2ShAddress = sse_decode_String(deserializer);
+    var var_p2ShSpkHex = sse_decode_String(deserializer);
+    return BtcHtlcInfo(
+      redeemScriptHex: var_redeemScriptHex,
+      p2ShAddress: var_p2ShAddress,
+      p2ShSpkHex: var_p2ShSpkHex,
+    );
+  }
+
+  @protected
   BtcTx sse_decode_btc_tx(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_hex = sse_decode_String(deserializer);
@@ -1808,6 +2409,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_assetId = sse_decode_String(deserializer);
     var var_rate = sse_decode_u_64(deserializer);
     return FeeAsset(assetId: var_assetId, rate: var_rate);
+  }
+
+  @protected
+  PlatformInt64 sse_decode_i_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getPlatformInt64();
   }
 
   @protected
@@ -2003,6 +2610,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  XchainSecret sse_decode_xchain_secret(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_secretHex = sse_decode_String(deserializer);
+    var var_hashHex = sse_decode_String(deserializer);
+    return XchainSecret(secretHex: var_secretHex, hashHex: var_hashHex);
+  }
+
+  @protected
   int sse_decode_i_32(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getInt32();
@@ -2028,6 +2643,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.address, serializer);
     sse_encode_u_32(self.index, serializer);
+  }
+
+  @protected
+  void sse_encode_anchor_evidence(
+    AnchorEvidence self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_64(self.seqAnchorHeight, serializer);
+    sse_encode_i_64(self.btcLegHeight, serializer);
+    sse_encode_i_64(self.btcTip, serializer);
+    sse_encode_String(self.anchorStatus, serializer);
+    sse_encode_i_64(self.depth, serializer);
+    sse_encode_bool(self.ok, serializer);
   }
 
   @protected
@@ -2086,6 +2715,23 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_btc_funding(BtcFunding self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_32(self.vout, serializer);
+    sse_encode_String(self.valueSats, serializer);
+    sse_encode_i_64(self.height, serializer);
+    sse_encode_i_64(self.confirmations, serializer);
+  }
+
+  @protected
+  void sse_encode_btc_htlc_info(BtcHtlcInfo self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.redeemScriptHex, serializer);
+    sse_encode_String(self.p2ShAddress, serializer);
+    sse_encode_String(self.p2ShSpkHex, serializer);
+  }
+
+  @protected
   void sse_encode_btc_tx(BtcTx self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.hex, serializer);
@@ -2112,6 +2758,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.assetId, serializer);
     sse_encode_u_64(self.rate, serializer);
+  }
+
+  @protected
+  void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putPlatformInt64(self);
   }
 
   @protected
@@ -2278,6 +2930,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_String(self.tipHash, serializer);
     sse_encode_list_asset_balance(self.balances, serializer);
     sse_encode_u_32(self.nextIndex, serializer);
+  }
+
+  @protected
+  void sse_encode_xchain_secret(XchainSecret self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.secretHex, serializer);
+    sse_encode_String(self.hashHex, serializer);
   }
 
   @protected

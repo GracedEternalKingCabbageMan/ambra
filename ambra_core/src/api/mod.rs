@@ -14,6 +14,7 @@ use lwk_wollet::clients::blocking::{BlockchainBackend, EsploraClient};
 use lwk_wollet::clients::EsploraClientBuilder;
 use lwk_wollet::elements::pset::PartiallySignedTransaction;
 use lwk_wollet::bitcoin::bip32::{ChildNumber, DerivationPath};
+use lwk_wollet::bitcoin::hex::FromHex;
 use lwk_wollet::elements::{Address, AssetId, Txid};
 use lwk_wollet::secp256k1::PublicKey;
 use lwk_wollet::TxBuilder;
@@ -201,6 +202,198 @@ pub fn seqdex_sign_accept(mnemonic: String, esplora_url: String, accept_pset: St
         // strip them (the partial signatures stay) before CompleteTrade.
         crate::seqdex::strip_bip32(&pset.to_string()).map_err(err)
     })
+}
+
+// --- SeqDEX cross-chain (BTC <-> SEQ asset) HTLC swap -------------------------
+//
+// The wallet is Alice (holds BTC, wants the SEQ asset). She funds the BTC HTLC
+// (reusing btc_prepare/btc_broadcast to the P2SH address), proposes to the
+// daemon, verifies the SEQ leg is anchor-safe, then claims it revealing the
+// preimage. See crate::xchain for the reveal-gate rationale.
+
+fn hexbytes(s: &str) -> Result<Vec<u8>> {
+    Vec::<u8>::from_hex(s).map_err(rerr)
+}
+
+/// A fresh swap preimage + its SHA256 hashlock. `secret_hex` is NOT HD-derivable;
+/// the caller MUST persist it before locking any BTC.
+pub struct XchainSecret {
+    pub secret_hex: String,
+    pub hash_hex: String,
+}
+
+/// The BTC HTLC the wallet funds: the redeemScript + its bare-P2SH address/spk.
+pub struct BtcHtlcInfo {
+    pub redeem_script_hex: String,
+    pub p2sh_address: String,
+    pub p2sh_spk_hex: String,
+}
+
+/// A located BTC HTLC funding output (value as a string for FFI precision).
+pub struct BtcFunding {
+    pub vout: u32,
+    pub value_sats: String,
+    pub height: i64,
+    pub confirmations: i64,
+}
+
+/// The reveal-gate verdict + the evidence behind it (all from the wallet's own
+/// nodes). `ok` true means it is safe to reveal the preimage.
+pub struct AnchorEvidence {
+    pub seq_anchor_height: i64,
+    pub btc_leg_height: i64,
+    pub btc_tip: i64,
+    pub anchor_status: String,
+    pub depth: i64,
+    pub ok: bool,
+}
+
+/// Generate the swap preimage + hashlock.
+pub fn xchain_new_secret() -> XchainSecret {
+    let (secret_hex, hash_hex) = crate::xchain::new_secret();
+    XchainSecret { secret_hex, hash_hex }
+}
+
+/// Alice's SEQ-leg claim pubkey (the HTLC claim key; secret stays in the core).
+pub fn xchain_seq_claim_pubkey(mnemonic: String) -> Result<String> {
+    crate::xchain::seq_claim_keypair(&mnemonic).map(|(_, p)| p).map_err(err)
+}
+
+/// Alice's BTC-leg refund pubkey.
+pub fn xchain_btc_refund_pubkey(mnemonic: String) -> Result<String> {
+    crate::xchain::btc_refund_keypair(&mnemonic).map(|(_, p)| p).map_err(err)
+}
+
+/// Build the BTC HTLC the wallet will fund: redeemScript + P2SH address/spk.
+pub fn xchain_btc_htlc(
+    hash_hex: String,
+    claim_pub_hex: String,
+    refund_pub_hex: String,
+    locktime: u32,
+) -> Result<BtcHtlcInfo> {
+    let redeem = crate::btc_htlc::build_htlc_redeem_script(
+        &hexbytes(&hash_hex)?,
+        &hexbytes(&claim_pub_hex)?,
+        &hexbytes(&refund_pub_hex)?,
+        locktime,
+    )
+    .map_err(err)?;
+    let (address, spk) = crate::btc_htlc::htlc_p2sh(&redeem).map_err(err)?;
+    Ok(BtcHtlcInfo {
+        redeem_script_hex: redeem.to_hex_string(),
+        p2sh_address: address.to_string(),
+        p2sh_spk_hex: spk.to_hex_string(),
+    })
+}
+
+/// The SEQ-leg redeemScript Alice rebuilds, as hex — compare it to the daemon's
+/// reported `seqLeg.redeemScript` (value-binding) before trusting the leg.
+pub fn xchain_seq_redeem_script(
+    mnemonic: String,
+    hash_hex: String,
+    maker_seq_refund_pub_hex: String,
+    seq_locktime: u32,
+) -> Result<String> {
+    crate::xchain::seq_redeem_script_hex(&mnemonic, &hash_hex, &maker_seq_refund_pub_hex, seq_locktime).map_err(err)
+}
+
+/// Locate the BTC HTLC funding output by its P2SH scriptPubKey on testnet4.
+pub fn xchain_find_btc_funding(t4_api: String, txid: String, p2sh_spk_hex: String) -> Result<BtcFunding> {
+    let f = crate::btc::find_htlc_funding(&t4_api, &txid, &p2sh_spk_hex).map_err(err)?;
+    Ok(BtcFunding {
+        vout: f.vout,
+        value_sats: f.value_sats.to_string(),
+        height: f.height,
+        confirmations: f.confirmations,
+    })
+}
+
+/// THE REVEAL GATE. ok == true means it is safe to broadcast the SEQ claim:
+/// the SEQ leg's Bitcoin anchor >= the BTC funding height, anchorstatus "ok",
+/// and the anchor is >= `min_depth` Bitcoin-confs deep (default D = 1).
+pub fn xchain_verify_seq_leg_safe(
+    seq_esplora: String,
+    seq_block_hash: String,
+    btc_leg_height: i64,
+    t4_api: String,
+    min_depth: i64,
+) -> Result<AnchorEvidence> {
+    let e = crate::xchain::verify_seq_leg_safe(&seq_esplora, &seq_block_hash, btc_leg_height, &t4_api, min_depth)
+        .map_err(err)?;
+    Ok(AnchorEvidence {
+        seq_anchor_height: e.seq_anchor_height,
+        btc_leg_height: e.btc_leg_height,
+        btc_tip: e.btc_tip,
+        anchor_status: e.anchor_status,
+        depth: e.depth,
+        ok: e.ok,
+    })
+}
+
+/// Build the SEQ claim tx (reveals the preimage). Only call after the reveal gate
+/// passes. Returns the raw Elements tx hex to [`xchain_seq_broadcast`].
+#[allow(clippy::too_many_arguments)]
+pub fn xchain_seq_claim(
+    mnemonic: String,
+    seq_txid: String,
+    seq_vout: u32,
+    seq_amount: u64,
+    seq_asset_id: String,
+    dest_address: String,
+    hash_hex: String,
+    maker_seq_refund_pub_hex: String,
+    seq_locktime: u32,
+    fee: u64,
+    preimage_hex: String,
+) -> Result<String> {
+    crate::xchain::seq_claim(
+        &mnemonic,
+        &seq_txid,
+        seq_vout,
+        seq_amount,
+        &seq_asset_id,
+        &dest_address,
+        &hash_hex,
+        &maker_seq_refund_pub_hex,
+        seq_locktime,
+        fee,
+        &preimage_hex,
+    )
+    .map_err(err)
+}
+
+/// Broadcast a raw SEQ (Elements) tx hex; returns the txid.
+pub fn xchain_seq_broadcast(seq_esplora: String, tx_hex: String) -> Result<String> {
+    crate::xchain::seq_broadcast(&seq_esplora, &tx_hex).map_err(err)
+}
+
+/// Build the BTC HTLC refund (CLTV/ELSE branch), valid once the chain tip reaches
+/// `locktime`. Returns raw tx hex for [`btc_broadcast`].
+#[allow(clippy::too_many_arguments)]
+pub fn xchain_btc_refund(
+    mnemonic: String,
+    btc_txid: String,
+    btc_vout: u32,
+    btc_amount_sats: u64,
+    dest_address: String,
+    fee_sats: u64,
+    redeem_script_hex: String,
+    locktime: u32,
+) -> Result<String> {
+    let (sk, _) = crate::xchain::btc_refund_keypair(&mnemonic).map_err(err)?;
+    let redeem = lwk_wollet::bitcoin::ScriptBuf::from_hex(&redeem_script_hex).map_err(rerr)?;
+    let dest = lwk_wollet::bitcoin::Address::from_str(&dest_address)
+        .map_err(|_| err("invalid Bitcoin address".to_string()))?
+        .require_network(lwk_wollet::bitcoin::Network::Testnet)
+        .map_err(|_| err("address is not a Bitcoin testnet (tb1) address".to_string()))?;
+    let spend = crate::btc_htlc::BtcHtlcSpend {
+        txid: btc_txid,
+        vout: btc_vout,
+        amount_sats: btc_amount_sats,
+        dest_spk: dest.script_pubkey(),
+        fee_sats,
+    };
+    crate::btc_htlc::build_refund_tx(&redeem, &spend, locktime, &sk).map_err(err)
 }
 
 /// A per-asset balance: the asset id (hex) and the amount in atoms (a string to
