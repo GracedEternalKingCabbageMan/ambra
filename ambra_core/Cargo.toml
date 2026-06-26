@@ -18,7 +18,7 @@ crate-type = ["cdylib", "staticlib", "lib"]
 [dependencies]
 # esplora = the blocking EsploraClient (reqwest + rustls — cross-compiles to
 # Android cleanly, no OpenSSL) for full_scan/broadcast against the box's /api.
-lwk_wollet = { version = "0.18.1", default-features = false, features = ["sequentia", "esplora"] }
+lwk_wollet = { version = "0.18.1", default-features = false, features = ["sequentia", "esplora", "btc-blocking"] }
 # Software-only signer: drop default features ["jade","amp0"] so we don't pull
 # lwk_jade/lwk_ledger (hardware wallets) or lwk_containers (docker) — irrelevant
 # on mobile, and they keep the unpublished-crate closure (and binary) minimal.
