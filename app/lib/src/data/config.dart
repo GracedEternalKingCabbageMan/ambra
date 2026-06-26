@@ -1,5 +1,5 @@
 /// App version shown in the More footer. Bump alongside pubspec on release.
-const kAppVersion = '0.10.1';
+const kAppVersion = '0.10.2';
 
 /// Backend node the wallet talks to. Defaults to the public Sequentia testnet
 /// node; users can point Ambra at their own (persisted via [NodeConfig]). Every
