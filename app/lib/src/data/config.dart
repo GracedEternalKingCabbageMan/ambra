@@ -62,7 +62,7 @@ class SeqAssets {
 
   static const _builtin = <String, AssetLabel>{
     'c8eccacf0953e1931cd31e434d8319101cc36e6c38b0e2104d8687552fae3e40':
-        AssetLabel('tSEQ', 8, subtitle: 'Sequentia'),
+        AssetLabel('tSEQ', 8, subtitle: 'Sequence'),
     'dc7f45fcfeb17c8ae74e284472d85543395f50e88f4a36cb652e8102703b7027':
         AssetLabel('USDX', 8, subtitle: 'USD Stablecoin'),
     'f7a756b4e966623065543e52b754324629295c895046a0916a939898ad373667':
