@@ -927,6 +927,7 @@ fn wire__crate__api__seqdex_build_swap_request_impl(
             let api_amount_r = <u64>::sse_decode(&mut deserializer);
             let api_fee_asset = <String>::sse_decode(&mut deserializer);
             let api_fee_amount = <u64>::sse_decode(&mut deserializer);
+            let api_fee_rate = <u64>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
@@ -940,6 +941,7 @@ fn wire__crate__api__seqdex_build_swap_request_impl(
                             api_amount_r,
                             api_fee_asset,
                             api_fee_amount,
+                            api_fee_rate,
                         )?;
                         Ok(output_ok)
                     })(),

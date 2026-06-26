@@ -19,6 +19,16 @@ import 'xchain_swap_screen.dart';
 /// this errs on the generous side and the resulting fee is shown for review.
 const int _kSwapVbytes = 3000;
 
+/// Default network fee, in native sat/vB, when the user doesn't override it.
+/// Comfortably above the daemon's relay floor (0.11 sat/vB) so the taker-funded
+/// fee always clears the maker's size-based requirement, with margin for the
+/// estimate. The fee is shown for review and can be overridden per-vB.
+const double _kDefaultSatPerVb = 0.5;
+
+/// 1e8 = exchange_rate_scale (native atoms per reference unit). Used to convert a
+/// native fee into the chosen fee asset at the node's published rate.
+final BigInt _kScale = BigInt.from(100000000);
+
 /// SeqDEX same-chain swap: pay one Sequentia asset, receive another. (Cross-chain
 /// BTC<->asset swaps are a later phase.) One composer — pick what you pay + an
 /// amount, pick what you receive, and the daemon's preview fills the rest.
@@ -181,6 +191,16 @@ class _SwapTabState extends State<SwapTab> {
     return _feeRates[t] != null || _feeRates[hex] != null;
   }
 
+  /// The node's published exchange rate (atoms of the asset per 1e8 native) for a
+  /// fee asset, keyed in /feerates by ticker or hex (deployments vary). Native is
+  /// 1:1 at exactly 1e8; an unpriced asset falls back to 1e8 so a quote can still
+  /// build (the maker then rejects it if it isn't fee-eligible).
+  BigInt _rateFor(String hex) {
+    if (hex == SeqAssets.policy) return _kScale;
+    final t = SeqAssets.labelFor(hex).ticker;
+    return _feeRates[t] ?? _feeRates[hex] ?? _kScale;
+  }
+
   /// Default the fee to the asset being paid/transferred (no asset privileged),
   /// else tSEQ. Folded into the pay leg when it equals the pay asset.
   String _defaultFeeAsset() => (_payAsset != null && _acceptedFee(_payAsset!)) ? _payAsset! : SeqAssets.policy;
@@ -273,15 +293,23 @@ class _SwapTabState extends State<SwapTab> {
 
       final preview = await SeqdexClient.preview(m, side, baseAtoms, feeAsset);
 
-      // The swap's NETWORK fee is the taker's (the maker turns fee_amount into the
-      // settlement tx's fee output). Default to the daemon's suggestion for this
-      // asset; let the user override with a per-vB rate (in the fee asset) applied
-      // to the estimated swap size — the same any-asset, per-vB model as send.
-      BigInt feeAmount = preview.feeAmount;
+      // The swap's NETWORK fee is taker-funded: lwk adds a fee input + an explicit
+      // fee output in feeAsset, which the maker validates. (The daemon preview's
+      // fee_amount is the market COMMISSION, 0 on these markets, not the network
+      // fee.) Default to a safe native per-vB rate over the estimated swap size,
+      // converted to feeAsset at the node's published rate; let the user override
+      // the per-vB rate in the fee asset's own units — the same model as send.
+      final feeRate = _rateFor(feeAsset); // atoms of feeAsset per 1e8 native
+      BigInt feeAmount;
       final fr = double.tryParse(_feeRateCtl.text.trim());
       if (fr != null && fr > 0) {
         final feePrec = SeqAssets.labelFor(feeAsset).precision;
         feeAmount = BigInt.from((fr * _kSwapVbytes * _pow10(feePrec)).ceil());
+      } else {
+        // ceil(nativeFee * 1e8 / rate), nativeFee = vbytes * default sat/vB.
+        final nativeFee = BigInt.from((_kSwapVbytes * _kDefaultSatPerVb).ceil());
+        feeAmount = (nativeFee * _kScale + feeRate - BigInt.one) ~/ feeRate;
+        if (feeAmount <= BigInt.zero) feeAmount = BigInt.one;
       }
 
       // Orient the legs (proven 6d-1 mapping).
@@ -291,14 +319,14 @@ class _SwapTabState extends State<SwapTab> {
           market: m, side: side,
           assetP: m.baseAsset, amountP: baseAtoms,
           assetR: preview.counterAsset, amountR: preview.counterAtoms,
-          feeAsset: feeAsset, feeAmount: feeAmount,
+          feeAsset: feeAsset, feeAmount: feeAmount, feeRate: feeRate,
         );
       } else {
         q = SwapQuote(
           market: m, side: side,
           assetP: preview.counterAsset, amountP: preview.counterAtoms,
           assetR: m.baseAsset, amountR: baseAtoms,
-          feeAsset: feeAsset, feeAmount: feeAmount,
+          feeAsset: feeAsset, feeAmount: feeAmount, feeRate: feeRate,
         );
       }
       if (my != _reqSeq || !mounted) return; // a newer request superseded this one

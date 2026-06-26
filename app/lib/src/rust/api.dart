@@ -85,9 +85,12 @@ Future<String> btcBroadcast({required String t4Api, required String txHex}) =>
     RustLib.instance.api.crateApiBtcBroadcast(t4Api: t4Api, txHex: txHex);
 
 /// Build the taker (proposer) half of a SeqDEX same-chain swap. `asset_*` are
-/// display hex; amounts are atoms. The fee folds into the funded `asset_p` leg
-/// when `fee_asset == asset_p`. Returns the swap id + the SwapRequest JSON to
-/// hand to the daemon's ProposeTrade.
+/// display hex; amounts are atoms. Open fee market: `fee_amount == 0` ⇒ the maker
+/// funds the network fee in `asset_r` (default); `fee_amount > 0` ⇒ the taker
+/// funds it in `fee_asset` (any held, fee-eligible asset except `asset_r`),
+/// adding a fee input + explicit fee output. `fee_rate` is `fee_asset`'s
+/// published rate (atoms per 1e8 native), used only for the dust threshold.
+/// Returns the swap id + the SwapRequest JSON to hand to the daemon's ProposeTrade.
 Future<SeqdexSwapRequestOut> seqdexBuildSwapRequest({
   required String mnemonic,
   required String esploraUrl,
@@ -97,6 +100,7 @@ Future<SeqdexSwapRequestOut> seqdexBuildSwapRequest({
   required BigInt amountR,
   required String feeAsset,
   required BigInt feeAmount,
+  required BigInt feeRate,
 }) => RustLib.instance.api.crateApiSeqdexBuildSwapRequest(
   mnemonic: mnemonic,
   esploraUrl: esploraUrl,
@@ -106,6 +110,7 @@ Future<SeqdexSwapRequestOut> seqdexBuildSwapRequest({
   amountR: amountR,
   feeAsset: feeAsset,
   feeAmount: feeAmount,
+  feeRate: feeRate,
 );
 
 /// Sign the maker's SwapAccept PSET (base64) and return the stripped, signed PSET

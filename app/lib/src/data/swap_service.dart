@@ -18,6 +18,7 @@ class SwapQuote {
     required this.amountR,
     required this.feeAsset,
     required this.feeAmount,
+    required this.feeRate,
   });
   final Market market;
   final String side;
@@ -27,6 +28,9 @@ class SwapQuote {
   final BigInt amountR;
   final String feeAsset;
   final BigInt feeAmount;
+  // The fee asset's published exchange rate (atoms of feeAsset per 1e8 native),
+  // used only for the dust threshold when funding the fee output.
+  final BigInt feeRate;
 }
 
 /// Orchestrates a SeqDEX same-chain swap: build the taker SwapRequest (Rust) →
@@ -49,11 +53,17 @@ class SwapService {
       amountP: q.amountP,
       assetR: q.assetR,
       amountR: q.amountR,
+      // The taker funds the network fee itself: lwk adds a fee input + an explicit
+      // fee output in feeAsset to the swap PSET. feeRate is only for the dust fold.
       feeAsset: q.feeAsset,
       feeAmount: q.feeAmount,
+      feeRate: q.feeRate,
     );
     final swapReq = jsonDecode(out.swapRequestJson) as Map<String, dynamic>;
-    final accept = await SeqdexClient.propose(q.market, q.side, swapReq, q.feeAmount, q.feeAsset);
+    // The network fee now lives in the PSET (taker-funded); the wire fee_amount is
+    // the market COMMISSION channel only — send 0 so the daemon doesn't double the
+    // fee or shift the maker's receive amount.
+    final accept = await SeqdexClient.propose(q.market, q.side, swapReq, BigInt.zero, q.feeAsset);
     final stripped = await core.seqdexSignAccept(mnemonic: mnemonic, esploraUrl: Backend.esplora, acceptPset: accept.transaction);
     try {
       return await SeqdexClient.complete(_randId(), accept.id, stripped);

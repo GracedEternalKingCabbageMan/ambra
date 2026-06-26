@@ -206,6 +206,7 @@ abstract class RustLibApi extends BaseApi {
     required BigInt amountR,
     required String feeAsset,
     required BigInt feeAmount,
+    required BigInt feeRate,
   });
 
   Future<String> crateApiSeqdexSignAccept({
@@ -1154,6 +1155,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     required BigInt amountR,
     required String feeAsset,
     required BigInt feeAmount,
+    required BigInt feeRate,
   }) {
     return handler.executeNormal(
       NormalTask(
@@ -1167,6 +1169,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           sse_encode_u_64(amountR, serializer);
           sse_encode_String(feeAsset, serializer);
           sse_encode_u_64(feeAmount, serializer);
+          sse_encode_u_64(feeRate, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -1188,6 +1191,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           amountR,
           feeAsset,
           feeAmount,
+          feeRate,
         ],
         apiImpl: this,
       ),
@@ -1206,6 +1210,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           "amountR",
           "feeAsset",
           "feeAmount",
+          "feeRate",
         ],
       );
 

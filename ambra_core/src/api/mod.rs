@@ -154,9 +154,12 @@ pub struct SeqdexSwapRequestOut {
 }
 
 /// Build the taker (proposer) half of a SeqDEX same-chain swap. `asset_*` are
-/// display hex; amounts are atoms. The fee folds into the funded `asset_p` leg
-/// when `fee_asset == asset_p`. Returns the swap id + the SwapRequest JSON to
-/// hand to the daemon's ProposeTrade.
+/// display hex; amounts are atoms. Open fee market: `fee_amount == 0` ⇒ the maker
+/// funds the network fee in `asset_r` (default); `fee_amount > 0` ⇒ the taker
+/// funds it in `fee_asset` (any held, fee-eligible asset except `asset_r`),
+/// adding a fee input + explicit fee output. `fee_rate` is `fee_asset`'s
+/// published rate (atoms per 1e8 native), used only for the dust threshold.
+/// Returns the swap id + the SwapRequest JSON to hand to the daemon's ProposeTrade.
 #[allow(clippy::too_many_arguments)]
 pub fn seqdex_build_swap_request(
     mnemonic: String,
@@ -167,6 +170,7 @@ pub fn seqdex_build_swap_request(
     amount_r: u64,
     fee_asset: String,
     fee_amount: u64,
+    fee_rate: u64,
 ) -> Result<SeqdexSwapRequestOut> {
     with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
         let opts = lwk_wollet::SeqdexSwapRequestOpts {
@@ -179,6 +183,7 @@ pub fn seqdex_build_swap_request(
             receive_address: wollet.address(None).map_err(rerr)?.address().clone(),
             fee_asset: AssetId::from_str(&fee_asset).map_err(rerr)?,
             fee_amount,
+            fee_rate,
         };
         let req = wollet.seqdex_swap_request(&opts).map_err(rerr)?;
         let swap_request_json = crate::seqdex::swap_request_json(&req).map_err(err)?;
