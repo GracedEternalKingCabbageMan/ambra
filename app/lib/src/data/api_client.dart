@@ -46,6 +46,37 @@ class ApiClient {
     return out;
   }
 
+  /// The public asset registry, as display labels keyed by asset id (hex).
+  /// index.minimal.json is `{ id: [domain, ticker, name, precision, verified] }`.
+  static Future<Map<String, AssetLabel>> registry() async {
+    final r =
+        await http.get(Uri.parse(Backend.registry), headers: Backend.authHeaders).timeout(const Duration(seconds: 20));
+    if (r.statusCode != 200) throw Exception('HTTP ${r.statusCode}');
+    final j = jsonDecode(r.body) as Map<String, dynamic>;
+    final out = <String, AssetLabel>{};
+    j.forEach((id, v) {
+      if (v is! List || v.length < 4) return;
+      final ticker = v[1];
+      final name = v[2];
+      final precRaw = v[3];
+      final prec = precRaw is num ? precRaw.toInt() : int.tryParse('$precRaw');
+      if (ticker is! String || ticker.isEmpty || prec == null || prec < 0 || prec > 8) return;
+      out[id] = AssetLabel(
+        _clean(ticker, 16),
+        prec,
+        subtitle: (name is String && name.isNotEmpty) ? _clean(name, 48) : null,
+      );
+    });
+    return out;
+  }
+
+  /// Defence-in-depth for registry display strings: strip angle brackets and cap
+  /// the length (these render as text, but keep them tidy and non-injectable).
+  static String _clean(String s, int max) {
+    final t = s.replaceAll(RegExp(r'[<>]'), '');
+    return t.length > max ? t.substring(0, max) : t;
+  }
+
   /// Per-asset USD prices for reference-currency display (DISPLAY only).
   /// /prices = {TICKER: {price, market_cap, …}} (or a flat number).
   static Future<Map<String, double>> prices() async {

@@ -80,9 +80,29 @@ class SeqAssets {
   /// Faucet-dispensable assets (empty string = tSEQ).
   static const faucetAssets = <String>['', 'USDX', 'EURX', 'GOLD', 'WBTC', 'SILVR', 'OILX'];
 
+  /// Registry-fetched labels (asset id -> label), populated by [RegistryService]
+  /// at startup. Overlaid BELOW the built-in demo set so an asset outside that set
+  /// resolves its real ticker/precision/name from the public registry instead of a
+  /// hex-derived placeholder with an assumed precision.
+  static final Map<String, AssetLabel> _registry = {};
+
+  /// Replace the registry overlay (from a fetch or the on-disk cache).
+  static void mergeRegistry(Map<String, AssetLabel> m) {
+    _registry
+      ..clear()
+      ..addAll(m);
+  }
+
   static AssetLabel labelFor(String assetId) {
+    // Curated demo assets are authoritative (correct even offline).
     final hit = _builtin[assetId];
     if (hit != null) return hit;
+    // The public registry supplies the real ticker + precision + name — use it so
+    // we don't fabricate a ticker from the hex id or assume precision 8.
+    final reg = _registry[assetId];
+    if (reg != null) return reg;
+    // Truly unknown: elide the hex id (precision unknown; keep the 8-dp default
+    // that issued assets use).
     final short = assetId.length > 12
         ? '${assetId.substring(0, 6)}…${assetId.substring(assetId.length - 4)}'
         : assetId;
