@@ -126,6 +126,7 @@ dependencies = [
  "lwk_signer",
  "lwk_wollet",
  "reqwest",
+ "seqln-signer",
  "serde",
  "serde_json",
 ]
@@ -2225,6 +2226,19 @@ name = "semver"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
+
+[[package]]
+name = "seqln-signer"
+version = "0.1.0"
+dependencies = [
+ "bitcoin",
+ "chacha20poly1305",
+ "hmac",
+ "libc",
+ "pbkdf2",
+ "secp256k1",
+ "sha2",
+]
 
 [[package]]
 name = "serde"

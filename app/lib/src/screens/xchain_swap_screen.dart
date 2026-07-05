@@ -309,12 +309,12 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
         break;
       case XStep.seqClaimed:
         w.add(const _Waiting('Asset claimed. Waiting for the maker to settle the BTC side…'));
-        if (r.seqClaimTxid.isNotEmpty) w.add(_txRow('SEQ claim', r.seqClaimTxid));
+        if (r.seqClaimTxid.isNotEmpty) w.add(_txRow('Sequentia claim', r.seqClaimTxid));
         w.add(_checkButton(_pollSettle));
         break;
       case XStep.btcClaimed:
         w.add(const AmbraCard(child: Text('Swap complete. You received the asset; the maker took the BTC.', style: AmbraText.body)));
-        if (r.seqClaimTxid.isNotEmpty) w.add(_txRow('SEQ claim', r.seqClaimTxid));
+        if (r.seqClaimTxid.isNotEmpty) w.add(_txRow('Sequentia claim', r.seqClaimTxid));
         w.add(const SizedBox(height: 10));
         w.add(SecondaryButton(label: 'Done', icon: Icons.check, onPressed: _reset));
         break;
@@ -379,7 +379,7 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
               Text('Checking the anchor…', style: AmbraText.muted),
             ])
           else ...[
-            _Row('SEQ anchor height', ev.seqAnchorHeight < 0 ? 'not anchored yet' : '${ev.seqAnchorHeight}'),
+            _Row('Sequentia anchor height', ev.seqAnchorHeight < 0 ? 'not anchored yet' : '${ev.seqAnchorHeight}'),
             _Row('Your BTC lock height', '${ev.btcLegHeight}'),
             _Row('Anchor depth', ev.depth < 0 ? '—' : '${ev.depth} conf'),
             _Row('Anchor status', ev.anchorStatus),
@@ -389,7 +389,7 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
       ),
       const SizedBox(height: 14),
       PrimaryButton(
-        label: ok ? 'Claim the asset (reveal secret)' : 'Claim — not safe yet',
+        label: ok ? 'Claim the asset (reveal secret)' : 'Claim (not safe yet)',
         busy: _busy,
         icon: Icons.verified_user,
         onPressed: (_busy || !ok) ? null : _claim,

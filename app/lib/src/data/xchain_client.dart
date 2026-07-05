@@ -208,7 +208,7 @@ class XchainClient {
     final accepted = pick(j, ['accepted']) as Map?;
     if (accepted == null) throw Exception('propose returned neither accepted nor fail');
     final leg = pick(accepted, ['seq_leg', 'seqLeg']) as Map?;
-    if (leg == null) throw Exception('propose accepted without a SEQ leg');
+    if (leg == null) throw Exception('propose accepted without a Sequentia leg');
     return (swapId: _str(pick(accepted, ['swap_id', 'swapId'])), seqLeg: XSeqLeg.fromJson(leg));
   }
 
