@@ -65,6 +65,8 @@ class _AmbraAppState extends State<AmbraApp> with WidgetsBindingObserver {
       // returns. Pop back to the first route so nothing sensitive outlives the
       // lock. Guarded on the lock actually engaging, so an unlocked session
       // doesn't lose the user's place (mid-send review, etc.) on every switch.
+      // TODO(device-verify): background the app with the recovery-phrase sheet
+      // open and confirm it's gone (not on top of the lock) after returning.
       if (repo.hasWallet && repo.lockEnabled) {
         _navKey.currentState?.popUntil((r) => r.isFirst);
       }

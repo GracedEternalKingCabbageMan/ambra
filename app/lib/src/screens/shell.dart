@@ -40,6 +40,8 @@ class _ShellState extends State<Shell> {
       HistoryTab(isActive: _tab == 4),
       const MoreTab(),
     ];
+    // TODO(device-verify): confirm the Android hardware/gesture back returns to
+    // Balance from other tabs and only exits from Balance (needs a device).
     return PopScope(
       // Android back should return to the Balance tab from any other tab, and only
       // exit the app when already on Balance — not drop out of the wallet on the
