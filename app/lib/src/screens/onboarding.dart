@@ -44,8 +44,9 @@ class WelcomeScreen extends StatelessWidget {
                       ),
                       const Spacer(),
                       const WarnCallout(
-                        'Testnet. Your recovery phrase is stored on this device, '
-                        'protected by your device lock. For real funds, use a hardware wallet.',
+                        'Testnet. Your recovery phrase is stored on this device. Turn on the '
+                        'app lock to require your device credentials to open Ambra, and use a '
+                        'hardware wallet for real funds.',
                       ),
                       const SizedBox(height: 22),
                       const Center(child: SequentiaWordmark()),
@@ -172,7 +173,6 @@ class _VerifyScreenState extends State<VerifyScreen> {
   late final List<int> _targets;
   late final List<List<String>> _choices;
   int _step = 0;
-  bool _busy = false;
   String? _error;
 
   @override
@@ -189,8 +189,7 @@ class _VerifyScreenState extends State<VerifyScreen> {
     }).toList();
   }
 
-  Future<void> _pick(String word) async {
-    if (_busy) return;
+  void _pick(String word) {
     final target = _targets[_step];
     if (word != widget.words[target]) {
       setState(() => _error = 'That is not word #${target + 1}. Try again.');
@@ -203,10 +202,12 @@ class _VerifyScreenState extends State<VerifyScreen> {
       });
       return;
     }
-    // All three correct -> persist + activate.
-    setState(() => _busy = true);
-    await WalletRepository.instance.persistNewWallet(widget.words.join(' '));
-    if (mounted) Navigator.of(context).popUntil((r) => r.isFirst);
+    // All three correct -> offer to enable the app lock, then persist + activate
+    // (the security step performs the persist so the lock choice is applied atomically).
+    if (mounted) {
+      Navigator.of(context).push(
+          MaterialPageRoute(builder: (_) => SecuritySetupScreen(mnemonic: widget.words.join(' '))));
+    }
   }
 
   @override
@@ -228,13 +229,12 @@ class _VerifyScreenState extends State<VerifyScreen> {
                 spacing: 10,
                 runSpacing: 10,
                 children: _choices[_step]
-                    .map((w) => _ChoiceChip(label: w, onTap: _busy ? null : () => _pick(w)))
+                    .map((w) => _ChoiceChip(label: w, onTap: () => _pick(w)))
                     .toList(),
               ),
               const SizedBox(height: 16),
               if (_error != null) Text(_error!, style: const TextStyle(color: AmbraColors.red)),
               const Spacer(),
-              if (_busy) const Center(child: CircularProgressIndicator(color: AmbraColors.amber)),
             ]),
           ),
         ),
@@ -290,8 +290,11 @@ class _ImportScreenState extends State<ImportScreen> {
     });
     try {
       await core.validateMnemonic(mnemonic: phrase);
-      await WalletRepository.instance.persistNewWallet(phrase);
-      if (mounted) Navigator.of(context).popUntil((r) => r.isFirst);
+      if (mounted) {
+        setState(() => _busy = false);
+        // Offer to enable the app lock, then persist (the security step persists).
+        Navigator.of(context).push(MaterialPageRoute(builder: (_) => SecuritySetupScreen(mnemonic: phrase)));
+      }
     } catch (e) {
       setState(() {
         _busy = false;
@@ -327,6 +330,94 @@ class _ImportScreenState extends State<ImportScreen> {
             ),
             BottomActionBar(children: [
               PrimaryButton(label: 'Import', busy: _busy, onPressed: _busy ? null : _import),
+            ]),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Final onboarding step: offer to enable the app lock (defaults ON) before the
+/// wallet becomes active. Persisting the mnemonic happens HERE so the lock choice
+/// is applied together with wallet creation, not left off and buried in More.
+class SecuritySetupScreen extends StatefulWidget {
+  const SecuritySetupScreen({super.key, required this.mnemonic});
+  final String mnemonic;
+  @override
+  State<SecuritySetupScreen> createState() => _SecuritySetupScreenState();
+}
+
+class _SecuritySetupScreenState extends State<SecuritySetupScreen> {
+  bool _enableLock = true; // default ON
+  bool _busy = false;
+
+  Future<void> _finish() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    final repo = WalletRepository.instance;
+    var enabled = false;
+    if (_enableLock) {
+      // Only enable if the device can actually enforce it (has a PIN/pattern/
+      // biometric); otherwise the "lock" would open on any tap. Inform, continue.
+      if (await repo.canEnforceLock()) {
+        enabled = true;
+      } else if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text(
+                'No device screen lock found. Set a PIN, pattern, or biometrics, then enable the app lock in More.')));
+      }
+    }
+    await repo.persistNewWallet(widget.mnemonic);
+    if (enabled) await repo.setLockEnabled(true);
+    if (mounted) Navigator.of(context).popUntil((r) => r.isFirst);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      appBar: _bar(context, 'Secure your wallet'),
+      body: AmbraBackground(
+        child: Column(
+          children: [
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(20),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                  const Text(
+                    'Add an app lock so opening Ambra requires your device credentials '
+                    '(biometrics or your PIN/pattern).',
+                    style: AmbraText.muted,
+                  ),
+                  const SizedBox(height: 18),
+                  AmbraCard(
+                    child: SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      activeThumbColor: AmbraColors.amber,
+                      value: _enableLock,
+                      onChanged: _busy ? null : (v) => setState(() => _enableLock = v),
+                      title: const Text('App lock', style: AmbraText.body),
+                      subtitle: const Text(
+                          'Require biometrics or your device PIN to open Ambra. You can change this later in More.',
+                          style: AmbraText.sub),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  const WarnCallout(
+                    'The app lock protects opening the wallet on this device. It does NOT replace your '
+                    'recovery phrase: keep those 12 words backed up offline.',
+                  ),
+                ]),
+              ),
+            ),
+            BottomActionBar(children: [
+              PrimaryButton(
+                label: 'Finish',
+                busy: _busy,
+                icon: Icons.check,
+                onPressed: _busy ? null : _finish,
+              ),
             ]),
           ],
         ),
