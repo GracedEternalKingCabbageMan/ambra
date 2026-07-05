@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import '../data/api_client.dart';
 import '../data/config.dart';
 import '../data/format.dart';
+import '../data/lightning_service.dart';
 import '../data/price_service.dart';
 import '../data/seqdex_client.dart';
 import '../data/swap_service.dart';
@@ -11,6 +12,7 @@ import '../data/wallet_repository.dart';
 import '../rust/api.dart' as core;
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
+import 'lightning_swap_screen.dart';
 import 'xchain_swap_screen.dart';
 
 /// Estimated vByte size of a same-chain swap settlement tx, used to turn the
@@ -489,6 +491,24 @@ class _SwapTabState extends State<SwapTab> {
             icon: Icons.currency_bitcoin,
             onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const XchainSwapScreen())),
           ),
+          // Instant (Lightning) rail: a pure-LN BTC<->asset swap through the
+          // hosted-SeqLN LSP (non-custodial; keys stay on device). Shown only
+          // while the on-device signer is serving — otherwise the composer stays
+          // on the on-chain cross-chain path, exactly as an LN-less build.
+          ListenableBuilder(
+            listenable: LightningService.instance,
+            builder: (context, _) => LightningService.instance.available
+                ? Padding(
+                    padding: const EdgeInsets.only(top: 10),
+                    child: SecondaryButton(
+                      label: 'Instant (Lightning)',
+                      icon: Icons.bolt,
+                      onPressed: () =>
+                          Navigator.of(context).push(MaterialPageRoute(builder: (_) => const LightningSwapScreen())),
+                    ),
+                  )
+                : const SizedBox.shrink(),
+          ),
           const SizedBox(height: 20),
           if (_loading)
             const Padding(padding: EdgeInsets.only(top: 40), child: Center(child: CircularProgressIndicator(color: AmbraColors.amber)))
@@ -708,7 +728,7 @@ class _SwapReviewSheetState extends State<_SwapReviewSheet> {
               _Row('You pay', _amt(q.assetP, q.amountP)),
               _Row('You receive', _amt(q.assetR, q.amountR)),
               _Row('Network fee', _amt(q.feeAsset, q.feeAmount)),
-              _Row('Settlement', 'Atomic — settles in full or not at all.'),
+              _Row('Settlement', 'Atomic; settles in full or not at all.'),
               _Row('Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'),
             ]),
           ),

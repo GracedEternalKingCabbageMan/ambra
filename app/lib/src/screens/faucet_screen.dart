@@ -99,6 +99,19 @@ class _FaucetScreenState extends State<FaucetScreen> {
             ],
           ),
           const SizedBox(height: 20),
+          AmbraCard(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: const [
+              SectionLabel('Bitcoin (testnet4)'),
+              SizedBox(height: 10),
+              Text(
+                'The buttons above fund Sequentia assets only. Your address also receives '
+                'Bitcoin on testnet4 (one address, both chains). To get testnet Bitcoin, send '
+                'it from a public Bitcoin testnet4 faucet to the funding address shown above.',
+                style: AmbraText.sub,
+              ),
+            ]),
+          ),
+          const SizedBox(height: 20),
           if (_status != null)
             Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
               if (_busy) ...[

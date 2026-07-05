@@ -28,6 +28,15 @@ lwk_common = { version = "0.18.1" }
 flutter_rust_bridge = "=2.12.0"
 anyhow = "1"
 
+# The SeqLN Tier-2 device signer (the phone-side crypto kernel + validating
+# policy + Noise_XK). Pure, I/O-free, and deliberately pinned to the SAME
+# bitcoin 0.32 / secp256k1 0.29 line ambra_core already resolves, so cargo
+# unifies to one copy of each crypto crate. This is the phone equivalent of the
+# WASM signer the web wallet drives: api/signer.rs wraps it for Dart via FRB.
+# (Local-dev layout: seqln sits as a sibling of ambra, like SWK. Becomes a git
+# dep before CI, same as the lwk_* path patches below.)
+seqln-signer = { path = "../../seqln/contrib/seqln-signer" }
+
 # Bitcoin (parent-chain testnet4) wallet: a small esplora client + raw P2WPKH tx
 # building. The `bitcoin` crate itself comes via lwk_wollet::bitcoin (0.32), so we
 # don't depend on it directly (keeps the version in lockstep with elements). These
