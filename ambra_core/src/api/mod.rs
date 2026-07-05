@@ -5,6 +5,10 @@
 //! Generated Dart bindings land in `app/lib/src/rust/` via
 //! `flutter_rust_bridge_codegen generate`.
 
+/// Phone-side SeqLN Tier-2 device signer (the WASM signer's native twin): holds
+/// the wallet's keys on-device and co-signs a hosted SeqLN node over Noise_XK.
+pub mod signer;
+
 use std::str::FromStr;
 
 use anyhow::Result;
