@@ -8,6 +8,7 @@ import '../data/config.dart';
 import '../data/format.dart';
 import '../data/node_config.dart';
 import '../data/price_service.dart';
+import '../data/registry_service.dart';
 import '../data/wallet_cache.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
@@ -39,10 +40,19 @@ class _ShellState extends State<Shell> {
       HistoryTab(isActive: _tab == 4),
       const MoreTab(),
     ];
-    return Scaffold(
-      backgroundColor: Colors.transparent,
-      body: AmbraBackground(child: SafeArea(bottom: false, child: IndexedStack(index: _tab, children: tabs))),
-      bottomNavigationBar: _BottomBar(index: _tab, onTap: (i) => setState(() => _tab = i)),
+    return PopScope(
+      // Android back should return to the Balance tab from any other tab, and only
+      // exit the app when already on Balance — not drop out of the wallet on the
+      // first back press from Send/Swap/History/More.
+      canPop: _tab == 0,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && mounted) setState(() => _tab = 0);
+      },
+      child: Scaffold(
+        backgroundColor: Colors.transparent,
+        body: AmbraBackground(child: SafeArea(bottom: false, child: IndexedStack(index: _tab, children: tabs))),
+        bottomNavigationBar: _BottomBar(index: _tab, onTap: (i) => setState(() => _tab = i)),
+      ),
     );
   }
 }
@@ -60,21 +70,34 @@ class BalanceTab extends StatefulWidget {
 class _BalanceTabState extends State<BalanceTab> {
   core.WalletSync? _sync;
   core.BtcBalance? _btc; // parent-chain (testnet4) balance, first-class like any asset
+  String? _btcCachedSats; // last-known BTC sats from disk, shown if a fresh scan fails
+  bool _btcStale = false; // true when the shown BTC balance is last-known (scan failed)
   List<core.AssetBalance>? _cachedBalances; // last-known, shown instantly while syncing
   String? _error;
   bool _loading = true;
+  DateTime? _lastSync; // time of the last successful Sequentia sync (for the chip)
+  bool _syncFailed = false; // the latest refresh errored (chip shows offline + last-sync time)
 
   @override
   void initState() {
     super.initState();
     PriceService.instance.addListener(_onPrice);
+    // Asset labels can arrive after first paint (network registry); rebuild so
+    // rows show the real ticker/precision instead of a hex placeholder.
+    RegistryService.instance.addListener(_onPrice);
     _loadCached(); // show outdated balances at once, refresh below
     _refresh(); // eager: every tab loads at launch (cheap now that the wallet is cached)
   }
 
   Future<void> _loadCached() async {
     final b = await WalletCache.loadBalances();
-    if (b != null && mounted && _sync == null) setState(() => _cachedBalances = b);
+    final btcSats = await WalletCache.loadBtc();
+    if (mounted && _sync == null) {
+      setState(() {
+        if (b != null) _cachedBalances = b;
+        if (btcSats != null && _btc == null) _btcCachedSats = btcSats;
+      });
+    }
   }
 
   @override
@@ -92,6 +115,7 @@ class _BalanceTabState extends State<BalanceTab> {
   @override
   void dispose() {
     PriceService.instance.removeListener(_onPrice);
+    RegistryService.instance.removeListener(_onPrice);
     super.dispose();
   }
 
@@ -113,18 +137,31 @@ class _BalanceTabState extends State<BalanceTab> {
       final s = await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
       final btc = await btcF;
       WalletCache.saveBalances(s.balances); // persist for the next launch
+      if (btc != null) WalletCache.saveBtc(btc.balanceSats); // persist last-known BTC
       // Feed both chains' indices into the shared cross-chain receive cycling.
       BtcState.instance.observe(btc: btc, seqNext: s.nextIndex);
       if (mounted) {
         setState(() {
           _sync = s;
-          if (btc != null) _btc = btc;
+          _lastSync = DateTime.now();
+          _syncFailed = false;
+          if (btc != null) {
+            _btc = btc;
+            _btcCachedSats = btc.balanceSats;
+            _btcStale = false;
+          } else {
+            // The testnet4 scan failed. Keep showing the last-known BTC balance
+            // (fresh _btc or the disk cache) marked offline, instead of silently
+            // dropping the row while the sync chip reads green.
+            _btcStale = _btc != null || _btcCachedSats != null;
+          }
           _loading = false;
         });
       }
     } catch (e) {
       if (mounted) {
         setState(() {
+          _syncFailed = true; // latest refresh failed; chip reflects it (may show stale data)
           // Surface an error only when there's nothing (not even stale data) to show.
           if (_sync == null && _cachedBalances == null) _error = friendlyError(e);
           _loading = false;
@@ -146,10 +183,11 @@ class _BalanceTabState extends State<BalanceTab> {
         any = true;
       }
     }
-    // Parent-chain Bitcoin counts equally toward the portfolio total.
-    final btc = _btc;
-    if (btc != null) {
-      final v = PriceService.instance.refValue('BTC', btc.balanceSats, 8);
+    // Parent-chain Bitcoin counts equally toward the portfolio total (using the
+    // last-known balance if the latest testnet4 scan didn't complete).
+    final btcSats = _btc?.balanceSats ?? _btcCachedSats;
+    if (btcSats != null) {
+      final v = PriceService.instance.refValue('BTC', btcSats, 8);
       if (v != null) {
         sum += v;
         any = true;
@@ -168,8 +206,10 @@ class _BalanceTabState extends State<BalanceTab> {
         ? const <core.AssetBalance>[]
         : balances.where((b) => (BigInt.tryParse(b.atoms) ?? BigInt.zero) > BigInt.zero).toList();
     final total = balances == null ? null : _totalRef(balances);
-    // Bitcoin is first-class: shown when held (a 0 balance is hidden like any asset).
-    final btcSats = BigInt.tryParse(_btc?.balanceSats ?? '0') ?? BigInt.zero;
+    // Bitcoin is first-class: shown when held (a 0 balance is hidden like any
+    // asset). Resolve to the last-known balance if a fresh testnet4 scan failed.
+    final btcSatsStr = _btc?.balanceSats ?? _btcCachedSats;
+    final btcSats = BigInt.tryParse(btcSatsStr ?? '0') ?? BigInt.zero;
     final hasBtc = btcSats > BigInt.zero;
     return RefreshIndicator(
       onRefresh: _refresh,
@@ -185,7 +225,7 @@ class _BalanceTabState extends State<BalanceTab> {
             const Spacer(),
             _RefChip(ref: PriceService.instance.ref),
             const SizedBox(width: 10),
-            _SyncChip(loading: _loading, tip: _sync?.tipHeight),
+            _SyncChip(loading: _loading, tip: _sync?.tipHeight, failed: _syncFailed, lastSync: _lastSync),
           ]),
           const SizedBox(height: 28),
           Text('TOTAL BALANCE', style: AmbraText.label),
@@ -220,7 +260,7 @@ class _BalanceTabState extends State<BalanceTab> {
             AmbraCard(
               padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 16),
               child: Column(children: [
-                if (hasBtc) _BtcRow(sats: _btc!.balanceSats),
+                if (hasBtc) _BtcRow(sats: btcSatsStr!, stale: _btcStale),
                 for (final b in held) _AssetRow(balance: b),
               ]),
             ),
@@ -270,8 +310,9 @@ class _AssetRow extends StatelessWidget {
 
 /// The Bitcoin parent-chain balance row — first-class, same layout as [_AssetRow].
 class _BtcRow extends StatelessWidget {
-  const _BtcRow({required this.sats});
+  const _BtcRow({required this.sats, this.stale = false});
   final String sats;
+  final bool stale; // showing the last-known balance because the latest scan failed
   @override
   Widget build(BuildContext context) {
     final amount = formatAtoms(sats, 8);
@@ -280,11 +321,12 @@ class _BtcRow extends StatelessWidget {
       padding: const EdgeInsets.symmetric(vertical: 12),
       child: Row(children: [
         Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: const [
-            Text('BTC',
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('BTC',
                 style: TextStyle(color: AmbraColors.txt, fontWeight: FontWeight.w600, fontSize: 15)),
-            SizedBox(height: 2),
-            Text('Bitcoin testnet4', style: AmbraText.sub),
+            const SizedBox(height: 2),
+            Text(stale ? 'Bitcoin testnet4 · last known (offline)' : 'Bitcoin testnet4',
+                style: stale ? AmbraText.sub.copyWith(color: AmbraColors.amber2) : AmbraText.sub),
           ]),
         ),
         const SizedBox(width: 12),
@@ -303,9 +345,18 @@ class _BtcRow extends StatelessWidget {
 }
 
 class _SyncChip extends StatelessWidget {
-  const _SyncChip({required this.loading, this.tip});
+  const _SyncChip({required this.loading, this.tip, this.failed = false, this.lastSync});
   final bool loading;
   final int? tip;
+  final bool failed; // the latest refresh errored
+  final DateTime? lastSync; // time of the last successful sync
+
+  static String _hhmm(DateTime t) {
+    final l = t.toLocal();
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${two(l.hour)}:${two(l.minute)}';
+  }
+
   @override
   Widget build(BuildContext context) {
     if (loading) {
@@ -315,9 +366,18 @@ class _SyncChip extends StatelessWidget {
         Text('syncing', style: AmbraText.sub),
       ]);
     }
-    // Not loading: green + block height when synced; amber + "offline" when the
-    // last sync didn't complete (so the screen is showing last-known data).
-    final synced = tip != null;
+    // Green + block height when the latest sync succeeded; amber + "offline" when
+    // it failed, with the last-synced time so "offline" isn't undated (the screen
+    // is then showing last-known data).
+    final synced = tip != null && !failed;
+    final String label;
+    if (synced) {
+      label = 'block $tip';
+    } else if (lastSync != null) {
+      label = 'offline · synced ${_hhmm(lastSync!)}';
+    } else {
+      label = 'offline';
+    }
     return Row(mainAxisSize: MainAxisSize.min, children: [
       Container(
         width: 7,
@@ -328,7 +388,7 @@ class _SyncChip extends StatelessWidget {
         ),
       ),
       const SizedBox(width: 7),
-      Text(synced ? 'block $tip' : 'offline', style: AmbraText.sub),
+      Text(label, style: AmbraText.sub),
     ]);
   }
 }
