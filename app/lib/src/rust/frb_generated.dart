@@ -2189,15 +2189,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TxRow dco_decode_tx_row(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 6)
-      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
+    if (arr.length != 7)
+      throw Exception('unexpected arr length: expect 7 but see ${arr.length}');
     return TxRow(
       txid: dco_decode_String(arr[0]),
       height: dco_decode_opt_box_autoadd_u_32(arr[1]),
       timestamp: dco_decode_opt_box_autoadd_u_64(arr[2]),
       kind: dco_decode_String(arr[3]),
       fee: dco_decode_u_64(arr[4]),
-      deltas: dco_decode_list_asset_delta(arr[5]),
+      feeAsset: dco_decode_String(arr[5]),
+      deltas: dco_decode_list_asset_delta(arr[6]),
     );
   }
 
@@ -2565,6 +2566,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_timestamp = sse_decode_opt_box_autoadd_u_64(deserializer);
     var var_kind = sse_decode_String(deserializer);
     var var_fee = sse_decode_u_64(deserializer);
+    var var_feeAsset = sse_decode_String(deserializer);
     var var_deltas = sse_decode_list_asset_delta(deserializer);
     return TxRow(
       txid: var_txid,
@@ -2572,6 +2574,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       timestamp: var_timestamp,
       kind: var_kind,
       fee: var_fee,
+      feeAsset: var_feeAsset,
       deltas: var_deltas,
     );
   }
@@ -2902,6 +2905,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_opt_box_autoadd_u_64(self.timestamp, serializer);
     sse_encode_String(self.kind, serializer);
     sse_encode_u_64(self.fee, serializer);
+    sse_encode_String(self.feeAsset, serializer);
     sse_encode_list_asset_delta(self.deltas, serializer);
   }
 

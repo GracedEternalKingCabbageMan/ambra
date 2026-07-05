@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `clear_scan_marks`, `err`, `esplora_client`, `hexbytes`, `last_scan`, `mark_scanned`, `rerr`, `scan_into`, `scanned_recently`, `with_synced_wollet`, `wollet_cache`
+// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `btc_params`, `clear_scan_marks`, `err`, `esplora_client`, `hexbytes`, `last_scan`, `mark_scanned`, `rerr`, `scan_into`, `scanned_recently`, `with_synced_wollet`, `wollet_cache`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
 String networkName() => RustLib.instance.api.crateApiNetworkName();
@@ -778,6 +778,12 @@ class TxRow {
   /// "incoming" | "outgoing" | "issuance" | "reissuance" | "burn" | "redeposit" | "unknown".
   final String kind;
   final BigInt fee;
+
+  /// The asset id (hex) the network fee was paid in. Sequentia's open fee market
+  /// lets the fee be ANY accepted asset, not just the policy asset, so the UI
+  /// must label the fee with its real asset instead of assuming tSEQ. Falls back
+  /// to the policy asset when the tx has no explicit fee output (fee == 0).
+  final String feeAsset;
   final List<AssetDelta> deltas;
 
   const TxRow({
@@ -786,6 +792,7 @@ class TxRow {
     this.timestamp,
     required this.kind,
     required this.fee,
+    required this.feeAsset,
     required this.deltas,
   });
 
@@ -796,6 +803,7 @@ class TxRow {
       timestamp.hashCode ^
       kind.hashCode ^
       fee.hashCode ^
+      feeAsset.hashCode ^
       deltas.hashCode;
 
   @override
@@ -808,6 +816,7 @@ class TxRow {
           timestamp == other.timestamp &&
           kind == other.kind &&
           fee == other.fee &&
+          feeAsset == other.feeAsset &&
           deltas == other.deltas;
 }
 

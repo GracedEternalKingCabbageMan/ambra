@@ -2015,6 +2015,7 @@ impl SseDecode for crate::api::TxRow {
         let mut var_timestamp = <Option<u64>>::sse_decode(deserializer);
         let mut var_kind = <String>::sse_decode(deserializer);
         let mut var_fee = <u64>::sse_decode(deserializer);
+        let mut var_feeAsset = <String>::sse_decode(deserializer);
         let mut var_deltas = <Vec<crate::api::AssetDelta>>::sse_decode(deserializer);
         return crate::api::TxRow {
             txid: var_txid,
@@ -2022,6 +2023,7 @@ impl SseDecode for crate::api::TxRow {
             timestamp: var_timestamp,
             kind: var_kind,
             fee: var_fee,
+            fee_asset: var_feeAsset,
             deltas: var_deltas,
         };
     }
@@ -2376,6 +2378,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::TxRow {
             self.timestamp.into_into_dart().into_dart(),
             self.kind.into_into_dart().into_dart(),
             self.fee.into_into_dart().into_dart(),
+            self.fee_asset.into_into_dart().into_dart(),
             self.deltas.into_into_dart().into_dart(),
         ]
         .into_dart()
@@ -2670,6 +2673,7 @@ impl SseEncode for crate::api::TxRow {
         <Option<u64>>::sse_encode(self.timestamp, serializer);
         <String>::sse_encode(self.kind, serializer);
         <u64>::sse_encode(self.fee, serializer);
+        <String>::sse_encode(self.fee_asset, serializer);
         <Vec<crate::api::AssetDelta>>::sse_encode(self.deltas, serializer);
     }
 }
