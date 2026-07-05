@@ -568,6 +568,11 @@ pub struct TxRow {
     /// "incoming" | "outgoing" | "issuance" | "reissuance" | "burn" | "redeposit" | "unknown".
     pub kind: String,
     pub fee: u64,
+    /// The asset id (hex) the network fee was paid in. Sequentia's open fee market
+    /// lets the fee be ANY accepted asset, not just the policy asset, so the UI
+    /// must label the fee with its real asset instead of assuming tSEQ. Falls back
+    /// to the policy asset when the tx has no explicit fee output (fee == 0).
+    pub fee_asset: String,
     pub deltas: Vec<AssetDelta>,
 }
 
@@ -575,6 +580,9 @@ pub struct TxRow {
 /// per tx). Ordering is left to the UI.
 pub fn wallet_transactions(mnemonic: String, esplora_url: String) -> Result<Vec<TxRow>> {
     with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        // The policy asset is the fee-asset fallback for txs with no explicit fee
+        // output (e.g. incoming, fee == 0).
+        let policy = wollet.policy_asset();
         let rows = wollet
             .transactions()
             .map_err(rerr)?
@@ -604,12 +612,23 @@ pub fn wallet_transactions(mnemonic: String, esplora_url: String) -> Result<Vec<
                     (false, true) => "incoming".to_string(),
                     _ => t.type_,
                 };
+                // The fee output's asset (any-asset fee market): the fee need not
+                // be tSEQ. Read it straight off the tx's explicit fee output.
+                let fee_asset = t
+                    .tx
+                    .output
+                    .iter()
+                    .find(|o| o.is_fee())
+                    .and_then(|o| o.asset.explicit())
+                    .unwrap_or(policy)
+                    .to_string();
                 TxRow {
                     txid: t.txid.to_string(),
                     height: t.height,
                     timestamp: t.timestamp.map(|ts| ts as u64),
                     kind,
                     fee: t.fee,
+                    fee_asset,
                     deltas,
                 }
             })

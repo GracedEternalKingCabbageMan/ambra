@@ -222,6 +222,14 @@ String _kindTitle(String kind) {
   }
 }
 
+/// The network fee rendered in its REAL asset (Sequentia's any-asset fee market),
+/// not a hardcoded "tSEQ". An empty fee_asset (older cached rows) falls back to
+/// the policy asset.
+String _feeText(core.TxRow tx) {
+  final feeLabel = SeqAssets.labelFor(tx.feeAsset.isEmpty ? SeqAssets.policy : tx.feeAsset);
+  return '${formatAtoms(tx.fee.toString(), feeLabel.precision)} ${feeLabel.ticker}';
+}
+
 String _fmtTime(BigInt? ts) {
   if (ts == null) return '—';
   final d = DateTime.fromMillisecondsSinceEpoch(ts.toInt() * 1000).toLocal();
@@ -268,7 +276,7 @@ class _TxDetailSheet extends StatelessWidget {
                 _DetailRow('Status', settled ? 'Settled · block ${tx.height} (anchor-bound to Bitcoin)' : 'Pending; not yet in a block'),
                 _DetailRow('Date', _fmtTime(tx.timestamp)),
                 _DetailRow('Network', 'sequentia-testnet'),
-                if (showFee) _DetailRow('Network fee', '${formatAtoms(tx.fee.toString(), 8)} tSEQ'),
+                if (showFee) _DetailRow('Network fee', _feeText(tx)),
               ]),
             ),
             const SizedBox(height: 14),
