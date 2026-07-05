@@ -17,6 +17,8 @@ class MainActivity : FlutterFragmentActivity() {
     // app was backgrounded cannot leak into the task switcher. App-wide (rather
     // than per-route) is deliberate: it has no route-tracking gap a sensitive
     // sheet could slip through.
+    // TODO(device-verify): confirm on a real device/emulator that seed screens no
+    // longer appear in a screenshot or the recents thumbnail (cannot be built here).
     override fun onCreate(savedInstanceState: Bundle?) {
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         super.onCreate(savedInstanceState)
