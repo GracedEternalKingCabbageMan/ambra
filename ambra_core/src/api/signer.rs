@@ -27,6 +27,9 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use flutter_rust_bridge::frb;
+use lwk_wollet::bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
+use lwk_wollet::bitcoin::secp256k1::Secp256k1;
+use lwk_wollet::bitcoin::Network;
 
 use seqln_signer::dispatch::{Outcome, Signer as InnerSigner};
 use seqln_signer::frame;
@@ -273,4 +276,33 @@ pub fn device_pubkey(static_privkey: Vec<u8>) -> Result<String> {
     noise::static_pubkey(&priv_)
         .map(|p| hex(&p))
         .map_err(|e| anyhow!(e.0))
+}
+
+/// Derive the device transport (Noise static) private key for the hosted-SeqLN
+/// LSP link, deterministically from the wallet mnemonic. This is the native twin
+/// of the web wallet's `lnDeviceTransportPriv`: standard BIP39 seed (no
+/// passphrase) -> BIP32 `m/1017'/0'/0'` -> the 32-byte private key. It is stable
+/// across reinstalls and recoverable from the mnemonic, so the LSP can pin ONE
+/// device identity per wallet — and it is byte-identical to the browser client
+/// for the same seed (both take the standard BIP39 seed through the same BIP32
+/// path), so one hosted LSP can pin the same key whichever client the user runs.
+#[frb(sync)]
+pub fn seqln_device_transport_privkey(mnemonic: String) -> Result<Vec<u8>> {
+    // Standard 64-byte BIP39 seed (empty passphrase), via the same path the
+    // signer takes: synthesize the `32 zero bytes || mnemonic` on-disk form and
+    // parse it (yields `secret.seed`, the plain BIP39 seed).
+    let mut bytes = vec![0u8; 32];
+    bytes.extend_from_slice(mnemonic.trim().as_bytes());
+    let secret = hsm_secret::parse(&bytes).map_err(|e| anyhow!(e))?;
+    let secp = Secp256k1::new();
+    // The BIP32 network version affects only the (unused) xprv serialization, not
+    // the derived private-key bytes, so testnet here is fine and cross-consistent.
+    let master = Xpriv::new_master(Network::Testnet, &secret.seed).map_err(|e| anyhow!("{e}"))?;
+    let path = DerivationPath::from(vec![
+        ChildNumber::from_hardened_idx(1017).map_err(|e| anyhow!("{e}"))?,
+        ChildNumber::from_hardened_idx(0).map_err(|e| anyhow!("{e}"))?,
+        ChildNumber::from_hardened_idx(0).map_err(|e| anyhow!("{e}"))?,
+    ]);
+    let child = master.derive_priv(&secp, &path).map_err(|e| anyhow!("{e}"))?;
+    Ok(child.private_key.secret_bytes().to_vec())
 }

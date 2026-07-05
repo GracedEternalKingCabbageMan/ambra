@@ -15,6 +15,19 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 String devicePubkey({required List<int> staticPrivkey}) => RustLib.instance.api
     .crateApiSignerDevicePubkey(staticPrivkey: staticPrivkey);
 
+/// Derive the device transport (Noise static) private key for the hosted-SeqLN
+/// LSP link, deterministically from the wallet mnemonic. This is the native twin
+/// of the web wallet's `lnDeviceTransportPriv`: standard BIP39 seed (no
+/// passphrase) -> BIP32 `m/1017'/0'/0'` -> the 32-byte private key. It is stable
+/// across reinstalls and recoverable from the mnemonic, so the LSP can pin ONE
+/// device identity per wallet — and it is byte-identical to the browser client
+/// for the same seed (both take the standard BIP39 seed through the same BIP32
+/// path), so one hosted LSP can pin the same key whichever client the user runs.
+Uint8List seqlnDeviceTransportPrivkey({required String mnemonic}) => RustLib
+    .instance
+    .api
+    .crateApiSignerSeqlnDeviceTransportPrivkey(mnemonic: mnemonic);
+
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<NoiseSession>>
 abstract class NoiseSession implements RustOpaqueInterface {
   /// Decrypt a body (`len + 16` bytes) into the plaintext message.

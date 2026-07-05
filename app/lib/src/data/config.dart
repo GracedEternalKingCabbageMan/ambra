@@ -23,6 +23,38 @@ class Backend {
   static String get registry => '$_origin/registry/index.minimal.json';
   static String get faucet => '$_origin/faucet';
 
+  /// The hosted-SeqLN LSP HTTP API (`GET /status`, `POST /swap`), same-origin by
+  /// default. This is the SAME contract the web wallet's seqln.js speaks, so one
+  /// hosted LSP serves both clients. See [lnWsUrl] for the on-device signer link.
+  static String get lsp => '$_origin/lsp';
+
+  // -- Lightning (hosted-SeqLN LSP) transport config -------------------------
+  // Mirrors the web wallet's window.SEQ_LSP_* globals. Empty [lnWsUrl] /
+  // [lnHostPubkey] => Lightning is NOT deployed for this build: the on-device
+  // signer stays offline, the "Instant (Lightning)" swap rail is hidden, and the
+  // wallet behaves exactly as the on-chain-only build. Point these at the harness
+  // (or a future hosted LSP) to bring the non-custodial LN rail online.
+
+  /// wss front of the hosted node's Noise_XK responder (a WS<->TCP relay). Absent
+  /// => the on-device signer cannot come online, so the LN route stays unavailable.
+  static String lnWsUrl = '';
+
+  /// The hosted node's pinned 33-byte transport static pubkey (hex). Absent => LN
+  /// unavailable (the device must authenticate the host it co-signs for).
+  static String lnHostPubkey = '';
+
+  /// Optional bearer token for the LSP HTTP API. When empty the LSP calls reuse
+  /// the node [authHeaders] plumbing (same as /dex, /feerates).
+  static String lnToken = '';
+
+  /// Harness pinning: a fixed 64-hex device transport privkey to use instead of
+  /// the seed-derived one (the twin of the web wallet's SEQ_LSP_DEV_KEY). Empty =>
+  /// derive deterministically from the wallet seed (m/1017'/0'/0').
+  static String lnDeviceKeyOverride = '';
+
+  /// Device signer validating policy: 'permissive' or 'enforce'.
+  static String lnPolicy = 'permissive';
+
   /// Optional `Authorization` header for a node behind HTTP auth. Set by
   /// [NodeConfig]; applied to the sidecar HTTP calls (and, via the core, to
   /// Esplora). Null when the node is open (the public default).

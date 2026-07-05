@@ -6,6 +6,7 @@ import '../rust/api.dart' as core;
 import '../data/btc_state.dart';
 import '../data/config.dart';
 import '../data/format.dart';
+import '../data/lightning_service.dart';
 import '../data/node_config.dart';
 import '../data/price_service.dart';
 import '../data/registry_service.dart';
@@ -29,6 +30,23 @@ class Shell extends StatefulWidget {
 
 class _ShellState extends State<Shell> {
   int _tab = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    // The wallet is unlocked once the Shell is shown. Bring the on-device
+    // Lightning signer online (the mobile twin of the web wallet's post-unlock
+    // initLightning), so the "Instant (Lightning)" swap rail becomes available.
+    // Non-fatal + opt-in: no-op unless a hosted LSP is configured for this build
+    // (Backend.lnWsUrl / lnHostPubkey), and idempotent if already serving.
+    _initLightning();
+  }
+
+  Future<void> _initLightning() async {
+    if (!LightningService.instance.configured) return; // LN not deployed here
+    final m = await WalletRepository.instance.readMnemonic();
+    if (m != null) await LightningService.instance.start(m);
+  }
 
   @override
   Widget build(BuildContext context) {
