@@ -708,7 +708,7 @@ class _SwapReviewSheetState extends State<_SwapReviewSheet> {
               _Row('You pay', _amt(q.assetP, q.amountP)),
               _Row('You receive', _amt(q.assetR, q.amountR)),
               _Row('Network fee', _amt(q.feeAsset, q.feeAmount)),
-              _Row('Settlement', 'Atomic — settles in full or not at all.'),
+              _Row('Settlement', 'Atomic; settles in full or not at all.'),
               _Row('Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'),
             ]),
           ),

@@ -188,7 +188,7 @@ class XchainSwapService {
     final m = await _mnemonic();
     final q = await XchainClient.quote(seqAsset, seqAmount);
     if (!(q.btcLocktime > q.seqLocktime)) {
-      throw Exception('quote rejected: BTC timeout must exceed the SEQ timeout');
+      throw Exception('quote rejected: BTC timeout must exceed the Sequentia timeout');
     }
     final secret = await core.xchainNewSecret();
     final seqClaimPub = await core.xchainSeqClaimPubkey(mnemonic: m);
@@ -224,6 +224,10 @@ class XchainSwapService {
 
   /// Lock the BTC: fund the HTLC P2SH (reusing the ordinary BTC send path).
   static Future<XchainSwapRecord> fundBtc(XchainSwapRecord r, {double feeRate = 0}) async {
+    // Locking spends real (testnet4) Bitcoin into the HTLC. Require payment auth
+    // (fail-closed) FIRST — this leg previously broadcast with no authentication.
+    final ok = await WalletRepository.instance.requirePaymentAuth();
+    if (!ok) throw Exception('Authentication failed or cancelled; BTC not locked.');
     final m = await _mnemonic();
     final tx = await core.btcPrepare(
       mnemonic: m,
@@ -284,7 +288,7 @@ class XchainSwapService {
   /// any mismatch (never reveal into a leg you can't claim / wrong asset).
   static Future<void> verifyLeg(XchainSwapRecord r) async {
     final leg = r.seqLeg;
-    if (leg == null) throw Exception('no SEQ leg to verify');
+    if (leg == null) throw Exception('no Sequentia leg to verify');
     final m = await _mnemonic();
     final rebuilt = await core.xchainSeqRedeemScript(
       mnemonic: m,
@@ -293,13 +297,13 @@ class XchainSwapService {
       seqLocktime: r.seqLocktime,
     );
     if (rebuilt.toLowerCase() != leg.redeemScript.toLowerCase()) {
-      throw Exception('SEQ leg redeemScript does not match — refusing to proceed');
+      throw Exception('Sequentia leg redeemScript does not match; refusing to proceed');
     }
     if (leg.assetId.toLowerCase() != r.seqAsset.toLowerCase()) {
-      throw Exception('SEQ leg pays the wrong asset — refusing to proceed');
+      throw Exception('Sequentia leg pays the wrong asset; refusing to proceed');
     }
     if (leg.amount < r.seqAmount) {
-      throw Exception('SEQ leg amount is below the agreed amount — refusing to proceed');
+      throw Exception('Sequentia leg amount is below the agreed amount; refusing to proceed');
     }
     if (r.step.index < XStep.seqVerified.index) {
       r.step = XStep.seqVerified;
@@ -326,7 +330,7 @@ class XchainSwapService {
     final leg = r.seqLeg!;
     await verifyLeg(r); // re-bind right before reveal
     final ev = await checkAnchor(r);
-    if (!ev.ok) throw Exception('SEQ leg is not anchor-safe yet — not revealing the secret');
+    if (!ev.ok) throw Exception('Sequentia leg is not anchor-safe yet; not revealing the secret');
     final m = await _mnemonic();
     final dest = await core.receiveAddress(mnemonic: m); // Alice's own tb1 (valid SEQ addr)
     final claimHex = await core.xchainSeqClaim(
@@ -375,7 +379,7 @@ class XchainSwapService {
 
   /// Refund the BTC via the CLTV/ELSE branch (only when refundable + matured).
   static Future<XchainSwapRecord> refundBtc(XchainSwapRecord r, {double feeRate = 2}) async {
-    if (!r.refundable) throw Exception('this swap is not refundable (the SEQ claim was already revealed)');
+    if (!r.refundable) throw Exception('this swap is not refundable (the Sequentia claim was already revealed)');
     final m = await _mnemonic();
     final dest = await core.receiveAddress(mnemonic: m);
     // Legacy P2SH HTLC spend ~ 200 vB; size the fee for that, not the P2WPKH estimate.
