@@ -47,13 +47,13 @@ class PriceService extends ChangeNotifier {
     final t = ticker.toUpperCase();
     if (t == 'TSEQ' || t == 'SEQ') return _prices['SEQ'];
     // Parent-chain Bitcoin is priced under WBTC (Wrapped Bitcoin) on /prices.
-    if (t == 'BTC' || t == 'WBTC') return _prices['WBTC'] ?? _prices['BTC'];
+    if (t == 'BTC' || t == 'WBTC') return _prices['BTC'];
     return _prices[t];
   }
 
   double? _refPriceUsd() {
     if (_ref == 'USD') return 1.0;
-    if (_ref == 'BTC') return _prices['WBTC'] ?? _prices['BTC'];
+    if (_ref == 'BTC') return _prices['BTC'];
     return _priceUsd(_ref);
   }
 

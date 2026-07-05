@@ -95,22 +95,20 @@ class SeqAssets {
   static const _builtin = <String, AssetLabel>{
     'c8eccacf0953e1931cd31e434d8319101cc36e6c38b0e2104d8687552fae3e40':
         AssetLabel('tSEQ', 8, subtitle: 'Sequence'),
-    'dc7f45fcfeb17c8ae74e284472d85543395f50e88f4a36cb652e8102703b7027':
+    '048c7943385563c3f74982760f88654a4acb1ecc0bd49803c2f52b304ee7ce11':
         AssetLabel('USDX', 8, subtitle: 'USD Stablecoin'),
-    'f7a756b4e966623065543e52b754324629295c895046a0916a939898ad373667':
+    '701aae7392509f7d0dc9c281ac821c9e5fb523e07673957c093b7a6f724ac92b':
         AssetLabel('EURX', 8, subtitle: 'Euro Stablecoin'),
-    'c28fc933ce41f7a9188da029c6f7377fc961e2d58588372ef4073438610b9283':
+    '3a0f9192219db59f8d7f87d93ac6311095dfe1255d149727b87baaa7d2cc71a1':
         AssetLabel('GOLD', 8, subtitle: 'Gold (troy ounce)'),
-    '3e30ad0ebd13cc7ac1bbd12df1414b213708a6048b745d185fe935d9624024db':
-        AssetLabel('WBTC', 8, subtitle: 'Wrapped Bitcoin'),
-    '50a00211d7074d5f857a3dec6cb84a1f3fefb26e56a94a954a299b28ac9f32df':
+    'f30edec8211e1f395ddd44d380f70b5bea74989df952604fac636d9bb926bc30':
         AssetLabel('SILVR', 8, subtitle: 'Silver (troy ounce)'),
-    'f9b069ac00f4dc57381a304704fac93301f90d3d509d207cfbddc8367d4e9cfb':
+    'df66fc977b42c2c049184422a27e38aea2c3ce60e91a56d0b2c5d63256fc835d':
         AssetLabel('OILX', 8, subtitle: 'Crude Oil (barrel)'),
   };
 
   /// Faucet-dispensable assets (empty string = tSEQ).
-  static const faucetAssets = <String>['', 'USDX', 'EURX', 'GOLD', 'WBTC', 'SILVR', 'OILX'];
+  static const faucetAssets = <String>['', 'USDX', 'EURX', 'GOLD', 'SILVR', 'OILX'];
 
   /// Registry-fetched labels (asset id -> label), populated by [RegistryService]
   /// at startup. Overlaid BELOW the built-in demo set so an asset outside that set
