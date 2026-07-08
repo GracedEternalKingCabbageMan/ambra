@@ -8,6 +8,7 @@ import '../data/api_client.dart';
 import '../data/btc_state.dart';
 import '../data/config.dart';
 import '../data/format.dart';
+import '../data/openamp_service.dart';
 import '../data/price_service.dart';
 import '../data/wallet_cache.dart';
 import '../data/wallet_repository.dart';
@@ -53,7 +54,8 @@ class _SendTabState extends State<SendTab> {
     final b = await WalletCache.loadBalances();
     if (b == null || !mounted || _balances.isNotEmpty) return; // don't clobber a finished sync
     setState(() {
-      _balances = b;
+      // Restricted (OpenAMP) assets are sendable among equals; show last-known.
+      _balances = [...b, ...OpenAmpService.instance.balances];
       final sendable = _sendableIds();
       if (!sendable.contains(_assetId)) {
         _assetId = sendable.isNotEmpty ? sendable.first : SeqAssets.policy;
@@ -112,14 +114,16 @@ class _SendTabState extends State<SendTab> {
           return null;
         }
       }();
+      final ampF = OpenAmpService.instance.refresh(m); // restricted assets, fail-soft
       final s = await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
       final btc = await btcF;
+      final amp = await ampF;
       WalletCache.saveBalances(s.balances); // keep the shared cache fresh
       if (btc != null) BtcState.instance.observe(btc: btc, seqNext: s.nextIndex);
       if (!mounted) return;
       setState(() {
         _error = null; // a successful load clears any earlier (transient) error
-        _balances = s.balances;
+        _balances = [...s.balances, ...amp];
         if (btc != null) _btc = btc;
         // Default the send asset to one you hold (keep the current choice if it's
         // still funded). Never default to tSEQ when its balance is 0.
@@ -169,9 +173,17 @@ class _SendTabState extends State<SendTab> {
   /// doesn't price — so the fee still builds and the relay/producers decide.
   static final BigInt _refScale = BigInt.from(100000000);
 
+  /// True when the send asset is a restricted (OpenAMP enclave) asset — moved via
+  /// the enclave transfer flow, not an on-chain PSET, and addressed by account id.
+  bool get _isRestricted => OpenAmpService.instance.isRestricted(_assetId);
+
   /// Every asset you hold is a valid fee option — no asset is privileged. The
-  /// '' sentinel = the policy asset (tSEQ), one option among equals.
-  List<String> _feeOptions() => _heldIds().map((id) => id == SeqAssets.policy ? '' : id).toList();
+  /// '' sentinel = the policy asset (tSEQ), one option among equals. Restricted
+  /// (enclave-held) assets can't pay an on-chain fee, so they're excluded.
+  List<String> _feeOptions() => _heldIds()
+      .where((id) => !OpenAmpService.instance.isRestricted(id))
+      .map((id) => id == SeqAssets.policy ? '' : id)
+      .toList();
 
   /// The fee defaults to the asset being sent (asset-agnostic). null = pay in
   /// tSEQ, only when tSEQ is what you're sending.
@@ -267,6 +279,7 @@ class _SendTabState extends State<SendTab> {
 
   Future<void> _review() async {
     if (_isBtc) return _reviewBtc();
+    if (_isRestricted) return _reviewOpenamp();
     final label = SeqAssets.labelFor(_assetId);
     final addr = _addr.text.trim();
     final atoms = parseAtoms(_amount.text, label.precision);
@@ -384,6 +397,49 @@ class _SendTabState extends State<SendTab> {
     }
   }
 
+  /// Review + send a restricted (OpenAMP) asset. The enclave holds the funds; the
+  /// recipient is addressed by their OpenAMP account id (AID), not an address, and
+  /// the fee is taken by conversion inside the enclave (no any-asset fee market).
+  /// The wallet drafts the transfer, Schnorr-signs each sighash on-device, and
+  /// completes it — the signing key never leaves the phone.
+  Future<void> _reviewOpenamp() async {
+    final label = SeqAssets.labelFor(_assetId);
+    final recipient = _addr.text.trim();
+    final atoms = parseAtoms(_amount.text, label.precision);
+    if (recipient.isEmpty) return _snack('Enter a recipient account id (AID)');
+    if (atoms == null || atoms <= BigInt.zero) return _snack('Enter a valid amount');
+    if (atoms >= (BigInt.one << 64)) return _snack('Amount is too large.');
+    final bal = BigInt.tryParse(_selected?.atoms ?? '0') ?? BigInt.zero;
+    if (atoms > bal) return _snack('Amount exceeds your ${label.ticker} balance');
+
+    final txid = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AmbraColors.panel,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+      builder: (_) => _OpenampReviewSheet(
+        recipientAid: recipient,
+        assetId: _assetId,
+        atoms: atoms,
+        ticker: label.ticker,
+        amountStr: formatAtoms(atoms.toString(), label.precision),
+      ),
+    );
+    if (txid != null && mounted) {
+      _addr.clear();
+      _amount.clear();
+      ScaffoldMessenger.of(context).showSnackBar(ambraSnack(
+        'Sent · ${txid.substring(0, txid.length < 16 ? txid.length : 16)}…',
+        action: SnackBarAction(
+          label: 'Copy txid',
+          textColor: AmbraColors.amber,
+          onPressed: () => Clipboard.setData(ClipboardData(text: txid)),
+        ),
+      ));
+      _load();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final label = SeqAssets.labelFor(_assetId);
@@ -423,20 +479,28 @@ class _SendTabState extends State<SendTab> {
               ),
               const SizedBox(height: 18),
               AmbraField(
-                label: 'Recipient address',
+                label: _isRestricted ? 'Recipient account id (AID)' : 'Recipient address',
                 controller: _addr,
-                hint: 'tb1… or tsqb1…',
+                hint: _isRestricted ? 'their OpenAMP account id' : 'tb1… or tsqb1…',
                 mono: true,
-                suffix: IconButton(
-                  icon: const Icon(Icons.qr_code_scanner, color: AmbraColors.amber2),
-                  tooltip: 'Scan QR',
-                  onPressed: _scan,
-                ),
+                suffix: _isRestricted
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.qr_code_scanner, color: AmbraColors.amber2),
+                        tooltip: 'Scan QR',
+                        onPressed: _scan,
+                      ),
               ),
               const SizedBox(height: 18),
               AmbraField(label: 'Amount (${label.ticker})', controller: _amount, hint: '0.0'),
               const SizedBox(height: 18),
-              if (_isBtc) ...[
+              if (_isRestricted) ...[
+                // Restricted (OpenAMP) assets move inside the enclave; the fee is
+                // taken by conversion there, so there's no any-asset fee market.
+                const Text('Restricted asset: sent via the OpenAMP enclave to a recipient '
+                    'account id. The fee is taken by conversion inside the enclave.',
+                    style: AmbraText.sub),
+              ] else if (_isBtc) ...[
                 // Parent-chain Bitcoin pays its own fee in BTC (sat/vB is a Bitcoin
                 // unit and only correct here); there's no any-asset fee market.
                 const Text('Bitcoin (testnet4): the fee is paid in BTC at the rate below.', style: AmbraText.sub),
@@ -777,6 +841,87 @@ class _BtcReviewSheetState extends State<_BtcReviewSheet> {
               busy: _busy,
               icon: Icons.fingerprint,
               onPressed: (_busy || _loading || _tx == null) ? null : _confirm),
+          const SizedBox(height: 6),
+          GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
+        ]),
+      ),
+    );
+  }
+}
+
+/// Review + send a restricted (OpenAMP) asset. On confirm it drafts the transfer
+/// with the enclave, Schnorr-signs each returned sighash on-device (the key never
+/// leaves the phone), and completes it — returning the broadcast txid.
+class _OpenampReviewSheet extends StatefulWidget {
+  const _OpenampReviewSheet({
+    required this.recipientAid,
+    required this.assetId,
+    required this.atoms,
+    required this.ticker,
+    required this.amountStr,
+  });
+  final String recipientAid;
+  final String assetId;
+  final BigInt atoms;
+  final String ticker;
+  final String amountStr;
+
+  @override
+  State<_OpenampReviewSheet> createState() => _OpenampReviewSheetState();
+}
+
+class _OpenampReviewSheetState extends State<_OpenampReviewSheet> {
+  bool _busy = false; // drafting + signing + completing
+
+  Future<void> _confirm() async {
+    setState(() => _busy = true);
+    try {
+      final ok = await WalletRepository.instance.requirePaymentAuth();
+      if (!ok) {
+        setState(() => _busy = false);
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(ambraSnack('Authentication cancelled; not sent.'));
+        return;
+      }
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) throw Exception('wallet unavailable');
+      final txid = await OpenAmpService.instance.sendTransfer(
+        mnemonic: m,
+        assetId: widget.assetId,
+        recipientAid: widget.recipientAid,
+        atoms: widget.atoms,
+      );
+      if (mounted) Navigator.pop(context, txid);
+    } catch (e) {
+      if (mounted) {
+        setState(() => _busy = false);
+        ScaffoldMessenger.of(context).showSnackBar(ambraSnack(_pretty(e)));
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          const Text('Confirm transfer', style: AmbraText.h1),
+          const SizedBox(height: 18),
+          AmbraCard(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Column(children: [
+              _Row('Amount', '${widget.amountStr} ${widget.ticker}'),
+              _Row('To (AID)', widget.recipientAid, mono: true),
+              _Row('Via', 'OpenAMP enclave'),
+              _Row('Fee', 'taken by conversion in the enclave'),
+            ]),
+          ),
+          const SizedBox(height: 14),
+          PrimaryButton(
+              label: 'Confirm & sign',
+              busy: _busy,
+              icon: Icons.fingerprint,
+              onPressed: _busy ? null : _confirm),
           const SizedBox(height: 6),
           GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
         ]),
