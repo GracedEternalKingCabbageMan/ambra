@@ -18,14 +18,12 @@ class OpenAmpAsset {
     required this.ticker,
     required this.name,
     required this.precision,
-    this.tier,
     this.clawback = false,
   });
   final String id;
   final String ticker;
   final String name;
   final int precision;
-  final String? tier;
   final bool clawback;
 }
 
@@ -184,7 +182,6 @@ class ApiClient {
           ticker: _clean(ticker, 16),
           name: e['name'] is String ? _clean(e['name'] as String, 48) : ticker,
           precision: (prec < 0 || prec > 8) ? 8 : prec,
-          tier: e['tier']?.toString(),
           clawback: e['clawback'] == true,
         ));
       }
