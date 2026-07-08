@@ -1,97 +1,156 @@
-# Ambra — build spec (v1, testnet, Android-first)
+# Ambra product and design spec (current state, testnet, Android-first)
 
-Ambra is a non-custodial Bitcoin + Sequentia wallet for Android + iOS (Flutter UI over the
-`ambra_core` Rust crate via flutter_rust_bridge, on the SWK kit). The **Sequentia
-web wallet** is the design + feature model; this is it re-shaped for a phone.
+Ambra is a non-custodial dual-chain wallet for Bitcoin (testnet4) + Sequentia:
+a Flutter UI over the `ambra_core` Rust crate via flutter_rust_bridge, built on the
+SWK kit. The Sequentia web wallet is the design and feature model, re-shaped for a
+phone. This document describes the app as implemented today; the short list of
+not-yet-implemented items is at the end under "Roadmap".
 
 ## Custody contract
-Seed never leaves the device. The 12/24-word mnemonic is stored in Android
-Keystore / iOS Keychain (encrypted, biometric-backed), re-read into the core only
-to sign, and never persisted by the core. App-lock (biometric/passcode) gates:
-opening the app, every Confirm & sign, and Reveal phrase / Remove wallet.
 
-## Finality UX (consensus law — never contradict)
-Sequentia has immediate finality: a tx is **settled the instant it lands in a
-certified block** (~30s slot), subject only to a Bitcoin reorg of its anchor (Bitcoin anchoring is supreme). NO confirmation-count bar, NO anchor-depth gating
-— a light wallet cannot watch Bitcoin and just mirrors backend chain state; if a
-sync reports a (rare, Bitcoin-reorg-driven) disconnect, the affected tx
-un-settles. Per-asset balances only — never a summed total across assets. Staked
-SEQ is shown LOCKED, excluded from spendable.
+The seed never leaves the device. The 12-word mnemonic is stored in Android
+Keystore-backed encrypted preferences (iOS Keychain once iOS ships),
+re-read into the core only to derive/sign, and never persisted by the core.
+
+The app lock (biometric or device PIN, `local_auth`) is opt-in (More > Security).
+When enabled it gates opening the app on cold start and re-engages whenever the app
+is backgrounded, popping any sheet above the lock so nothing sensitive survives it.
+Independently of the lock, Reveal recovery phrase always requires authentication,
+and enabling/disabling the lock itself requires authentication.
+
+## Finality UX (consensus law, never contradict)
+
+Bitcoin anchoring is supreme: Sequentia reorganizes whenever Bitcoin reorganizes
+away a block's anchor, overriding checkpoints and immediate finality. A transaction
+is settled when it lands in a certified block (~30s slot), subject always to a
+Bitcoin reorg of its anchor. There is no confirmation-count bar and no anchor-depth
+gating in the general UI: a light wallet cannot watch Bitcoin itself and mirrors
+backend chain state; if a sync reports a (rare, Bitcoin-reorg-driven) disconnect,
+the affected transaction un-settles. The two places anchoring surfaces explicitly:
+
+- Swap review sheets state "Anchor-bound to Bitcoin (reverts only if Bitcoin
+  reverts)"; nothing on-chain is ever labeled "final".
+- The cross-chain (BTC->asset) swap hard-gates its preimage reveal on verifying the
+  Sequentia leg's anchor evidence, because there real BTC is at stake on the answer.
+- Only the pure-Lightning rail, where nothing settles on-chain, is labeled instant
+  and final.
+
+Staked tSEQ is shown LOCKED and excluded from spendable.
+
+## Balance model (no privileged asset)
+
+The Balance headline is the total portfolio value across every held asset, valued
+in a user-chosen reference currency (USD default; picker in the top bar, price-server
+fed). Every asset counts equally toward the total: BTC (parent chain), tSEQ, issued
+assets, and OpenAMP restricted assets. When prices are unavailable the headline
+shows a dash and the per-asset rows carry the amounts. Below the headline, one equal
+row per held asset; zero balances are hidden for every asset alike, tSEQ included.
+There is no "native asset" label anywhere: the Sequence token (tSEQ) is one row among
+equals, and its only special role is staking.
 
 ## Navigation
-- Onboarding Navigator stack (no bottom bar): Boot → Welcome → {Create: word-grid
-  → verify-words → backed-up} | {Import} → app-lock setup → pushReplacement → Shell.
-- Shell = native bottom tab bar over an IndexedStack (state per tab):
-  **Balance · Send · Receive · History · More**.
-- More hub routes to: Assets, Stake, Settings, Faucet, and UI-only stubs
-  Lightning / T-DEX / Managed assets.
-- Modals = native bottom sheets: Review-&-sign (shared, biometric CTA),
-  reference-currency picker, fee-asset picker, RBF-bump / RBF-replace / CPFP,
-  QR scanner, share.
+
+- Onboarding Navigator stack (no bottom bar): Boot > Welcome > {Create: word-grid >
+  verify-words > backed-up} | {Import} > pushReplacement > Shell. (The app lock is
+  configured later, in More > Security, not during onboarding.)
+- Shell = bottom tab bar over an IndexedStack (state kept per tab):
+  **Balance · Send · Receive · Swap · History · More**. Android back returns to
+  Balance from any tab and only exits from Balance.
+- Swap tab: same-chain SeqDEX composer, plus entries to "Buy with Bitcoin
+  (cross-chain)" and, when a hosted LSP is configured, "Instant (Lightning)".
+- More hub: Node (view/change backend), Testnet faucet, Security (app lock),
+  Wallet (reveal phrase / remove wallet), Assets & staking (issue/manage assets,
+  stake tSEQ).
+- Modals = bottom sheets: review-&-sign, reference-currency picker, fee-asset
+  picker, rescue (RBF-bump / RBF-replace / CPFP), QR scanner (full-screen route),
+  recovery-phrase reveal.
+
+## Fees (open fee market)
+
+Sequentia sends default the fee to the asset being sent; a fee-asset picker offers
+any asset the network publishes an exchange rate for (`/feerates`). A manual
+fee-rate override is always denominated in the chosen fee asset's own units per
+vByte, never "sat/vB" (sats are Bitcoin-only). Parent-chain BTC sends pay their own
+fee in BTC at sat/vB, with no fee-asset market (that is Bitcoin, not Sequentia).
 
 ## Design tokens (ported 1:1 from the web wallet)
-Colors: bg `#0d1014`, glowTop `#1a212b`, panel `#161b22`, panelDeep `#0b0e12`,
-line `#262d36`, txt `#e6edf3`, dim `#8b949e`, amber `#f0a500`, amber2 `#ffb733`,
-green `#27ae60`, red `#e0564b`, blue `#4aa3df`, buttonSurface `#1d242d`,
-primaryOnGold `#1a1200`, warnFill `#2a1d0a`, warnBorder `#6b4e12`, warnText
-`#ffcf7a`, monoText `#c9d4df`, qrWhite `#ffffff`, scrim `#000` @67%.
-Badges: in {`#27ae60`/`#10241a`/`#1f4d33`}, out {`#ffb733`/`#241c0a`/`#5a4412`},
-iss {`#4aa3df`/`#0d1f2a`/`#244a63`}. Canvas = radial gradient (`#1a212b`→`#0d1014`)
-behind the header. Single-accent discipline: gold is the only brand accent + the
-only gradient; green/red/blue are semantic status only. Never `#000`/`#fff` for
-surfaces; the QR card is the one pure white.
 
-Type: system sans (SF Pro / Roboto) for all prose/UI; monospace (SF Mono / Roboto
-Mono / Menlo) for ALL machine-precise values (addresses, 64-hex asset ids, txids,
-atom amounts) — the sans/mono split is the load-bearing trust signal. Scale: hero
-balance 42/w800/-0.02 + 17/w700 amber2 unit suffix; h1 21/-0.01; micro-label
-`.lbl` 12/dim/uppercase/0.06; body 14; kv 12.5–14; pills 11; tabs 13.5; mono 13.
-Bold reserved for numbers/identifiers/actions.
+Colors (`app/lib/src/theme/theme.dart`): bg `#0d1014`, glowTop `#1a212b`, panel
+`#161b22`, panelDeep `#0b0e12`, line `#262d36`, txt `#e6edf3`, dim `#8b949e`, amber
+`#f0a500`, amber2 `#ffb733`, green `#27ae60`, red `#e0564b`, blue `#4aa3df`,
+buttonSurface `#1d242d`, primaryOnGold `#1a1200`, warnFill `#2a1d0a`, warnBorder
+`#6b4e12`, warnText `#ffcf7a`, monoText `#c9d4df`, dangerBorder `#5a2a26`, qrWhite
+`#ffffff`. Canvas = radial gradient (`#1a212b` > `#0d1014`) behind the header.
+Single-accent discipline: gold is the only brand accent and the only gradient;
+green/red/blue are semantic status only. Never `#000`/`#fff` for surfaces; the QR
+card is the one pure white.
 
-Rounding: cards 16, controls/buttons 10–12, inputs 10, chips 8, pills capsule.
+Type: system sans (SF Pro / Roboto) for all prose/UI; monospace for ALL
+machine-precise values (addresses, 64-hex asset ids, txids, atom amounts). The
+sans/mono split is the load-bearing trust signal. Hero balance 42/w800 + amber2
+unit suffix; micro-label 12/dim/uppercase; bold reserved for numbers, identifiers,
+and actions.
 
-Components: AmbraCard (panel fill, 1px line, r16, p20, no shadow). PrimaryButton
-(the one gold 135° gradient CTA per screen, `#1a1200` text, full-width, bottom
-action bar). SecondaryButton (`#1d242d` + line). DangerButton (red text +
-`#5a2a26` border, no fill). BottomTabBar (nested-pill active). Inputs (panelDeep
-inset, mono variant, `.lbl` above + caption below). KvRow (dim key / right mono
-value / hairline). HistoryRow (semantic pill + mono txid + signed amount).
-BadgePill. WarnCallout (`#2a1d0a`/`#6b4e12`/`#ffcf7a`). Toast (bottom-center,
-explorer deep-link, auto-dismiss). MnemonicWordGrid (3-col panelDeep chips,
-FLAG_SECURE). QR card (white). Signature: any-asset **fee picker** + tethered
-**reference dual-field** (segmented Asset|REF + keypad + "You'll send X TICKER").
+Rounding: cards 16, controls/buttons 10-12, inputs 10, chips 8, pills capsule.
 
-Brand: circular near-black coin with the two-stroke gold **S** (matte ground melts
-into the canvas; only the gold S floats) → app icon. Voice: self-custodial,
-any-asset fees with no privileged asset, review-before-sign, Bitcoin a first-class
-sibling with explicit chain badges. Resist Material defaults (colored surfaces,
-secondary accents, heavy shadows).
+Components (`app/lib/src/widgets/widgets.dart`): AmbraCard (panel fill, 1px line,
+r16, no shadow), PrimaryButton (the one gold gradient CTA per screen, `#1a1200`
+text), SecondaryButton, DangerButton (red text, no fill), bottom bar with
+nested-pill active state, panelDeep inset inputs with mono variant, KvRow, history
+rows (semantic pill + mono txid + signed amount), WarnCallout, MnemonicWordGrid,
+white QR card. Signature interactions: the any-asset fee picker and the tethered
+reference dual-field ("You'll send X TICKER").
 
-## ambra_core API (FRB), by milestone
-Have: network_name, generate_mnemonic, descriptor_from_mnemonic, receive_address,
-confidential_receive_address.
-- M3: `validate_mnemonic(m)`; `receive_address_at(m, index?, confidential) -> {address,index}`.
-- M4: `sync_wallet(m, esplora) -> {tip_height,tip_hash,balances,txs,next_receive_index}`;
-  `wallet_balances(m)`; `tip_height(m)`; `asset_metadata(ids, registry_url)`;
-  `prices(prices_url)`; `faucet_request(faucet_url,address,asset?)`;
-  `tx_status(esplora,txid)`.
-- M5: `validate_address(a)`; `wallet_transactions(m)`; `fee_exchange_rates(url)`;
-  `build_send_tx(m,recipients,fee_rate?,fee_asset?) -> pset`; `pset_details(m,pset)`;
-  `sign_pset(m,pset)`; `finalize_pset(m,pset)`; `broadcast_tx(esplora,pset_or_tx)`.
-- M6: `build_rbf_bump_tx`, `build_rbf_replace_tx`, `build_cpfp_tx`, `cpfp_suggested_feerate`.
-- M7: `build_issue_tx`, `build_reissue_tx`, `build_burn_tx`, `staker_public_key`,
-  `build_stake_tx` (enforce ≥40,000 tSEQ, csv 43200, non-confidential SEQ).
+Brand: circular near-black coin with the two-stroke gold **S** (the app icon,
+`assets/icon/sequentia-s.png`). Voice: self-custodial, any-asset fees with no
+privileged asset, review-before-sign, Bitcoin a first-class sibling with explicit
+chain badges. Resist Material defaults (colored surfaces, secondary accents, heavy
+shadows).
 
-## Roadmap
-- **M3** Onboarding + secure custody — create/import survives restart, locked.
-- **M4** Sync + multi-asset balance + receive + settings/faucet — real testnet funds.
-- **M5** Send + any-asset fee + reference dual-field + history + sign — real spending.
-- **M6** RBF/CPFP rescue (cross-asset, reference-valued).
-- **M7** Assets (issue/reissue/burn) + staking.
-- **M8** UI stubs (Lightning/T-DEX/Managed) + iOS bring-up + hardening.
+## ambra_core API surface (implemented)
 
-## v1 defaults (open questions, changeable)
-Single wallet (mirror web); device biometric/passcode lock (wallet-PIN later);
-foreground + on-resume + pull-to-refresh sync (no push yet); keep testnet/faucet
-cues; reference currency defaults to USD. Backend = http://159.195.15.140
-(`/api`, `/testnet4/api`, `/feerates`, `/prices`, `/registry`, `/faucet`).
+Generated bindings live in `app/lib/src/rust/`; the Rust source of truth is
+`ambra_core/src/api/mod.rs` and `ambra_core/src/api/signer.rs`.
+
+- Keys/addresses: `network_name`, `generate_mnemonic`, `validate_mnemonic`,
+  `descriptor_from_mnemonic`, `receive_address`, `confidential_receive_address`,
+  `receive_address_at`, `validate_address`.
+- Sync/state: `set_data_dir` (on-disk wallet persistence), `set_auth_header`,
+  `sync_wallet`, `wallet_transactions`, `clear_wallet_cache`.
+- Send: `build_send_tx` (multi-recipient, any-asset fee, optional fee rate),
+  `sign_pset`, `finalize_and_broadcast`, `pset_fee`.
+- Rescue: `build_rbf_bump_tx`, `build_rbf_replace_tx`, `build_cpfp_tx`,
+  `cpfp_suggested_feerate`.
+- Assets/staking: `build_issue_tx`, `build_reissue_tx`, `build_burn_tx`,
+  `staker_public_key`, `build_stake_tx` (enforces the 40,000 tSEQ minimum and a
+  time-based CSV of ~15 days).
+- Bitcoin (testnet4) wallet: `btc_sync`, `btc_prepare`, `btc_broadcast`.
+- SeqDEX same-chain swap: `seqdex_build_swap_request`, `seqdex_sign_accept`.
+- Cross-chain BTC->asset HTLC: `xchain_new_secret`, `xchain_seq_claim_pubkey`,
+  `xchain_btc_refund_pubkey`, `xchain_btc_htlc`, `xchain_seq_redeem_script`,
+  `xchain_find_btc_funding`, `xchain_verify_seq_leg_safe` (the anchor gate),
+  `xchain_seq_claim`, `xchain_seq_broadcast`, `xchain_btc_refund`.
+- OpenAMP: `openamp_xonly_pubkey`, `openamp_sign_sighash` (on-device Schnorr signer
+  for the enclave's transfer approvals).
+- Lightning device signer (`api/signer.rs`): `SeqlnSigner` (from mnemonic or
+  hsm_secret, `process_frame`, enforce/permissive policy), `NoiseSession`
+  (Noise_XK initiator: handshake, encrypt/decrypt), `device_pubkey`,
+  `seqln_device_transport_privkey` (BIP32 m/1017'/0'/0').
+
+## Defaults
+
+Single wallet (mirrors the web wallet); opt-in device biometric/passcode lock;
+foreground + on-resume + pull-to-refresh sync (no push); testnet/faucet cues kept;
+reference currency defaults to USD. Backend defaults to the public testnet node
+`http://159.195.15.140` and is user-configurable (More > Node, optional HTTP auth);
+endpoints: `/api`, `/testnet4/api`, `/dex`, `/feerates`, `/prices`,
+`/registry/index.minimal.json`, `/faucet`, `/openamp`, `/lsp`.
+
+## Roadmap (not yet implemented)
+
+- Unstaking/unbonding flow (staking is one-way in the app today).
+- A live hosted LSP deployment; the Lightning rail ships dormant until
+  `Backend.lnWsUrl`/`lnHostPubkey` point at one.
+- iOS bring-up (scaffold exists; needs a macOS/Xcode machine) and release signing
+  for Android (currently debug-signed).
+- Push/background sync.
