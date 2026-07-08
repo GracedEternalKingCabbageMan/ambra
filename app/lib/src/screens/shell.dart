@@ -8,6 +8,7 @@ import '../data/config.dart';
 import '../data/format.dart';
 import '../data/lightning_service.dart';
 import '../data/node_config.dart';
+import '../data/openamp_service.dart';
 import '../data/price_service.dart';
 import '../data/registry_service.dart';
 import '../data/wallet_cache.dart';
@@ -40,12 +41,20 @@ class _ShellState extends State<Shell> {
     // Non-fatal + opt-in: no-op unless a hosted LSP is configured for this build
     // (Backend.lnWsUrl / lnHostPubkey), and idempotent if already serving.
     _initLightning();
+    // Register this wallet's x-only key with the OpenAMP enclave so restricted
+    // assets can be held/received/sent. Fails soft if the enclave isn't deployed.
+    _initOpenamp();
   }
 
   Future<void> _initLightning() async {
     if (!LightningService.instance.configured) return; // LN not deployed here
     final m = await WalletRepository.instance.readMnemonic();
     if (m != null) await LightningService.instance.start(m);
+  }
+
+  Future<void> _initOpenamp() async {
+    final m = await WalletRepository.instance.readMnemonic();
+    if (m != null) await OpenAmpService.instance.ensureRegistered(m);
   }
 
   @override
@@ -93,6 +102,7 @@ class _BalanceTabState extends State<BalanceTab> {
   String? _btcCachedSats; // last-known BTC sats from disk, shown if a fresh scan fails
   bool _btcStale = false; // true when the shown BTC balance is last-known (scan failed)
   List<core.AssetBalance>? _cachedBalances; // last-known, shown instantly while syncing
+  List<core.AssetBalance> _openamp = const []; // restricted-asset balances (enclave)
   String? _error;
   bool _loading = true;
   DateTime? _lastSync; // time of the last successful Sequentia sync (for the chip)
@@ -154,8 +164,12 @@ class _BalanceTabState extends State<BalanceTab> {
           return null;
         }
       }();
+      // Restricted (OpenAMP) balances load in parallel; a failure must not break
+      // the on-chain balance, so it resolves to the last-known list on error.
+      final ampF = OpenAmpService.instance.refresh(m);
       final s = await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
       final btc = await btcF;
+      final amp = await ampF;
       WalletCache.saveBalances(s.balances); // persist for the next launch
       if (btc != null) WalletCache.saveBtc(btc.balanceSats); // persist last-known BTC
       // Feed both chains' indices into the shared cross-chain receive cycling.
@@ -163,6 +177,7 @@ class _BalanceTabState extends State<BalanceTab> {
       if (mounted) {
         setState(() {
           _sync = s;
+          _openamp = amp;
           _lastSync = DateTime.now();
           _syncFailed = false;
           if (btc != null) {
@@ -222,10 +237,15 @@ class _BalanceTabState extends State<BalanceTab> {
     // last-known values instantly instead of a spinner. tSEQ is not privileged,
     // so a 0 balance is hidden like any other asset's.
     final balances = _sync?.balances ?? _cachedBalances;
+    // Restricted (OpenAMP) assets sit among equals — appended to the on-chain
+    // rows, counted equally in the total, with no privileged label.
     final held = balances == null
-        ? const <core.AssetBalance>[]
-        : balances.where((b) => (BigInt.tryParse(b.atoms) ?? BigInt.zero) > BigInt.zero).toList();
-    final total = balances == null ? null : _totalRef(balances);
+        ? _openamp.toList()
+        : [
+            ...balances.where((b) => (BigInt.tryParse(b.atoms) ?? BigInt.zero) > BigInt.zero),
+            ..._openamp,
+          ];
+    final total = balances == null ? null : _totalRef([...balances, ..._openamp]);
     // Bitcoin is first-class: shown when held (a 0 balance is hidden like any
     // asset). Resolve to the last-known balance if a fresh testnet4 scan failed.
     final btcSatsStr = _btc?.balanceSats ?? _btcCachedSats;
@@ -472,6 +492,8 @@ class _ReceiveTabState extends State<ReceiveTab> {
   String? _address;
   String? _bitcoinAddress; // the tb1 form, shown alongside a confidential address
   String? _error;
+  String? _ampAid; // OpenAMP account id (how senders address restricted assets)
+  String? _ampAddress; // an enclave deposit address for a restricted asset
 
   @override
   void initState() {
@@ -515,6 +537,21 @@ class _ReceiveTabState extends State<ReceiveTab> {
         setState(() {
           _address = info.address;
           _bitcoinAddress = bitcoin;
+        });
+      }
+      // Restricted-asset (OpenAMP) receive identifiers, best-effort. Senders use
+      // the AID; the enclave deposit address funds the account on-chain.
+      await OpenAmpService.instance.ensureRegistered(m);
+      final aid = OpenAmpService.instance.aid;
+      String? ampAddr;
+      final assets = OpenAmpService.instance.assets;
+      if (aid != null && assets.isNotEmpty) {
+        ampAddr = await OpenAmpService.instance.depositAddress(assets.first.id);
+      }
+      if (mounted) {
+        setState(() {
+          _ampAid = aid;
+          _ampAddress = ampAddr;
         });
       }
     } catch (e) {
@@ -627,6 +664,38 @@ class _ReceiveTabState extends State<ReceiveTab> {
           title: const Text('Show confidential address', style: AmbraText.body),
           subtitle: const Text('A private address that hides the amount and asset.', style: AmbraText.sub),
         ),
+        if (_ampAid != null) ...[
+          const SizedBox(height: 18),
+          AmbraCard(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              const SectionLabel('Restricted assets (OpenAMP)'),
+              const SizedBox(height: 12),
+              const Text('Your account id — share it to receive restricted assets.',
+                  style: AmbraText.sub),
+              const SizedBox(height: 8),
+              SelectableText(_ampAid!, style: AmbraText.mono.copyWith(fontSize: 14)),
+              const SizedBox(height: 10),
+              SecondaryButton(
+                label: 'Copy account id',
+                icon: Icons.copy,
+                onPressed: () => _copy(_ampAid!, 'Account id copied'),
+              ),
+              if (_ampAddress != null) ...[
+                const SizedBox(height: 16),
+                const Text('Enclave deposit address (funds the account on-chain):',
+                    style: AmbraText.sub),
+                const SizedBox(height: 8),
+                SelectableText(_ampAddress!, style: AmbraText.mono.copyWith(fontSize: 14)),
+                const SizedBox(height: 10),
+                SecondaryButton(
+                  label: 'Copy deposit address',
+                  icon: Icons.copy,
+                  onPressed: () => _copy(_ampAddress!, 'Deposit address copied'),
+                ),
+              ],
+            ]),
+          ),
+        ],
       ],
     );
   }

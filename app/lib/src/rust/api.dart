@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `btc_params`, `clear_scan_marks`, `err`, `esplora_client`, `hexbytes`, `last_scan`, `mark_scanned`, `rerr`, `scan_into`, `scanned_recently`, `with_synced_wollet`, `wollet_cache`
+// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `btc_params`, `clear_scan_marks`, `err`, `esplora_client`, `hexbytes`, `last_scan`, `mark_scanned`, `openamp_keypair`, `rerr`, `scan_into`, `scanned_recently`, `tohex`, `with_synced_wollet`, `wollet_cache`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
 String networkName() => RustLib.instance.api.crateApiNetworkName();
@@ -463,6 +463,22 @@ Future<String> buildStakeTx({
   satoshi: satoshi,
   feeRateSatKvb: feeRateSatKvb,
   feeAsset: feeAsset,
+);
+
+/// The 32-byte x-only public key (BIP340) at m/5/0, as 64-char hex — the key an
+/// OpenAMP enclave user registers under (`POST /v1/users {pubkeys:[..]}`).
+String openampXonlyPubkey({required String mnemonic}) =>
+    RustLib.instance.api.crateApiOpenampXonlyPubkey(mnemonic: mnemonic);
+
+/// Schnorr-sign a 32-byte enclave transfer sighash (64-char hex) under the same
+/// dedicated m/5/0 key, returning the 64-byte (128-char hex) BIP340 signature.
+/// Verifies under the key from [`openamp_xonly_pubkey`].
+String openampSignSighash({
+  required String mnemonic,
+  required String sighashHex,
+}) => RustLib.instance.api.crateApiOpenampSignSighash(
+  mnemonic: mnemonic,
+  sighashHex: sighashHex,
 );
 
 /// A receive address together with the derivation index it came from.

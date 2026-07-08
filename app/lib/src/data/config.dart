@@ -23,6 +23,13 @@ class Backend {
   static String get registry => '$_origin/registry/index.minimal.json';
   static String get faucet => '$_origin/faucet';
 
+  /// The OpenAMP restricted-asset enclave API base (`/v1/users`, `/v1/assets`,
+  /// `/v1/transfers`), same-origin by default (live at `<origin>/openamp`). The
+  /// wallet holds the enclave's signing key on-device (m/5/0 x-only) and the
+  /// enclave only ever asks it to sign; restricted balances show as ordinary
+  /// rows. When the endpoint is absent/offline the OpenAMP layer stays dormant.
+  static String get openamp => '$_origin/openamp';
+
   /// The hosted-SeqLN LSP HTTP API (`GET /status`, `POST /swap`), same-origin by
   /// default. This is the SAME contract the web wallet's seqln.js speaks, so one
   /// hosted LSP serves both clients. See [lnWsUrl] for the on-device signer link.
@@ -116,9 +123,21 @@ class SeqAssets {
   /// hex-derived placeholder with an assumed precision.
   static final Map<String, AssetLabel> _registry = {};
 
+  /// OpenAMP restricted-asset labels (asset id -> label), populated from the
+  /// enclave's `GET /v1/assets` by [OpenAmpService]. Kept separate from the
+  /// public registry so the two overlays don't clobber each other.
+  static final Map<String, AssetLabel> _openamp = {};
+
   /// Replace the registry overlay (from a fetch or the on-disk cache).
   static void mergeRegistry(Map<String, AssetLabel> m) {
     _registry
+      ..clear()
+      ..addAll(m);
+  }
+
+  /// Replace the OpenAMP overlay (from the enclave's asset list).
+  static void mergeOpenamp(Map<String, AssetLabel> m) {
+    _openamp
       ..clear()
       ..addAll(m);
   }
@@ -127,6 +146,9 @@ class SeqAssets {
     // Curated demo assets are authoritative (correct even offline).
     final hit = _builtin[assetId];
     if (hit != null) return hit;
+    // Restricted (OpenAMP) assets carry their ticker/precision from the enclave.
+    final amp = _openamp[assetId];
+    if (amp != null) return amp;
     // The public registry supplies the real ticker + precision + name — use it so
     // we don't fabricate a ticker from the hex id or assume precision 8.
     final reg = _registry[assetId];

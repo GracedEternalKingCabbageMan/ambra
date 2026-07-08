@@ -970,3 +970,106 @@ pub fn build_stake_tx(
         apply_fee_and_finish(b, wollet, fee_rate_sat_kvb, fee_asset.as_ref())
     })
 }
+
+// --- OpenAMP restricted-asset enclave signing --------------------------------
+//
+// OpenAMP holds a user's restricted (clawback-capable) assets in an enclave
+// keyed by a DEDICATED taproot x-only key the wallet derives from its own
+// mnemonic. The enclave never sees the private key: it hands the wallet the
+// sighashes to sign for a transfer, the wallet Schnorr-signs each under the
+// dedicated key, and the enclave completes the tx. This is the ONLY native
+// crypto OpenAMP needs; everything else is plain HTTP in the Dart layer.
+
+/// Lowercase hex-encode bytes (dependency-free; mirrors the signer module).
+fn tohex(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push_str(&format!("{x:02x}"));
+    }
+    s
+}
+
+/// Derive the dedicated OpenAMP keypair from the wallet mnemonic.
+///
+/// Uses the standard BIP39 seed (empty passphrase) — the same seed source as
+/// the SeqLN device key — through a DEDICATED, otherwise-unused BIP32 path
+/// **m/5/0**. That index is distinct from every other role Ambra derives: the
+/// staker key at m/2/0, and the SeqLN device transport key at m/1017'/0'/0'.
+/// A single key is used both to register the enclave user (its x-only pubkey)
+/// and to Schnorr-sign transfer sighashes, so the two must agree bit-for-bit.
+fn openamp_keypair(mnemonic: &str) -> Result<lwk_wollet::bitcoin::secp256k1::Keypair> {
+    use lwk_wollet::bitcoin::secp256k1::{Keypair, Secp256k1};
+    // Standard 64-byte BIP39 seed via the "32 zero bytes || mnemonic" on-disk
+    // form (same path as seqln_device_transport_privkey); yields secret.seed.
+    let mut bytes = vec![0u8; 32];
+    bytes.extend_from_slice(mnemonic.trim().as_bytes());
+    let secret = seqln_signer::hsm_secret::parse(&bytes).map_err(|e| err(format!("{e:?}")))?;
+    let secp = Secp256k1::new();
+    // The BIP32 network version affects only the (unused) xprv serialization, not
+    // the derived private-key bytes, so testnet here is fine and cross-consistent.
+    let master = lwk_wollet::bitcoin::bip32::Xpriv::new_master(
+        lwk_wollet::bitcoin::Network::Testnet,
+        &secret.seed,
+    )
+    .map_err(rerr)?;
+    let path = DerivationPath::from(vec![
+        ChildNumber::Normal { index: 5 },
+        ChildNumber::Normal { index: 0 },
+    ]);
+    let child = master.derive_priv(&secp, &path).map_err(rerr)?;
+    Ok(Keypair::from_secret_key(&secp, &child.private_key))
+}
+
+/// The 32-byte x-only public key (BIP340) at m/5/0, as 64-char hex — the key an
+/// OpenAMP enclave user registers under (`POST /v1/users {pubkeys:[..]}`).
+#[flutter_rust_bridge::frb(sync)]
+pub fn openamp_xonly_pubkey(mnemonic: String) -> Result<String> {
+    let kp = openamp_keypair(&mnemonic)?;
+    let (xonly, _parity) = kp.x_only_public_key();
+    Ok(xonly.to_string())
+}
+
+/// Schnorr-sign a 32-byte enclave transfer sighash (64-char hex) under the same
+/// dedicated m/5/0 key, returning the 64-byte (128-char hex) BIP340 signature.
+/// Verifies under the key from [`openamp_xonly_pubkey`].
+#[flutter_rust_bridge::frb(sync)]
+pub fn openamp_sign_sighash(mnemonic: String, sighash_hex: String) -> Result<String> {
+    use lwk_wollet::bitcoin::secp256k1::{Message, Secp256k1};
+    let kp = openamp_keypair(&mnemonic)?;
+    let bytes = hexbytes(&sighash_hex)?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| err("sighash must be 32 bytes".to_string()))?;
+    let msg = Message::from_digest(arr);
+    let secp = Secp256k1::new();
+    let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp);
+    Ok(tohex(&sig.serialize()))
+}
+
+#[cfg(test)]
+mod openamp_tests {
+    use super::*;
+    use lwk_wollet::bitcoin::secp256k1::{schnorr, Message, Secp256k1, XOnlyPublicKey};
+
+    // Standard BIP39 test vector mnemonic.
+    const MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    #[test]
+    fn openamp_sign_verifies_under_pubkey() {
+        let xonly_hex = openamp_xonly_pubkey(MNEMONIC.to_string()).unwrap();
+        assert_eq!(xonly_hex.len(), 64, "x-only pubkey is 32 bytes");
+
+        let sighash = "3333333333333333333333333333333333333333333333333333333333333344";
+        let sig_hex = openamp_sign_sighash(MNEMONIC.to_string(), sighash.to_string()).unwrap();
+        assert_eq!(sig_hex.len(), 128, "schnorr sig is 64 bytes");
+
+        let secp = Secp256k1::new();
+        let xonly = XOnlyPublicKey::from_str(&xonly_hex).unwrap();
+        let sig = schnorr::Signature::from_slice(&hexbytes(&sig_hex).unwrap()).unwrap();
+        let msg_arr: [u8; 32] = hexbytes(sighash).unwrap().try_into().unwrap();
+        let msg = Message::from_digest(msg_arr);
+        assert!(secp.verify_schnorr(&sig, &msg, &xonly).is_ok());
+    }
+}
