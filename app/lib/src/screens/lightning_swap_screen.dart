@@ -72,11 +72,11 @@ class _LightningSwapScreenState extends State<LightningSwapScreen> {
   /// falling back to the ticker itself for anything outside the built-in set.
   String _idForTicker(String ticker) {
     for (final entry in {
-      'USDX': '048c7943385563c3f74982760f88654a4acb1ecc0bd49803c2f52b304ee7ce11',
-      'EURX': '701aae7392509f7d0dc9c281ac821c9e5fb523e07673957c093b7a6f724ac92b',
+      'USDX': '2a515539da5e6a60caa7766ecd65bac0c10d15717ddd2088844ba58f4d04b9de',
+      'EURX': 'e39685e718516156679088d9400d11a1eb82bf7cc27c5b9f5a614b8c91246d13',
       'GOLD': '3a0f9192219db59f8d7f87d93ac6311095dfe1255d149727b87baaa7d2cc71a1',
-      'SILVR': 'f30edec8211e1f395ddd44d380f70b5bea74989df952604fac636d9bb926bc30',
-      'OILX': 'df66fc977b42c2c049184422a27e38aea2c3ce60e91a56d0b2c5d63256fc835d',
+      'SILVR': '57dfa6b0eff594cc3ef1de5555e0526d1eb5590289e014e7663b292edcd63f48',
+      'OILX': '4dfe69c334a9cdf4005ddf3889bba1bc397703fa8da669254877f3209caf7c8f',
     }.entries) {
       if (entry.key == ticker) return entry.value;
     }

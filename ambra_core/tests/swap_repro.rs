@@ -7,7 +7,7 @@ const MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 const ESPLORA: &str = "http://159.195.15.140/api";
 const TSEQ: &str = "c8eccacf0953e1931cd31e434d8319101cc36e6c38b0e2104d8687552fae3e40";
-const SILVR: &str = "50a00211d7074d5f857a3dec6cb84a1f3fefb26e56a94a954a299b28ac9f32df";
+const SILVR: &str = "57dfa6b0eff594cc3ef1de5555e0526d1eb5590289e014e7663b292edcd63f48";
 
 #[test]
 fn repro_swap_request() {

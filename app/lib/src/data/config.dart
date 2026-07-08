@@ -1,5 +1,5 @@
 /// App version shown in the More footer. Bump alongside pubspec on release.
-const kAppVersion = '0.10.2';
+const kAppVersion = '0.10.3';
 
 /// Backend node the wallet talks to. Defaults to the public Sequentia testnet
 /// node; users can point Ambra at their own (persisted via [NodeConfig]). Every
@@ -102,15 +102,15 @@ class SeqAssets {
   static const _builtin = <String, AssetLabel>{
     'c8eccacf0953e1931cd31e434d8319101cc36e6c38b0e2104d8687552fae3e40':
         AssetLabel('tSEQ', 8, subtitle: 'Sequence'),
-    '048c7943385563c3f74982760f88654a4acb1ecc0bd49803c2f52b304ee7ce11':
+    '2a515539da5e6a60caa7766ecd65bac0c10d15717ddd2088844ba58f4d04b9de':
         AssetLabel('USDX', 8, subtitle: 'USD Stablecoin'),
-    '701aae7392509f7d0dc9c281ac821c9e5fb523e07673957c093b7a6f724ac92b':
+    'e39685e718516156679088d9400d11a1eb82bf7cc27c5b9f5a614b8c91246d13':
         AssetLabel('EURX', 8, subtitle: 'Euro Stablecoin'),
     '3a0f9192219db59f8d7f87d93ac6311095dfe1255d149727b87baaa7d2cc71a1':
         AssetLabel('GOLD', 8, subtitle: 'Gold (troy ounce)'),
-    'f30edec8211e1f395ddd44d380f70b5bea74989df952604fac636d9bb926bc30':
+    '57dfa6b0eff594cc3ef1de5555e0526d1eb5590289e014e7663b292edcd63f48':
         AssetLabel('SILVR', 8, subtitle: 'Silver (troy ounce)'),
-    'df66fc977b42c2c049184422a27e38aea2c3ce60e91a56d0b2c5d63256fc835d':
+    '4dfe69c334a9cdf4005ddf3889bba1bc397703fa8da669254877f3209caf7c8f':
         AssetLabel('OILX', 8, subtitle: 'Crude Oil (barrel)'),
   };
 

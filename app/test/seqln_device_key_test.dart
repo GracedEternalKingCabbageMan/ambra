@@ -7,13 +7,18 @@
 //
 // (Requires the host cdylib: `cargo build` in ../ambra_core first.)
 
+import 'dart:io' show Platform;
+
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated_io.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ambra/src/rust/api/signer.dart';
 import 'package:ambra/src/rust/frb_generated.dart';
 
-const _hostLib = '/home/aejkohl/ambra/ambra_core/target/debug/libambra_core.so';
+// Flutter runs tests with the package dir (app/) as the working directory;
+// override with AMBRA_CORE_LIB for out-of-tree builds.
+final _hostLib = Platform.environment['AMBRA_CORE_LIB'] ??
+    '../ambra_core/target/debug/libambra_core.so';
 
 // A fixed BIP39 test mnemonic (the all-"abandon" vector); testnet only.
 const _mnemonic = 'abandon abandon abandon abandon abandon abandon '
