@@ -163,37 +163,55 @@ class _SendTabState extends State<SendTab> {
   /// The published fee rate (atoms per reference unit) for an asset, keyed in
   /// /feerates by ticker or hex (deployments vary). null = not fee-priced.
   BigInt? _rateFor(String hex) {
+    // The policy asset (tSEQ) is keyed "bitcoin" in the feed (Elements naming). Resolve it from
+    // that key like any other asset — so tSEQ is priced ONLY when this node's feed prices it. NO
+    // privilege: a node whose fee reference is USD and ignores SEQ omits "bitcoin" -> tSEQ unpriced
+    // -> gated out of the fee options, exactly like any unpriced asset (first-principle: SEQ equal
+    // standing). We never fabricate a rate.
+    if (hex == SeqAssets.policy) return _feeRates['bitcoin'];
     final t = SeqAssets.labelFor(hex).ticker;
     return _feeRates[t] ?? _feeRates[hex]; // already filtered to >0 in feeRates()
   }
 
   String get _feeLabel => _feeAsset == null ? 'tSEQ' : SeqAssets.labelFor(_feeAsset!).ticker;
 
-  /// 1:1 reference-unit fallback rate (atoms-per-rfa × 1e8) for an asset the node
-  /// doesn't price — so the fee still builds and the relay/producers decide.
-  static final BigInt _refScale = BigInt.from(100000000);
+  /// The policy asset (tSEQ) is the Elements tx format's NATIVE fee unit: a tSEQ fee is built
+  /// natively by the PSET builder (no FeeAsset passed) at the reference scale. This is a STRUCTURAL
+  /// fact of the tx format, not a privilege — whether tSEQ is OFFERED as a fee choice is still gated
+  /// purely on the producer feed (see _rateFor / _feeOptions).
+  static final BigInt _policyScale = BigInt.from(100000000);
 
   /// True when the send asset is a restricted (OpenAMP enclave) asset — moved via
   /// the enclave transfer flow, not an on-chain PSET, and addressed by account id.
   bool get _isRestricted => OpenAmpService.instance.isRestricted(_assetId);
 
-  /// Every asset you hold is a valid fee option — no asset is privileged. The
-  /// '' sentinel = the policy asset (tSEQ), one option among equals. Restricted
-  /// (enclave-held) assets can't pay an on-chain fee, so they're excluded.
+  /// A held asset is a valid fee option iff some producer prices it for fees (it's in the /feerates
+  /// feed) — no asset is privileged, tSEQ (the '' sentinel) is judged by the exact same feed as
+  /// every issued asset. Restricted (enclave-held) assets can't pay an on-chain fee, so excluded.
+  /// An unpriced held asset is NOT offered (a fabricated rate would build a fee no producer accepts).
   List<String> _feeOptions() => _heldIds()
-      .where((id) => !OpenAmpService.instance.isRestricted(id))
+      .where((id) => !OpenAmpService.instance.isRestricted(id) && _rateFor(id) != null)
       .map((id) => id == SeqAssets.policy ? '' : id)
       .toList();
 
-  /// The fee defaults to the asset being sent (asset-agnostic). null = pay in
-  /// tSEQ, only when tSEQ is what you're sending.
-  String? _defaultFeeFor(String assetId) => assetId == SeqAssets.policy ? null : assetId;
+  /// The fee defaults to the asset being sent WHEN a producer prices it; else tSEQ when the feed
+  /// prices it; else the first priced held asset. No privileged tSEQ fallback — if the feed doesn't
+  /// price SEQ, tSEQ isn't chosen. (null = pay natively in tSEQ.)
+  String? _defaultFeeFor(String assetId) {
+    if (assetId != SeqAssets.policy && _rateFor(assetId) != null) return assetId;
+    if (_rateFor(SeqAssets.policy) != null) return null; // tSEQ, only because the feed prices it
+    final priced = _feeOptions();
+    if (priced.isEmpty) return null;                     // feed unavailable: fall to the tx-format's native tSEQ path
+    return priced.first.isEmpty ? null : priced.first;
+  }
 
-  /// Build rate for the chosen fee asset: the node's published rate, or a 1:1
-  /// reference fallback when the node doesn't price it (the tx still builds).
-  BigInt _feeRate(String assetId) => _rateFor(assetId) ?? _refScale;
+  /// Build rate for a chosen NON-policy fee asset: the node's published rate. Fee options are gated
+  /// to priced assets (see _feeOptions), so this is always present; a null here is a programming
+  /// error (an unpriced asset must never reach the builder), surfaced as a hard error.
+  BigInt _feeRate(String assetId) => _rateFor(assetId)!;
 
-  /// True when the chosen fee asset isn't priced by the node (estimated rate).
+  /// True when the chosen fee asset isn't priced by the node. With strict gating this should never
+  /// hold for an offered asset; kept as a last-line guard.
   bool get _feeUnpriced => _feeAsset != null && _rateFor(_feeAsset!) == null;
 
   Future<void> _pickAsset() async {
@@ -301,7 +319,7 @@ class _SendTabState extends State<SendTab> {
     } else {
       final feeBal = BigInt.tryParse(_balanceOf(_feeAsset!)) ?? BigInt.zero;
       if (feeBal <= BigInt.zero) return _snack('You have no $_feeLabel to pay the fee with.');
-      // Priced → node rate; unpriced → 1:1 reference fallback so the tx builds.
+      // The chosen fee asset is gated to producer-priced (see _feeOptions), so its rate is present.
       feeAsset = core.FeeAsset(assetId: _feeAsset!, rate: _feeRate(_feeAsset!));
     }
 
@@ -315,7 +333,9 @@ class _SendTabState extends State<SendTab> {
       final fr = double.tryParse(frText);
       if (fr == null || fr <= 0) return _snack('Enter a valid fee rate, or leave it blank.');
       final label = SeqAssets.labelFor(_feeAsset ?? SeqAssets.policy);
-      final rate = (_feeAsset == null) ? BigInt.from(100000000) : (_rateFor(_feeAsset!) ?? _refScale);
+      // Policy asset (tSEQ) pays natively at the reference scale (structural); a non-policy fee asset
+      // is gated to priced, so its published rate is present — no fabricated fallback.
+      final rate = (_feeAsset == null) ? _policyScale : _rateFor(_feeAsset!)!;
       feeRateSatKvb = fr * math.pow(10, label.precision) * rate.toDouble() / 100000;
     }
 
