@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `arr32`, `arr33`, `hex`
+// These functions are ignored because they are not marked as `pub`: `arr32`, `arr33`, `asset_path_index`, `bip39_seed`, `derive_hardened`, `hex`, `normalize_phrase`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `NoiseInner`
 
 /// Derive the compressed static pubkey (33-byte hex) for a transport static
@@ -15,18 +15,39 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 String devicePubkey({required List<int> staticPrivkey}) => RustLib.instance.api
     .crateApiSignerDevicePubkey(staticPrivkey: staticPrivkey);
 
-/// Derive the device transport (Noise static) private key for the hosted-SeqLN
-/// LSP link, deterministically from the wallet mnemonic. This is the native twin
-/// of the web wallet's `lnDeviceTransportPriv`: standard BIP39 seed (no
-/// passphrase) -> BIP32 `m/1017'/0'/0'` -> the 32-byte private key. It is stable
-/// across reinstalls and recoverable from the mnemonic, so the LSP can pin ONE
-/// device identity per wallet — and it is byte-identical to the browser client
-/// for the same seed (both take the standard BIP39 seed through the same BIP32
-/// path), so one hosted LSP can pin the same key whichever client the user runs.
+/// Derive the device transport (Noise static) private key for the hosted-SeqLN LSP link,
+/// deterministically from the wallet mnemonic — the legacy single-node path `m/1017'/0'/0'`
+/// (== the asset node's transport key). Kept for back-compat; new callers use
+/// [`seqln_derive_node`] / [`seqln_derive_asset`]. Byte-identical to the browser client.
 Uint8List seqlnDeviceTransportPrivkey({required String mnemonic}) => RustLib
     .instance
     .api
     .crateApiSignerSeqlnDeviceTransportPrivkey(mnemonic: mnemonic);
+
+/// Derive the device keys for one FIXED hosted node (`"asset"` | `"btc"`) from the wallet
+/// mnemonic — the native twin of `seqln-keys.js` `lnDeriveNode`. Role branch selects the key
+/// (0' = Noise transport, 1' = SeqLN signing seed); node leaf selects the node (0' =
+/// asset/Sequentia, 1' = btc/testnet4):
+///   asset transport `m/1017'/0'/0'`   asset signing `m/1017'/1'/0'`
+///   btc   transport `m/1017'/0'/1'`   btc   signing `m/1017'/1'/1'`
+LnNodeKeys seqlnDeriveNode({required String mnemonic, required String node}) =>
+    RustLib.instance.api.crateApiSignerSeqlnDeriveNode(
+      mnemonic: mnemonic,
+      node: node,
+    );
+
+/// Derive the device keys for a PROVISIONED per-asset hosted node from the wallet mnemonic +
+/// the 32-byte asset id (hex) — the native twin of `seqln-keys.js` `lnDeriveAsset`. Dedicated
+/// branch so it never collides with the fixed asset/btc leaves: transport `m/1017'/2'/<idx>'`,
+/// signing `m/1017'/3'/<idx>'`, where `idx = FNV-1a(asset-id) folded to 31 bits`
+/// (see [`asset_path_index`]) — so a given asset always re-derives the SAME device identity.
+LnNodeKeys seqlnDeriveAsset({
+  required String mnemonic,
+  required String assetId,
+}) => RustLib.instance.api.crateApiSignerSeqlnDeriveAsset(
+  mnemonic: mnemonic,
+  assetId: assetId,
+);
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<NoiseSession>>
 abstract class NoiseSession implements RustOpaqueInterface {
@@ -102,4 +123,29 @@ abstract class SeqlnSigner implements RustOpaqueInterface {
   /// phone has no env, so this is how the caller selects enforce mode (the
   /// device then refuses to sign a commitment that moves funds off-channel).
   void setEnforce({required bool enforce});
+}
+
+/// The two device keys for one hosted SeqLN node, derived from the wallet mnemonic —
+/// the native twin of the web wallet's `seqln-keys.js`. `transport_privkey` (32 bytes)
+/// is the BOLT-8 Noise static privkey (feed to [`device_pubkey`] / [`NoiseSession`]);
+/// `signing_seed` (64 lowercase hex) is the opaque string fed to
+/// [`SeqlnSigner::from_mnemonic`] — because the hosted node is KEYLESS, this value
+/// alone determines its LN identity (node_id + channel keys), so a node's identity +
+/// channels survive across sessions and are recoverable from the wallet mnemonic.
+class LnNodeKeys {
+  final Uint8List transportPrivkey;
+  final String signingSeed;
+
+  const LnNodeKeys({required this.transportPrivkey, required this.signingSeed});
+
+  @override
+  int get hashCode => transportPrivkey.hashCode ^ signingSeed.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LnNodeKeys &&
+          runtimeType == other.runtimeType &&
+          transportPrivkey == other.transportPrivkey &&
+          signingSeed == other.signingSeed;
 }

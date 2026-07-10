@@ -141,6 +141,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<TxRow> dco_decode_list_tx_row(dynamic raw);
 
   @protected
+  LnNodeKeys dco_decode_ln_node_keys(dynamic raw);
+
+  @protected
   double? dco_decode_opt_box_autoadd_f_32(dynamic raw);
 
   @protected
@@ -297,6 +300,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<TxRow> sse_decode_list_tx_row(SseDeserializer deserializer);
+
+  @protected
+  LnNodeKeys sse_decode_ln_node_keys(SseDeserializer deserializer);
 
   @protected
   double? sse_decode_opt_box_autoadd_f_32(SseDeserializer deserializer);
@@ -485,6 +491,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_list_tx_row(List<TxRow> self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_ln_node_keys(LnNodeKeys self, SseSerializer serializer);
 
   @protected
   void sse_encode_opt_box_autoadd_f_32(double? self, SseSerializer serializer);

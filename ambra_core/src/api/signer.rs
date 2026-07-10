@@ -278,31 +278,121 @@ pub fn device_pubkey(static_privkey: Vec<u8>) -> Result<String> {
         .map_err(|e| anyhow!(e.0))
 }
 
-/// Derive the device transport (Noise static) private key for the hosted-SeqLN
-/// LSP link, deterministically from the wallet mnemonic. This is the native twin
-/// of the web wallet's `lnDeviceTransportPriv`: standard BIP39 seed (no
-/// passphrase) -> BIP32 `m/1017'/0'/0'` -> the 32-byte private key. It is stable
-/// across reinstalls and recoverable from the mnemonic, so the LSP can pin ONE
-/// device identity per wallet — and it is byte-identical to the browser client
-/// for the same seed (both take the standard BIP39 seed through the same BIP32
-/// path), so one hosted LSP can pin the same key whichever client the user runs.
+/// The two device keys for one hosted SeqLN node, derived from the wallet mnemonic —
+/// the native twin of the web wallet's `seqln-keys.js`. `transport_privkey` (32 bytes)
+/// is the BOLT-8 Noise static privkey (feed to [`device_pubkey`] / [`NoiseSession`]);
+/// `signing_seed` (64 lowercase hex) is the opaque string fed to
+/// [`SeqlnSigner::from_mnemonic`] — because the hosted node is KEYLESS, this value
+/// alone determines its LN identity (node_id + channel keys), so a node's identity +
+/// channels survive across sessions and are recoverable from the wallet mnemonic.
+pub struct LnNodeKeys {
+    pub transport_privkey: Vec<u8>,
+    pub signing_seed: String,
+}
+
+/// Collapse internal whitespace + trim — matches `seqln-keys.js` `normPhrase`, so the
+/// derived BIP39 seed is identical to the browser client for the same phrase.
+fn normalize_phrase(p: &str) -> String {
+    p.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Standard 64-byte BIP39 seed (empty passphrase) from the mnemonic, via the same path
+/// the signer takes: synthesize the `32 zero bytes || mnemonic` on-disk form and parse it
+/// (yields `secret.seed`, the plain BIP39 seed) — identical to the web wallet's
+/// `mnemonicToSeedSync` for the same normalized phrase.
+fn bip39_seed(mnemonic: &str) -> Result<[u8; 64]> {
+    let mut bytes = vec![0u8; 32];
+    bytes.extend_from_slice(normalize_phrase(mnemonic).as_bytes());
+    let secret = hsm_secret::parse(&bytes).map_err(|e| anyhow!(e))?;
+    Ok(secret.seed)
+}
+
+/// Derive the 32-byte private key at `m/<i0>'/<i1>'/…` (ALL hardened) from a BIP39 seed.
+/// The BIP32 network version affects only the (unused) xprv serialization, not the derived
+/// key bytes, so testnet here is byte-consistent with the browser client.
+fn derive_hardened(seed: &[u8; 64], indices: &[u32]) -> Result<[u8; 32]> {
+    let secp = Secp256k1::new();
+    let master = Xpriv::new_master(Network::Testnet, seed).map_err(|e| anyhow!("{e}"))?;
+    let mut path = Vec::with_capacity(indices.len());
+    for &i in indices {
+        path.push(ChildNumber::from_hardened_idx(i).map_err(|e| anyhow!("{e}"))?);
+    }
+    let child = master
+        .derive_priv(&secp, &DerivationPath::from(path))
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(child.private_key.secret_bytes())
+}
+
+/// FNV-1a 32-bit over the asset-id BYTES, folded to a 31-bit hardened-path index —
+/// byte-for-byte the same fold `seqln-keys.js` `assetPathIndex` computes, so a given asset
+/// re-derives the SAME device identity on web and mobile.
+fn asset_path_index(asset_id_hex: &str) -> u32 {
+    let clean: Vec<u8> = asset_id_hex
+        .bytes()
+        .filter(u8::is_ascii_hexdigit)
+        .map(|b| b.to_ascii_lowercase())
+        .collect();
+    let mut h: u32 = 0x811c_9dc5;
+    let mut i = 0;
+    while i + 1 < clean.len() {
+        let hi = (clean[i] as char).to_digit(16).unwrap_or(0);
+        let lo = (clean[i + 1] as char).to_digit(16).unwrap_or(0);
+        h ^= (hi << 4) | lo;
+        h = h.wrapping_mul(0x0100_0193);
+        i += 2;
+    }
+    h & 0x7fff_ffff
+}
+
+/// Derive the device transport (Noise static) private key for the hosted-SeqLN LSP link,
+/// deterministically from the wallet mnemonic — the legacy single-node path `m/1017'/0'/0'`
+/// (== the asset node's transport key). Kept for back-compat; new callers use
+/// [`seqln_derive_node`] / [`seqln_derive_asset`]. Byte-identical to the browser client.
 #[frb(sync)]
 pub fn seqln_device_transport_privkey(mnemonic: String) -> Result<Vec<u8>> {
-    // Standard 64-byte BIP39 seed (empty passphrase), via the same path the
-    // signer takes: synthesize the `32 zero bytes || mnemonic` on-disk form and
-    // parse it (yields `secret.seed`, the plain BIP39 seed).
-    let mut bytes = vec![0u8; 32];
-    bytes.extend_from_slice(mnemonic.trim().as_bytes());
-    let secret = hsm_secret::parse(&bytes).map_err(|e| anyhow!(e))?;
-    let secp = Secp256k1::new();
-    // The BIP32 network version affects only the (unused) xprv serialization, not
-    // the derived private-key bytes, so testnet here is fine and cross-consistent.
-    let master = Xpriv::new_master(Network::Testnet, &secret.seed).map_err(|e| anyhow!("{e}"))?;
-    let path = DerivationPath::from(vec![
-        ChildNumber::from_hardened_idx(1017).map_err(|e| anyhow!("{e}"))?,
-        ChildNumber::from_hardened_idx(0).map_err(|e| anyhow!("{e}"))?,
-        ChildNumber::from_hardened_idx(0).map_err(|e| anyhow!("{e}"))?,
-    ]);
-    let child = master.derive_priv(&secp, &path).map_err(|e| anyhow!("{e}"))?;
-    Ok(child.private_key.secret_bytes().to_vec())
+    let seed = bip39_seed(&mnemonic)?;
+    Ok(derive_hardened(&seed, &[1017, 0, 0])?.to_vec())
+}
+
+/// Derive the device keys for one FIXED hosted node (`"asset"` | `"btc"`) from the wallet
+/// mnemonic — the native twin of `seqln-keys.js` `lnDeriveNode`. Role branch selects the key
+/// (0' = Noise transport, 1' = SeqLN signing seed); node leaf selects the node (0' =
+/// asset/Sequentia, 1' = btc/testnet4):
+///   asset transport `m/1017'/0'/0'`   asset signing `m/1017'/1'/0'`
+///   btc   transport `m/1017'/0'/1'`   btc   signing `m/1017'/1'/1'`
+#[frb(sync)]
+pub fn seqln_derive_node(mnemonic: String, node: String) -> Result<LnNodeKeys> {
+    let leaf: u32 = match node.as_str() {
+        "asset" => 0,
+        "btc" => 1,
+        other => return Err(anyhow!("unknown LN node: {other} (want 'asset' or 'btc')")),
+    };
+    let seed = bip39_seed(&mnemonic)?;
+    Ok(LnNodeKeys {
+        transport_privkey: derive_hardened(&seed, &[1017, 0, leaf])?.to_vec(),
+        signing_seed: hex(&derive_hardened(&seed, &[1017, 1, leaf])?),
+    })
+}
+
+/// Derive the device keys for a PROVISIONED per-asset hosted node from the wallet mnemonic +
+/// the 32-byte asset id (hex) — the native twin of `seqln-keys.js` `lnDeriveAsset`. Dedicated
+/// branch so it never collides with the fixed asset/btc leaves: transport `m/1017'/2'/<idx>'`,
+/// signing `m/1017'/3'/<idx>'`, where `idx = FNV-1a(asset-id) folded to 31 bits`
+/// (see [`asset_path_index`]) — so a given asset always re-derives the SAME device identity.
+#[frb(sync)]
+pub fn seqln_derive_asset(mnemonic: String, asset_id: String) -> Result<LnNodeKeys> {
+    let clean: String = asset_id
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if clean.len() != 64 {
+        return Err(anyhow!("assetId must be a 32-byte hex id"));
+    }
+    let idx = asset_path_index(&clean);
+    let seed = bip39_seed(&mnemonic)?;
+    Ok(LnNodeKeys {
+        transport_privkey: derive_hardened(&seed, &[1017, 2, idx])?.to_vec(),
+        signing_seed: hex(&derive_hardened(&seed, &[1017, 3, idx])?),
+    })
 }
