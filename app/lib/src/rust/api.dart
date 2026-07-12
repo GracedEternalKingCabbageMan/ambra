@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `btc_params`, `clear_scan_marks`, `err`, `esplora_client`, `hexbytes`, `last_scan`, `mark_scanned`, `openamp_keypair`, `rerr`, `scan_into`, `scanned_recently`, `tohex`, `with_synced_wollet`, `wollet_cache`
+// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `btc_params`, `clear_scan_marks`, `enclave_prevout_to_txout`, `enclave_prevouts_to_txouts`, `enclave_sighash_inner`, `err`, `esplora_client`, `hexbytes`, `last_scan`, `mark_scanned`, `openamp_keypair`, `parse_openamp_tx`, `rerr`, `scan_into`, `scanned_recently`, `tohex`, `with_synced_wollet`, `wollet_cache`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
 String networkName() => RustLib.instance.api.crateApiNetworkName();
@@ -481,6 +481,64 @@ String openampSignSighash({
   sighashHex: sighashHex,
 );
 
+/// Compute an OpenAMP AID locally from a set of 64-hex x-only pubkeys, exactly
+/// matching Go `store.AID`: `hex(first 20 bytes of sha256("openamp-aid-v1" ||
+/// pubkeys lowercased, sorted lexicographically, concatenated as UTF-8))`. The
+/// wallet MUST call this and assert equality with the server's AID (spec 1.3);
+/// a mismatch means the server registered a different or additional key.
+String openampComputeAid({required List<String> pubkeys}) =>
+    RustLib.instance.api.crateApiOpenampComputeAid(pubkeys: pubkeys);
+
+/// The Sequentia network genesis block hash (hex), the taproot sighash domain
+/// separator the wallet must pass to [`enclave_sighash`]. Resolved from the
+/// active network so Dart never hardcodes it.
+String sequentiaGenesisHash() =>
+    RustLib.instance.api.crateApiSequentiaGenesisHash();
+
+/// Recompute the enclave-spend sighash the wallet must sign (SWK-6, spec 0.4(3)).
+///
+/// - `tx_hex`: the FULL unsigned transaction the enclave asked the wallet to sign.
+/// - `input_index`: which input this enclave spend is.
+/// - `prevouts`: `{asset, value, script}` for EVERY input, aligned by index
+///   (taproot SIGHASH_DEFAULT commits to all prevout amounts + scripts).
+/// - `leaf_script_hex`: the enclave transfer leaf.
+/// - `control_block_hex`: the transfer-leaf control block (first byte = leaf
+///   version `0xc4` with the parity bit).
+/// - `genesis_hex`: the network genesis block hash (from [`sequentia_genesis_hash`]).
+///
+/// Returns the 32-byte sighash as hex. The wallet MUST sign THIS value and refuse
+/// if it differs from the server's `to_sign` digest.
+String enclaveSighash({
+  required String txHex,
+  required int inputIndex,
+  required List<EnclavePrevout> prevouts,
+  required String leafScriptHex,
+  required String controlBlockHex,
+  required String genesisHex,
+}) => RustLib.instance.api.crateApiEnclaveSighash(
+  txHex: txHex,
+  inputIndex: inputIndex,
+  prevouts: prevouts,
+  leafScriptHex: leafScriptHex,
+  controlBlockHex: controlBlockHex,
+  genesisHex: genesisHex,
+);
+
+/// Decode a candidate enclave-spend transaction into the effects a wallet must
+/// display before signing (SWK-6, spec 0.4(3)). `my_scripts` is the set of MY
+/// enclave scriptPubKeys (hex); a prevout or output matching one is flagged
+/// `mine`. `prevouts` aligns with the transaction inputs; pass an empty list to
+/// only enumerate each input's outpoint (txid/vout/index).
+EnclaveSpendEffects decodeEnclaveSpend({
+  required String txHex,
+  required List<EnclavePrevout> prevouts,
+  required List<String> myScripts,
+}) => RustLib.instance.api.crateApiDecodeEnclaveSpend(
+  txHex: txHex,
+  prevouts: prevouts,
+  myScripts: myScripts,
+);
+
 /// A receive address together with the derivation index it came from.
 class AddressInfo {
   final String address;
@@ -700,6 +758,189 @@ class BtcTx {
           feeSats == other.feeSats &&
           vsize == other.vsize &&
           inputs == other.inputs;
+}
+
+/// One decoded input of a candidate enclave spend.
+class EnclaveDecodedInput {
+  /// Input index in the transaction.
+  final int index;
+
+  /// Prevout txid, display hex.
+  final String txid;
+
+  /// Prevout vout.
+  final int vout;
+
+  /// Prevout asset id (display hex) if the prevout was supplied.
+  final String? asset;
+
+  /// Prevout value (atoms) if the prevout was supplied.
+  final BigInt? value;
+
+  /// True when the prevout scriptPubKey is one of MY enclave scripts.
+  final bool mine;
+
+  const EnclaveDecodedInput({
+    required this.index,
+    required this.txid,
+    required this.vout,
+    this.asset,
+    this.value,
+    required this.mine,
+  });
+
+  @override
+  int get hashCode =>
+      index.hashCode ^
+      txid.hashCode ^
+      vout.hashCode ^
+      asset.hashCode ^
+      value.hashCode ^
+      mine.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is EnclaveDecodedInput &&
+          runtimeType == other.runtimeType &&
+          index == other.index &&
+          txid == other.txid &&
+          vout == other.vout &&
+          asset == other.asset &&
+          value == other.value &&
+          mine == other.mine;
+}
+
+/// One decoded output of a candidate enclave spend.
+class EnclaveDecodedOutput {
+  /// Output index in the transaction.
+  final int index;
+
+  /// Explicit asset id (display hex), or `None` if the output is confidential.
+  final String? asset;
+
+  /// Explicit value (atoms), or `None` if the output is confidential.
+  final BigInt? value;
+
+  /// The output scriptPubKey, hex (empty for the Elements fee output).
+  final String script;
+
+  /// True for the explicit Elements fee output (empty scriptPubKey).
+  final bool isFee;
+
+  /// True when this output pays one of MY enclave scripts (a receipt to me).
+  final bool mine;
+
+  const EnclaveDecodedOutput({
+    required this.index,
+    this.asset,
+    this.value,
+    required this.script,
+    required this.isFee,
+    required this.mine,
+  });
+
+  @override
+  int get hashCode =>
+      index.hashCode ^
+      asset.hashCode ^
+      value.hashCode ^
+      script.hashCode ^
+      isFee.hashCode ^
+      mine.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is EnclaveDecodedOutput &&
+          runtimeType == other.runtimeType &&
+          index == other.index &&
+          asset == other.asset &&
+          value == other.value &&
+          script == other.script &&
+          isFee == other.isFee &&
+          mine == other.mine;
+}
+
+/// A transaction prevout as the wallet knows it: explicit asset id, explicit
+/// value (atoms), and the scriptPubKey (hex). Restricted-asset transactions are
+/// transparent (spec 0.6), so these are always explicit. Aligned 1:1 with the
+/// transaction inputs when passed to [`enclave_sighash`] / [`decode_enclave_spend`].
+class EnclavePrevout {
+  /// The prevout's asset id, display hex.
+  final String asset;
+
+  /// The prevout's explicit value, atoms.
+  final BigInt value;
+
+  /// The prevout's scriptPubKey, hex.
+  final String script;
+
+  const EnclavePrevout({
+    required this.asset,
+    required this.value,
+    required this.script,
+  });
+
+  @override
+  int get hashCode => asset.hashCode ^ value.hashCode ^ script.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is EnclavePrevout &&
+          runtimeType == other.runtimeType &&
+          asset == other.asset &&
+          value == other.value &&
+          script == other.script;
+}
+
+/// The human-readable effects of a candidate enclave spend, shown to the user
+/// BEFORE signing (spec 0.4(3)): which of my UTXOs are spent, what each output
+/// pays and to whom, and whether anything is confidential (a red flag).
+class EnclaveSpendEffects {
+  /// The transaction id.
+  final String txid;
+
+  /// Every input, with `mine` set for my enclave prevouts.
+  final List<EnclaveDecodedInput> inputs;
+
+  /// Every output, with `mine` set for receipts to my enclave scripts.
+  final List<EnclaveDecodedOutput> outputs;
+
+  /// Indices of the inputs that spend MY enclave UTXOs.
+  final Uint32List myInputsSpent;
+
+  /// True if ANY output is confidential (restricted-asset spends must be fully
+  /// transparent, spec 2.4/0.6, so this is an integrity warning).
+  final bool anyConfidential;
+
+  const EnclaveSpendEffects({
+    required this.txid,
+    required this.inputs,
+    required this.outputs,
+    required this.myInputsSpent,
+    required this.anyConfidential,
+  });
+
+  @override
+  int get hashCode =>
+      txid.hashCode ^
+      inputs.hashCode ^
+      outputs.hashCode ^
+      myInputsSpent.hashCode ^
+      anyConfidential.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is EnclaveSpendEffects &&
+          runtimeType == other.runtimeType &&
+          txid == other.txid &&
+          inputs == other.inputs &&
+          outputs == other.outputs &&
+          myInputsSpent == other.myInputsSpent &&
+          anyConfidential == other.anyConfidential;
 }
 
 /// Pay the fee in any accepted asset at the node's published rate.
