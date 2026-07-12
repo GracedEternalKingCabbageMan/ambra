@@ -88,6 +88,31 @@ pub fn confidential_receive_address(mnemonic: String) -> Result<String> {
     crate::confidential_receive_address(&wollet, 0).map_err(err)
 }
 
+/// A confidential (blech32 `tsqb…`) receive address together with its 33-byte
+/// blinding pubkey (hex). Both are published in a confidential-book offer's
+/// `same_chain{maker_recv_address, maker_blinding_pub}` so the counterparty can
+/// add a blinded output crediting this leg — both legs blind on-chain. Index 0.
+pub struct ConfidentialReceive {
+    pub address: String,
+    pub blinding_pub_hex: String,
+}
+
+/// The blinded (blech32) receive address + its 33-byte blinding pubkey (hex) for a
+/// confidential same-chain DEX credit/refund. `blinding_pub_hex` is empty only if
+/// the address somehow carries no blinding key (never for the CT descriptor).
+pub fn confidential_receive_with_blinding_pub(mnemonic: String) -> Result<ConfidentialReceive> {
+    let descriptor = crate::descriptor_from_mnemonic(&mnemonic).map_err(err)?;
+    let wollet = crate::build_wollet(&descriptor).map_err(err)?;
+    let res = wollet.address(Some(0)).map_err(rerr)?;
+    let addr = res.address();
+    let blinding_pub_hex = addr
+        .blinding_pubkey
+        .as_ref()
+        .map(|pk| tohex(&pk.serialize()))
+        .unwrap_or_default();
+    Ok(ConfidentialReceive { address: addr.to_string(), blinding_pub_hex })
+}
+
 /// The wallet's CT output descriptor for a recovery phrase.
 pub fn descriptor_from_mnemonic(mnemonic: String) -> Result<String> {
     crate::descriptor_from_mnemonic(&mnemonic).map_err(err)
@@ -996,6 +1021,161 @@ pub fn xchain_btc_refund(
         fee_sats,
     };
     lwk_wollet::btc::htlc::build_refund_tx(&redeem, &spend, locktime, &sk).map_err(rerr)
+}
+
+// --- REVERSE cross-chain (Sequentia asset -> BTC on-chain HTLC) ----------------
+//
+// The MIRROR of the forward buy. Here the wallet is the TAKER SELLING an asset:
+// the remote MAKER holds the secret and locks the BTC leg FIRST, the taker funds
+// the SEQ asset leg SECOND, the maker claims the asset (revealing the secret), and
+// the taker claims the BTC with that secret. The taker NEVER holds or reveals a
+// preimage in this direction, so the "never reveal before the paying leg is
+// anchor-safe" discipline is upheld BY CONSTRUCTION; the taker's own discipline is
+// verify-the-maker's-BTC-leg-before-funding + wait-for-its-confirmation (so the
+// SEQ leg anchors at/above it) + T_btc > T_seq + a CLTV asset refund off-ramp.
+// The BTC claim itself is on the anchor-supreme parent chain and needs no gate.
+
+/// A reverse-swap SEQ HTLC the taker FUNDS: its redeemScript + Sequentia P2SH
+/// address/spk. Fund the address with an EXPLICIT (unblinded) asset output via
+/// [`build_send_tx`] so the maker can read the asset + amount before it claims.
+pub struct SeqHtlcInfo {
+    pub redeem_script_hex: String,
+    pub p2sh_address: String,
+    pub p2sh_spk_hex: String,
+}
+
+/// The taker's BTC-leg CLAIM pubkey for a REVERSE swap: the pubkey the maker must
+/// embed as the IF/claim key in its BTC HTLC, and whose secret (kept in-core)
+/// signs the on-chain claim once the maker reveals the preimage. Distinct HD path
+/// from the BTC-refund key, so one leaked key never unlocks both HTLC branches.
+pub fn xchain_btc_claim_pubkey(mnemonic: String) -> Result<String> {
+    lwk_wollet::btc::xchain::btc_claim_keypair(&btc_params(), &mnemonic, lwk_wollet::btc::xchain::PathMode::Canonical)
+        .map(|(_, p)| p)
+        .map_err(rerr)
+}
+
+/// Build the SEQ-leg HTLC the taker FUNDS in a reverse (asset -> BTC) swap. The
+/// maker CLAIMS it (revealing the preimage) via the IF branch, and the taker
+/// REFUNDS it via the CLTV/ELSE branch after `seq_locktime`. So claim = the
+/// maker's SEQ-claim pubkey and refund = the taker's OWN canonical SEQ key (the
+/// same key [`xchain_seq_claim_pubkey`] returns — reused, so refund recovery is
+/// HD-derivable). Returns the redeemScript plus the Sequentia P2SH address/spk to
+/// fund via [`build_send_tx`] as an explicit recipient.
+pub fn xchain_seq_htlc_reverse(
+    mnemonic: String,
+    hash_hex: String,
+    maker_seq_claim_pub_hex: String,
+    seq_locktime: u32,
+) -> Result<SeqHtlcInfo> {
+    let (_sk, taker_seq_refund_pub) =
+        lwk_wollet::btc::xchain::seq_claim_keypair(&btc_params(), &mnemonic, lwk_wollet::btc::xchain::PathMode::Canonical)
+            .map_err(rerr)?;
+    let redeem = lwk_wollet::build_htlc_redeem_script(
+        &hexbytes(&hash_hex)?,
+        &hexbytes(&maker_seq_claim_pub_hex)?,
+        &hexbytes(&taker_seq_refund_pub)?,
+        seq_locktime,
+    )
+    .map_err(rerr)?;
+    // Sequentia P2SH (p2sh_prefix 196, byte-identical to Bitcoin testnet), encoded
+    // under the SEQUENTIA address params so `build_send_tx` round-trips the address.
+    let address = lwk_wollet::elements::Address::p2sh(&redeem, None, crate::sequentia_testnet().address_params());
+    Ok(SeqHtlcInfo {
+        redeem_script_hex: tohex(redeem.as_bytes()),
+        p2sh_spk_hex: tohex(address.script_pubkey().as_bytes()),
+        p2sh_address: address.to_string(),
+    })
+}
+
+/// Build the taker's BTC CLAIM (reverse swap): spend the maker's funded BTC HTLC
+/// via the IF/preimage branch to `dest_address`, paying `amount - fee`. Only call
+/// once the maker has revealed the preimage on the SEQ leg (read it with
+/// [`xchain_read_seq_preimage`]). Returns raw tx hex for [`btc_broadcast`].
+#[allow(clippy::too_many_arguments)]
+pub fn xchain_btc_claim(
+    mnemonic: String,
+    btc_txid: String,
+    btc_vout: u32,
+    btc_amount_sats: u64,
+    dest_address: String,
+    fee_sats: u64,
+    redeem_script_hex: String,
+    preimage_hex: String,
+) -> Result<String> {
+    let (sk, _) = lwk_wollet::btc::xchain::btc_claim_keypair(
+        &btc_params(),
+        &mnemonic,
+        lwk_wollet::btc::xchain::PathMode::Canonical,
+    )
+    .map_err(rerr)?;
+    let redeem = lwk_wollet::bitcoin::ScriptBuf::from_hex(&redeem_script_hex).map_err(rerr)?;
+    let dest = lwk_wollet::bitcoin::Address::from_str(&dest_address)
+        .map_err(|_| err("invalid Bitcoin address".to_string()))?
+        .require_network(lwk_wollet::bitcoin::Network::Testnet)
+        .map_err(|_| err("address is not a Bitcoin testnet (tb1) address".to_string()))?;
+    let spend = lwk_wollet::btc::htlc::BtcHtlcSpend {
+        txid: btc_txid,
+        vout: btc_vout,
+        amount_sats: btc_amount_sats,
+        dest_spk: dest.script_pubkey(),
+        fee_sats,
+    };
+    lwk_wollet::btc::htlc::build_claim_tx(&redeem, &spend, &hexbytes(&preimage_hex)?, &sk).map_err(rerr)
+}
+
+/// Build the taker's SEQ asset-leg REFUND (reverse swap): spend the funded SEQ
+/// HTLC back to `dest_address` via the CLTV/ELSE branch, valid once the SEQ tip
+/// reaches `seq_locktime`. The refund key is the taker's OWN canonical SEQ key
+/// (the one [`xchain_seq_htlc_reverse`] embedded as the refund pubkey). `fee_atoms`
+/// is paid in the CLAIMED asset (the HTLC holds no native tSEQ): the caller MUST
+/// derive it from the asset's published rate and cap it at half the output — the
+/// flat forward-direction claim fee would be rejected as "Fee exceeds maximum" for
+/// a valuable asset (memory principle 4). Returns raw Elements tx hex for
+/// [`xchain_seq_broadcast`].
+#[allow(clippy::too_many_arguments)]
+pub fn xchain_seq_refund(
+    mnemonic: String,
+    seq_txid: String,
+    seq_vout: u32,
+    seq_amount: u64,
+    seq_asset_id: String,
+    dest_address: String,
+    fee_atoms: u64,
+    redeem_script_hex: String,
+    seq_locktime: u32,
+) -> Result<String> {
+    let (sk, _) = lwk_wollet::btc::xchain::seq_claim_keypair(
+        &btc_params(),
+        &mnemonic,
+        lwk_wollet::btc::xchain::PathMode::Canonical,
+    )
+    .map_err(rerr)?;
+    let redeem = lwk_wollet::elements::Script::from(hexbytes(&redeem_script_hex)?);
+    let dest = lwk_wollet::elements::Address::parse_with_params(&dest_address, crate::sequentia_testnet().address_params())
+        .map_err(rerr)?;
+    let spend = lwk_wollet::SeqHtlcSpend {
+        txid: seq_txid,
+        vout: seq_vout,
+        amount: seq_amount,
+        asset_id: seq_asset_id,
+        dest_spk: dest.script_pubkey().as_bytes().to_vec(),
+        fee: fee_atoms,
+    };
+    lwk_wollet::build_refund_tx(&spend, &redeem, &sk, seq_locktime).map_err(rerr)
+}
+
+/// Read the maker's revealed preimage from its on-chain spend of the taker's
+/// funded SEQ asset leg (the reverse-swap reveal). Returns the preimage hex once
+/// the leg is spent and a push hashing to `hash_hex` (H) is visible, else `None`.
+/// The `sha256(push) == H` validation runs in trusted core — the taker learns the
+/// secret from the chain, never on the counterparty's word.
+pub fn xchain_read_seq_preimage(
+    seq_esplora: String,
+    seq_leg_txid: String,
+    seq_vout: u32,
+    hash_hex: String,
+) -> Result<Option<String>> {
+    lwk_wollet::btc::xchain::blocking::read_seq_preimage(&seq_esplora, &seq_leg_txid, seq_vout, &hash_hex).map_err(rerr)
 }
 
 /// A per-asset balance: the asset id (hex) and the amount in atoms (a string to

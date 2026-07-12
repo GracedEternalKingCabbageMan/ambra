@@ -38,6 +38,15 @@ Future<String> receiveAddress({required String mnemonic}) =>
 Future<String> confidentialReceiveAddress({required String mnemonic}) =>
     RustLib.instance.api.crateApiConfidentialReceiveAddress(mnemonic: mnemonic);
 
+/// The blinded (blech32) receive address + its 33-byte blinding pubkey (hex) for a
+/// confidential same-chain DEX credit/refund. `blinding_pub_hex` is empty only if
+/// the address somehow carries no blinding key (never for the CT descriptor).
+Future<ConfidentialReceive> confidentialReceiveWithBlindingPub({
+  required String mnemonic,
+}) => RustLib.instance.api.crateApiConfidentialReceiveWithBlindingPub(
+  mnemonic: mnemonic,
+);
+
 /// The wallet's CT output descriptor for a recovery phrase.
 Future<String> descriptorFromMnemonic({required String mnemonic}) =>
     RustLib.instance.api.crateApiDescriptorFromMnemonic(mnemonic: mnemonic);
@@ -357,6 +366,104 @@ Future<String> xchainBtcRefund({
   feeSats: feeSats,
   redeemScriptHex: redeemScriptHex,
   locktime: locktime,
+);
+
+/// The taker's BTC-leg CLAIM pubkey for a REVERSE swap: the pubkey the maker must
+/// embed as the IF/claim key in its BTC HTLC, and whose secret (kept in-core)
+/// signs the on-chain claim once the maker reveals the preimage. Distinct HD path
+/// from the BTC-refund key, so one leaked key never unlocks both HTLC branches.
+Future<String> xchainBtcClaimPubkey({required String mnemonic}) =>
+    RustLib.instance.api.crateApiXchainBtcClaimPubkey(mnemonic: mnemonic);
+
+/// Build the SEQ-leg HTLC the taker FUNDS in a reverse (asset -> BTC) swap. The
+/// maker CLAIMS it (revealing the preimage) via the IF branch, and the taker
+/// REFUNDS it via the CLTV/ELSE branch after `seq_locktime`. So claim = the
+/// maker's SEQ-claim pubkey and refund = the taker's OWN canonical SEQ key (the
+/// same key [`xchain_seq_claim_pubkey`] returns — reused, so refund recovery is
+/// HD-derivable). Returns the redeemScript plus the Sequentia P2SH address/spk to
+/// fund via [`build_send_tx`] as an explicit recipient.
+Future<SeqHtlcInfo> xchainSeqHtlcReverse({
+  required String mnemonic,
+  required String hashHex,
+  required String makerSeqClaimPubHex,
+  required int seqLocktime,
+}) => RustLib.instance.api.crateApiXchainSeqHtlcReverse(
+  mnemonic: mnemonic,
+  hashHex: hashHex,
+  makerSeqClaimPubHex: makerSeqClaimPubHex,
+  seqLocktime: seqLocktime,
+);
+
+/// Build the taker's BTC CLAIM (reverse swap): spend the maker's funded BTC HTLC
+/// via the IF/preimage branch to `dest_address`, paying `amount - fee`. Only call
+/// once the maker has revealed the preimage on the SEQ leg (read it with
+/// [`xchain_read_seq_preimage`]). Returns raw tx hex for [`btc_broadcast`].
+Future<String> xchainBtcClaim({
+  required String mnemonic,
+  required String btcTxid,
+  required int btcVout,
+  required BigInt btcAmountSats,
+  required String destAddress,
+  required BigInt feeSats,
+  required String redeemScriptHex,
+  required String preimageHex,
+}) => RustLib.instance.api.crateApiXchainBtcClaim(
+  mnemonic: mnemonic,
+  btcTxid: btcTxid,
+  btcVout: btcVout,
+  btcAmountSats: btcAmountSats,
+  destAddress: destAddress,
+  feeSats: feeSats,
+  redeemScriptHex: redeemScriptHex,
+  preimageHex: preimageHex,
+);
+
+/// Build the taker's SEQ asset-leg REFUND (reverse swap): spend the funded SEQ
+/// HTLC back to `dest_address` via the CLTV/ELSE branch, valid once the SEQ tip
+/// reaches `seq_locktime`. The refund key is the taker's OWN canonical SEQ key
+/// (the one [`xchain_seq_htlc_reverse`] embedded as the refund pubkey). `fee_atoms`
+/// is paid in the CLAIMED asset (the HTLC holds no native tSEQ): the caller MUST
+/// derive it from the asset's published rate and cap it at half the output — the
+/// flat forward-direction claim fee would be rejected as "Fee exceeds maximum" for
+/// a valuable asset (memory principle 4). Returns raw Elements tx hex for
+/// [`xchain_seq_broadcast`].
+Future<String> xchainSeqRefund({
+  required String mnemonic,
+  required String seqTxid,
+  required int seqVout,
+  required BigInt seqAmount,
+  required String seqAssetId,
+  required String destAddress,
+  required BigInt feeAtoms,
+  required String redeemScriptHex,
+  required int seqLocktime,
+}) => RustLib.instance.api.crateApiXchainSeqRefund(
+  mnemonic: mnemonic,
+  seqTxid: seqTxid,
+  seqVout: seqVout,
+  seqAmount: seqAmount,
+  seqAssetId: seqAssetId,
+  destAddress: destAddress,
+  feeAtoms: feeAtoms,
+  redeemScriptHex: redeemScriptHex,
+  seqLocktime: seqLocktime,
+);
+
+/// Read the maker's revealed preimage from its on-chain spend of the taker's
+/// funded SEQ asset leg (the reverse-swap reveal). Returns the preimage hex once
+/// the leg is spent and a push hashing to `hash_hex` (H) is visible, else `None`.
+/// The `sha256(push) == H` validation runs in trusted core — the taker learns the
+/// secret from the chain, never on the counterparty's word.
+Future<String?> xchainReadSeqPreimage({
+  required String seqEsplora,
+  required String seqLegTxid,
+  required int seqVout,
+  required String hashHex,
+}) => RustLib.instance.api.crateApiXchainReadSeqPreimage(
+  seqEsplora: seqEsplora,
+  seqLegTxid: seqLegTxid,
+  seqVout: seqVout,
+  hashHex: hashHex,
 );
 
 /// Full-scan the wallet against `esplora_url`, apply the update, and return the
@@ -885,6 +992,31 @@ class BuiltRawTx {
           txid == other.txid;
 }
 
+/// A confidential (blech32 `tsqb…`) receive address together with its 33-byte
+/// blinding pubkey (hex). Both are published in a confidential-book offer's
+/// `same_chain{maker_recv_address, maker_blinding_pub}` so the counterparty can
+/// add a blinded output crediting this leg — both legs blind on-chain. Index 0.
+class ConfidentialReceive {
+  final String address;
+  final String blindingPubHex;
+
+  const ConfidentialReceive({
+    required this.address,
+    required this.blindingPubHex,
+  });
+
+  @override
+  int get hashCode => address.hashCode ^ blindingPubHex.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ConfidentialReceive &&
+          runtimeType == other.runtimeType &&
+          address == other.address &&
+          blindingPubHex == other.blindingPubHex;
+}
+
 /// A BIP86 taproot maker-payout address + its 32-byte covenant `maker_prog`.
 class CovenantMakerAddress {
   /// The 32-byte v1-taproot payout program hex (the offer's `maker_prog`).
@@ -1237,6 +1369,34 @@ class Recipient {
           address == other.address &&
           assetId == other.assetId &&
           satoshi == other.satoshi;
+}
+
+/// A reverse-swap SEQ HTLC the taker FUNDS: its redeemScript + Sequentia P2SH
+/// address/spk. Fund the address with an EXPLICIT (unblinded) asset output via
+/// [`build_send_tx`] so the maker can read the asset + amount before it claims.
+class SeqHtlcInfo {
+  final String redeemScriptHex;
+  final String p2ShAddress;
+  final String p2ShSpkHex;
+
+  const SeqHtlcInfo({
+    required this.redeemScriptHex,
+    required this.p2ShAddress,
+    required this.p2ShSpkHex,
+  });
+
+  @override
+  int get hashCode =>
+      redeemScriptHex.hashCode ^ p2ShAddress.hashCode ^ p2ShSpkHex.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SeqHtlcInfo &&
+          runtimeType == other.runtimeType &&
+          redeemScriptHex == other.redeemScriptHex &&
+          p2ShAddress == other.p2ShAddress &&
+          p2ShSpkHex == other.p2ShSpkHex;
 }
 
 /// The taker half of a same-chain swap: the random swap id + the SwapRequest JSON

@@ -112,6 +112,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BuiltRawTx dco_decode_built_raw_tx(dynamic raw);
 
   @protected
+  ConfidentialReceive dco_decode_confidential_receive(dynamic raw);
+
+  @protected
   CovenantMakerAddress dco_decode_covenant_maker_address(dynamic raw);
 
   @protected
@@ -199,6 +202,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Recipient dco_decode_recipient(dynamic raw);
+
+  @protected
+  SeqHtlcInfo dco_decode_seq_htlc_info(dynamic raw);
 
   @protected
   SeqdexSwapRequestOut dco_decode_seqdex_swap_request_out(dynamic raw);
@@ -312,6 +318,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BuiltRawTx sse_decode_built_raw_tx(SseDeserializer deserializer);
 
   @protected
+  ConfidentialReceive sse_decode_confidential_receive(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   CovenantMakerAddress sse_decode_covenant_maker_address(
     SseDeserializer deserializer,
   );
@@ -413,6 +424,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Recipient sse_decode_recipient(SseDeserializer deserializer);
+
+  @protected
+  SeqHtlcInfo sse_decode_seq_htlc_info(SseDeserializer deserializer);
 
   @protected
   SeqdexSwapRequestOut sse_decode_seqdex_swap_request_out(
@@ -546,6 +560,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_built_raw_tx(BuiltRawTx self, SseSerializer serializer);
 
   @protected
+  void sse_encode_confidential_receive(
+    ConfidentialReceive self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_covenant_maker_address(
     CovenantMakerAddress self,
     SseSerializer serializer,
@@ -676,6 +696,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_recipient(Recipient self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_seq_htlc_info(SeqHtlcInfo self, SseSerializer serializer);
 
   @protected
   void sse_encode_seqdex_swap_request_out(

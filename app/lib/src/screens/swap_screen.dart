@@ -1,8 +1,10 @@
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../data/api_client.dart';
 import '../data/config.dart';
@@ -15,6 +17,7 @@ import '../rust/api.dart' as core;
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 import 'lightning_swap_screen.dart';
+import 'xchain_reverse_swap_screen.dart';
 import 'xchain_swap_screen.dart';
 
 /// Estimated vByte size of a same-chain settlement tx, used to turn the optional
@@ -65,6 +68,15 @@ class _SwapTabState extends State<SwapTab> {
   String? _receiveAsset;
   String? _feeAsset; // null => default (the paid asset)
 
+  // Book namespace: Unblinded (transparent, the default, byte-identical to the
+  // live covenant rail) vs Blinded (confidential). The Blinded book routes to the
+  // relay's segregated confidential namespace (?confidential=1 / the signed
+  // field-19 `confidential:true` tag) that matches confidential-vs-confidential
+  // only, so BOTH swap legs blind on-chain. Persisted wallet-wide.
+  static const _bookPrefKey = 'ambra.dex.book';
+  String _book = 'public';
+  bool get _confBook => _book == 'confidential';
+
   // Composer mode. TAKE lifts resting offers (fields LINKED by book price); POST
   // rests a LIMIT order at your OWN price (fields INDEPENDENT). Auto-defaults to
   // POST on an empty book so a market can be started; `_modeTouched` stops that.
@@ -72,7 +84,7 @@ class _SwapTabState extends State<SwapTab> {
   bool _modeTouched = false;
   String _edited = 'pay'; // which amount the user last typed
 
-  OrderBook? _book;
+  OrderBook? _orderBook;
   SeqObOffer? _selected;
 
   bool _loading = true;
@@ -93,7 +105,35 @@ class _SwapTabState extends State<SwapTab> {
       _receiveAsset = _SwapCache.receiveAsset;
       _loading = false;
     }
-    _load();
+    _bootstrap();
+  }
+
+  Future<void> _bootstrap() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      final v = p.getString(_bookPrefKey);
+      if (mounted) setState(() => _book = v == 'confidential' ? 'confidential' : 'public');
+    } catch (_) {/* default to the transparent book */}
+    await _load();
+  }
+
+  /// Switch the active book namespace. Distinct order sets: the composer reloads
+  /// from the selected namespace and posts into it. Blinded is Sequentia-only and
+  /// interactive-only (no covenant to lift), so it forces POST-mode.
+  Future<void> _setBook(String next) async {
+    next = next == 'confidential' ? 'confidential' : 'public';
+    if (next == _book) return;
+    setState(() {
+      _book = next;
+      _selected = null;
+      _modeTouched = false;
+      if (_confBook) _mode = 'post'; // Blinded book: post-only (lift needs co-sign).
+      _actionError = null;
+    });
+    try {
+      (await SharedPreferences.getInstance()).setString(_bookPrefKey, next);
+    } catch (_) {/* the toggle still works this session */}
+    _fetchBook();
   }
 
   @override
@@ -251,30 +291,36 @@ class _SwapTabState extends State<SwapTab> {
     final pay = _payAsset, recv = _receiveAsset;
     if (pay == null || recv == null || pay == recv) {
       setState(() {
-        _book = null;
+        _orderBook = null;
         _selected = null;
       });
       return;
     }
     setState(() => _bookLoading = true);
     try {
-      final book = await SeqObClient.fetchBook(recv, pay);
+      final book = await SeqObClient.fetchBook(recv, pay, confidential: _confBook);
       if (!mounted) return;
       setState(() {
-        _book = book;
-        _selected = book.best;
+        _orderBook = book;
+        // Blinded offers rest as interactive intents (no covenant to lift), so
+        // they are never auto-selected for a TAKE.
+        _selected = _confBook ? null : book.best;
         _bookLoading = false;
-        if (!_modeTouched) _mode = book.isEmpty ? 'post' : 'take';
+        if (_confBook) {
+          _mode = 'post'; // Blinded book: post-only until the co-sign courier lands.
+        } else if (!_modeTouched) {
+          _mode = book.isEmpty ? 'post' : 'take';
+        }
       });
       _relink();
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _book = null;
+        _orderBook = null;
         _selected = null;
         _bookLoading = false;
         // A missing book is not an error — it just means POST to start the market.
-        if (!_modeTouched) _mode = 'post';
+        _mode = 'post';
       });
     }
   }
@@ -384,10 +430,52 @@ class _SwapTabState extends State<SwapTab> {
   // --- actions ---------------------------------------------------------------
 
   Future<void> _submit() async {
-    if (_mode == 'take') {
+    if (_confBook) {
+      await _confPost();
+    } else if (_mode == 'take') {
       await _take();
     } else {
       await _post();
+    }
+  }
+
+  /// Rest a CONFIDENTIAL (blinded) same-chain offer. Unlike the transparent
+  /// covenant POST, a confidential offer is NOT funded on-chain: it rests as an
+  /// interactive intent carrying a blinded (blech32) receive address + its
+  /// blinding pubkey and the signed `confidential:true` (field-19) tag. A taker
+  /// fills it by co-signing a blinded PSET over the courier — the piece Ambra
+  /// does not have yet (see the on-screen note + openIssues), so for now the
+  /// offer rests and reads confidentially but is not lifted from Ambra.
+  Future<void> _confPost() async {
+    final pay = _payAsset, recv = _receiveAsset;
+    if (pay == null || recv == null) return _snack('Pick what you pay and receive');
+    final payPrec = SeqAssets.labelFor(pay).precision;
+    final recvPrec = SeqAssets.labelFor(recv).precision;
+    final sellAtoms = parseAtoms(_payAmount.text, payPrec);
+    final buyAtoms = parseAtoms(_recvAmount.text, recvPrec);
+    if (sellAtoms == null || sellAtoms <= BigInt.zero) return _snack('Enter how much ${_tk(pay)} to sell');
+    if (buyAtoms == null || buyAtoms <= BigInt.zero) return _snack('Enter your price: how much ${_tk(recv)} you want');
+    final payBal = BigInt.tryParse(_bal(pay)) ?? BigInt.zero;
+    if (sellAtoms > payBal) return _snack('Not enough ${_tk(pay)} to rest this order');
+
+    final txid = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AmbraColors.panel,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+      builder: (_) => _ConfPostReviewSheet(
+        payAsset: pay,
+        sellAtoms: sellAtoms,
+        recvAsset: recv,
+        buyAtoms: buyAtoms,
+        feeAsset: _feeAssetHex,
+      ),
+    );
+    if (txid != null && mounted) {
+      _payAmount.clear();
+      _recvAmount.clear();
+      ScaffoldMessenger.of(context).showSnackBar(ambraSnack('Blinded offer posted · rests confidentially'));
+      _fetchBook();
     }
   }
 
@@ -507,7 +595,7 @@ class _SwapTabState extends State<SwapTab> {
   @override
   Widget build(BuildContext context) {
     final pays = _payableAssets();
-    final book = _book;
+    final book = _orderBook;
     final canAct = !_loading && _error == null && _payAsset != null && _receiveAsset != null;
     return Column(children: [
       Expanded(
@@ -521,6 +609,13 @@ class _SwapTabState extends State<SwapTab> {
             label: 'Buy with Bitcoin (cross-chain)',
             icon: Icons.currency_bitcoin,
             onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const XchainSwapScreen())),
+          ),
+          const SizedBox(height: 10),
+          SecondaryButton(
+            label: 'Sell for Bitcoin (cross-chain)',
+            icon: Icons.currency_bitcoin,
+            onPressed: () =>
+                Navigator.of(context).push(MaterialPageRoute(builder: (_) => const XchainReverseSwapScreen())),
           ),
           ListenableBuilder(
             listenable: LightningService.instance,
@@ -554,7 +649,9 @@ class _SwapTabState extends State<SwapTab> {
                 child: Text('You hold no assets that trade yet. Receive a tradable asset, or use the faucet (More tab).',
                     style: AmbraText.muted))
           else ...[
-            _modeToggle(),
+            _bookToggle(),
+            const SizedBox(height: 12),
+            if (_confBook) _confBookNote() else _modeToggle(),
             const SizedBox(height: 16),
             const SectionLabel('You pay'),
             const SizedBox(height: 8),
@@ -589,9 +686,11 @@ class _SwapTabState extends State<SwapTab> {
             AmbraField(label: 'Fee rate (${_tk(_feeAssetHex)}/vB, optional)', controller: _feeRateCtl, hint: 'suggested'),
             const SizedBox(height: 8),
             Text(
-              _mode == 'take'
-                  ? 'Fee paid in the asset you pay (never the asset you receive). Leave the rate blank for the suggested fee.'
-                  : 'Resting your order funds a covenant on-chain, then posts it to the relay. Cancel anytime; reclaim the funds after expiry.',
+              _confBook
+                  ? 'A blinded offer rests confidentially (no on-chain funding); a taker fills it later by co-signing a blinded swap. Fee terms apply when it settles.'
+                  : _mode == 'take'
+                      ? 'Fee paid in the asset you pay (never the asset you receive). Leave the rate blank for the suggested fee.'
+                      : 'Resting your order funds a covenant on-chain, then posts it to the relay. Cancel anytime; reclaim the funds after expiry.',
               style: AmbraText.sub,
             ),
             if (_actionError != null) ...[
@@ -604,12 +703,85 @@ class _SwapTabState extends State<SwapTab> {
       if (canAct)
         BottomActionBar(children: [
           PrimaryButton(
-            label: _mode == 'take' ? 'Review & take' : 'Review & post',
-            icon: _mode == 'take' ? Icons.swap_horiz : Icons.playlist_add,
+            label: _confBook
+                ? 'Review & post (blinded)'
+                : _mode == 'take'
+                    ? 'Review & take'
+                    : 'Review & post',
+            icon: _confBook
+                ? Icons.lock_outline
+                : _mode == 'take'
+                    ? Icons.swap_horiz
+                    : Icons.playlist_add,
             onPressed: _submit,
           ),
         ]),
     ]);
+  }
+
+  /// Unblinded (transparent, default) vs Blinded (confidential) book namespace.
+  Widget _bookToggle() {
+    Widget seg(String value, String title) {
+      final on = _book == value;
+      return Expanded(
+        child: InkWell(
+          borderRadius: BorderRadius.circular(AmbraRadii.input),
+          onTap: () => _setBook(value),
+          child: Container(
+            padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 12),
+            decoration: BoxDecoration(
+              color: on ? AmbraColors.amber.withValues(alpha: 0.12) : AmbraColors.panelDeep,
+              border: Border.all(color: on ? AmbraColors.amber : AmbraColors.line),
+              borderRadius: BorderRadius.circular(AmbraRadii.input),
+            ),
+            child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+              Icon(value == 'confidential' ? Icons.lock_outline : Icons.visibility_outlined,
+                  size: 16, color: on ? AmbraColors.amber : AmbraColors.dim),
+              const SizedBox(width: 8),
+              Text(title, style: AmbraText.body.copyWith(color: on ? AmbraColors.amber : AmbraColors.txt)),
+            ]),
+          ),
+        ),
+      );
+    }
+
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Row(children: [
+        seg('public', 'Unblinded'),
+        const SizedBox(width: 10),
+        seg('confidential', 'Blinded'),
+      ]),
+      const SizedBox(height: 8),
+      Text(
+        _confBook
+            ? 'Blinded book: both legs settle confidentially (amounts and assets hidden on-chain). Sequentia assets only.'
+            : 'Unblinded book: transparent settlement, the default.',
+        style: AmbraText.sub,
+      ),
+    ]);
+  }
+
+  /// Post-only banner shown in the Blinded book (no covenant to lift; interactive
+  /// filling needs the co-sign courier Ambra does not have yet).
+  Widget _confBookNote() {
+    return AmbraCard(
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Icon(Icons.lock_outline, size: 18, color: AmbraColors.amber),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Post a blinded offer', style: AmbraText.body.copyWith(color: AmbraColors.amber)),
+            const SizedBox(height: 4),
+            const Text(
+              'Your offer rests confidentially with a blinded receive address. Lifting a blinded '
+              'offer needs the maker online to co-sign (coming); resting and reading the blinded '
+              'book work now.',
+              style: AmbraText.sub,
+            ),
+          ]),
+        ),
+      ]),
+    );
   }
 
   Widget _modeToggle() {
@@ -662,9 +834,17 @@ class _SwapTabState extends State<SwapTab> {
     if (book == null || book.isEmpty) {
       return AmbraCard(
         child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          Text('No resting offers for ${_tk(_receiveAsset)} / ${_tk(_payAsset)} yet.', style: AmbraText.muted),
+          Text(
+              _confBook
+                  ? 'No blinded offers for ${_tk(_receiveAsset)} / ${_tk(_payAsset)} yet.'
+                  : 'No resting offers for ${_tk(_receiveAsset)} / ${_tk(_payAsset)} yet.',
+              style: AmbraText.muted),
           const SizedBox(height: 6),
-          const Text('Post a limit order to start this market — you set the price.', style: AmbraText.sub),
+          Text(
+              _confBook
+                  ? 'Post a blinded offer to start this confidential market — you set the price.'
+                  : 'Post a limit order to start this market — you set the price.',
+              style: AmbraText.sub),
         ]),
       );
     }
@@ -674,16 +854,20 @@ class _SwapTabState extends State<SwapTab> {
     return AmbraCard(
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         Row(children: [
-          Text('Order book · buy ${_tk(_receiveAsset)}', style: AmbraText.sub),
+          Text(_confBook ? 'Blinded book · ${_tk(_receiveAsset)}' : 'Order book · buy ${_tk(_receiveAsset)}',
+              style: AmbraText.sub),
           const Spacer(),
           Text('depth ${formatAtoms(book.depthBaseAtoms.toString(), recvPrec)} ${_tk(_receiveAsset)}',
               style: AmbraText.sub),
         ]),
         const Divider(height: 16, color: AmbraColors.line),
         for (final o in rows) _bookRow(o, recvPrec, payPrec),
-        const Padding(
-          padding: EdgeInsets.only(top: 8),
-          child: Text('Settles in ~1 block · anchor-bound to Bitcoin (reverts only if Bitcoin reverts).',
+        Padding(
+          padding: const EdgeInsets.only(top: 8),
+          child: Text(
+              _confBook
+                  ? 'Blinded resting offers (read-only). Lifting needs the maker online to co-sign (coming).'
+                  : 'Settles in ~1 block · anchor-bound to Bitcoin (reverts only if Bitcoin reverts).',
               style: AmbraText.sub),
         ),
       ]),
@@ -989,6 +1173,138 @@ class _PostReviewSheetState extends State<_PostReviewSheet> {
               _Row('Funding fee', _amt(widget.feeAsset, widget.feeAtoms)),
               _Row('Order', 'Rests as a funded covenant; a taker fills it at your price.'),
               _Row('Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'),
+            ]),
+          ),
+          const SizedBox(height: 14),
+          if (_busy && _status.isNotEmpty)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_status, style: AmbraText.muted)),
+          if (_error != null)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
+          PrimaryButton(label: 'Confirm & post', busy: _busy, icon: Icons.fingerprint, onPressed: _busy ? null : _confirm),
+          const SizedBox(height: 6),
+          GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
+        ]),
+      ),
+    );
+  }
+}
+
+/// Confirm + post a CONFIDENTIAL (blinded) resting offer. No on-chain funding:
+/// the offer rests as an interactive intent carrying a blinded (blech32) receive
+/// address + its blinding pubkey and the signed `confidential:true` (field-19)
+/// tag, so both legs blind on-chain when a maker later co-signs the fill. The
+/// interactive fill itself is the documented courier residual.
+class _ConfPostReviewSheet extends StatefulWidget {
+  const _ConfPostReviewSheet({
+    required this.payAsset,
+    required this.sellAtoms,
+    required this.recvAsset,
+    required this.buyAtoms,
+    required this.feeAsset,
+  });
+  final String payAsset;
+  final BigInt sellAtoms;
+  final String recvAsset;
+  final BigInt buyAtoms;
+  final String feeAsset;
+  @override
+  State<_ConfPostReviewSheet> createState() => _ConfPostReviewSheetState();
+}
+
+class _ConfPostReviewSheetState extends State<_ConfPostReviewSheet> {
+  bool _busy = false;
+  String _status = '';
+  String? _error;
+
+  String _amt(String hex, BigInt atoms) {
+    final l = SeqAssets.labelFor(hex);
+    return '${formatAtoms(atoms.toString(), l.precision)} ${l.ticker}';
+  }
+
+  /// A random 16-byte hex offer id (matches the web wallet's `seqob.randHex(16)`).
+  String _randHex16() {
+    final r = Random.secure();
+    final b = List<int>.generate(16, (_) => r.nextInt(256));
+    return b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
+  }
+
+  Future<void> _confirm() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+      _status = 'Authenticating…';
+    });
+    try {
+      final ok = await WalletRepository.instance.requirePaymentAuth();
+      if (!ok) {
+        setState(() {
+          _busy = false;
+          _error = 'Authentication failed or cancelled; nothing posted.';
+        });
+        return;
+      }
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) throw Exception('wallet unavailable');
+
+      setState(() => _status = 'Deriving your blinded receive address…');
+      final recv = await core.confidentialReceiveWithBlindingPub(mnemonic: m);
+
+      setState(() => _status = 'Signing your blinded offer…');
+      final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final offer = <String, dynamic>{
+        'offer_id': _randHex16(),
+        'schema_version': 1,
+        'pair': {'base_asset': widget.payAsset, 'quote_asset': widget.recvAsset},
+        'trade_dir': 1, // SELL: maker gives base (= the asset you pay)
+        'base_amount': widget.sellAtoms.toString(),
+        'offer_amount': widget.sellAtoms.toString(),
+        'offer_asset': widget.payAsset,
+        'want_amount': widget.buyAtoms.toString(),
+        'want_asset': widget.recvAsset,
+        'allow_partial': true,
+        'created_at_unix': '$now',
+        'expires_at_unix': '${now + 3600}',
+        'fee_asset_hint': widget.feeAsset,
+        'confidential': true, // signed book-namespace tag (field 19)
+        'same_chain': {
+          'maker_recv_address': recv.address,
+          'maker_blinding_pub': recv.blindingPubHex,
+        },
+      };
+      final signed = await core.seqobSignOffer(mnemonic: m, offerJson: jsonEncode(offer));
+
+      setState(() => _status = 'Posting to the confidential book…');
+      await SeqObClient.postConfidentialOffer(jsonDecode(signed) as Map<String, dynamic>);
+
+      if (mounted) Navigator.pop(context, offer['offer_id'] as String);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = e.toString().replaceFirst('Exception: ', '');
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          const Text('Review · post blinded offer', style: AmbraText.h1),
+          const SizedBox(height: 18),
+          AmbraCard(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Column(children: [
+              _Row('You sell', _amt(widget.payAsset, widget.sellAtoms)),
+              _Row('You want', _amt(widget.recvAsset, widget.buyAtoms)),
+              _Row('Privacy', 'Blinded book — your offer rests confidentially; a blinded receive '
+                  'address and blinding pubkey are published so the counterparty can blind their leg too.'),
+              _Row('Filling', 'A taker fills it by co-signing a blinded swap. In-wallet co-sign is coming; '
+                  'for now the offer rests and you can cancel it anytime.'),
+              _Row('Finality', 'Settles in ~1 block · anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'),
             ]),
           ),
           const SizedBox(height: 14),
