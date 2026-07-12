@@ -22,6 +22,13 @@ use lwk_wollet::bitcoin::hex::FromHex;
 use lwk_wollet::elements::{Address, AssetId, Txid};
 use lwk_wollet::secp256k1::PublicKey;
 use lwk_wollet::TxBuilder;
+use lwk_wollet::{
+    build_covenant_fill_tx, covenant_secret_from_hex, maker_payout_program, Chain, CovenantFillPlan,
+    CovenantInput, FillCredit, FillRemainder, TakerFundingInput,
+};
+
+use crate::seqob_covenant_derive as covd;
+use crate::seqob_wire as wire;
 
 fn err(s: String) -> anyhow::Error {
     anyhow::Error::msg(s)
@@ -218,6 +225,560 @@ pub fn seqdex_sign_accept(mnemonic: String, esplora_url: String, accept_pset: St
         // strip them (the partial signatures stay) before CompleteTrade.
         crate::seqdex::strip_bip32(&pset.to_string()).map_err(err)
     })
+}
+
+// --- SeqOB passive-CLOB covenant order book (same-chain, transparent) --------
+//
+// The web wallet replaced the RFQ daemon with the P2P SeqOB relay: a maker RESTS
+// a self-enforcing covenant limit order ("the order is the coin") and a taker
+// LIFTS it by broadcasting a permissionless FILL. These FFIs reuse the SWK raw-tx
+// assemblers (build_covenant_fill_tx) + the ported byte-exact derivation
+// (seqob_covenant_derive) + the ported relay wire (seqob_wire). The plain-HTTP
+// relay transport itself lives in Dart (seqob_client.dart); every signature is
+// produced here so the bytes match the Go relay.
+
+/// The BIP84 coin type: 1 on testnet/regtest, 1776 on mainnet (matches
+/// `lwk_common::singlesig_desc`). Ambra is testnet-only for now.
+const SEQ_COIN_TYPE: u32 = 1;
+
+/// Derive the maker's stable SeqOB identity private key (NOT a fund key) from the
+/// wallet seed: `sha256("seqob-maker-identity-v1" || bip39_seed)`.
+fn maker_identity_priv(mnemonic: &str) -> Result<[u8; 32]> {
+    let signer = SwSigner::new(mnemonic, false).map_err(rerr)?;
+    let seed = signer
+        .seed()
+        .ok_or_else(|| err("wallet seed unavailable for maker identity".into()))?;
+    wire::maker_key_from_seed(&seed).map_err(err)
+}
+
+/// A BIP86 taproot maker-payout address + its 32-byte covenant `maker_prog`.
+pub struct CovenantMakerAddress {
+    /// The 32-byte v1-taproot payout program hex (the offer's `maker_prog`).
+    pub program_hex: String,
+    /// The `OP_1 <program>` scriptPubKey the FILL credit pays.
+    pub spk_hex: String,
+    /// The unblinded (transparent) BIP86 taproot receive address.
+    pub address: String,
+    /// The x-only internal key hex (the offer's `maker_x`, REFUND authoriser).
+    pub internal_key_hex: String,
+    /// The derivation path `m/86'/coin'/0'/0/index`.
+    pub path: String,
+}
+
+/// Derive the maker payout at `m/86'/coin'/0'/0/index` — the taproot output the
+/// covenant FILL credits, and the x-only key the REFUND leaf commits to.
+pub fn covenant_maker_address(mnemonic: String, index: u32) -> Result<CovenantMakerAddress> {
+    let (program, spk, internal_hex) = derive_maker_payout(&mnemonic, index)?;
+    let script = lwk_wollet::elements::Script::from(hexbytes(&spk)?);
+    let address =
+        lwk_wollet::elements::Address::from_script(&script, None, seq_addr_params())
+            .ok_or_else(|| err("cannot form taproot address from program".into()))?;
+    Ok(CovenantMakerAddress {
+        program_hex: program,
+        spk_hex: spk,
+        address: address.to_string(),
+        internal_key_hex: internal_hex,
+        path: format!("m/86'/{SEQ_COIN_TYPE}'/0'/0/{index}"),
+    })
+}
+
+/// The Sequentia transparent-address params (Elements bech32 HRP on testnet).
+fn seq_addr_params() -> &'static lwk_wollet::elements::AddressParams {
+    &lwk_wollet::elements::AddressParams::ELEMENTS
+}
+
+/// Derive `(maker_prog_hex, spk_hex, internal_x_only_hex)` for a maker index.
+fn derive_maker_payout(mnemonic: &str, index: u32) -> Result<(String, String, String)> {
+    use lwk_wollet::bitcoin::secp256k1::Secp256k1;
+    let signer = SwSigner::new(mnemonic, false).map_err(rerr)?;
+    let path = DerivationPath::from(vec![
+        ChildNumber::Hardened { index: 86 },
+        ChildNumber::Hardened { index: SEQ_COIN_TYPE },
+        ChildNumber::Hardened { index: 0 },
+        ChildNumber::Normal { index: 0 },
+        ChildNumber::Normal { index },
+    ]);
+    let xprv = signer.derive_xprv(&path).map_err(rerr)?;
+    let secp = Secp256k1::signing_only();
+    let (internal, _parity) = xprv.private_key.public_key(&secp).x_only_public_key();
+    let (program, spk) = maker_payout_program(internal).map_err(rerr)?;
+    Ok((tohex(&program), tohex(&spk), tohex(&internal.serialize())))
+}
+
+/// The prepared (pre-funding) parameters for a covenant resting LIMIT order.
+pub struct CovenantPrepared {
+    /// Opaque JSON round-tripped back into `covenant_finalize_offer` after funding.
+    pub prepared_json: String,
+    /// The address the maker must FUND with `sell_atoms` of the sold asset.
+    pub covenant_address: String,
+    /// The covenant scriptPubKey (used to locate the funded vout after funding).
+    pub covenant_spk_hex: String,
+    /// Atoms of the wanted asset a FULL fill pays the maker (ceil price).
+    pub required_b: String,
+    /// The min-lot floor (atoms of the sold asset) a taker may fill.
+    pub min_lot: String,
+    /// The absolute REFUND expiry height.
+    pub expiry_locktime: u32,
+    /// The fresh maker payout index used (persist to avoid credit collisions).
+    pub maker_index: u32,
+    /// The maker's SeqOB identity pubkey hex (offer namespace + cancel auth).
+    pub maker_pubkey: String,
+}
+
+/// Derive everything a covenant resting LIMIT order needs, WITHOUT wallet I/O:
+/// the covenant scriptPubKey/address to fund, the reduced rate, the min-lot, and
+/// the maker payout. The caller then funds `covenant_address` with `sell_atoms`
+/// of `sell_asset` (via the ordinary send path) and calls
+/// `covenant_finalize_offer` with the funded txid/vout.
+#[allow(clippy::too_many_arguments)]
+pub fn covenant_prepare_offer(
+    mnemonic: String,
+    sell_asset: String,
+    sell_atoms: u64,
+    buy_asset: String,
+    buy_atoms: u64,
+    tip_height: u32,
+    expiry_blocks: u32,
+    maker_index: u32,
+) -> Result<CovenantPrepared> {
+    if sell_atoms == 0 || buy_atoms == 0 {
+        return Err(err("amounts must be greater than zero".into()));
+    }
+    let (rate_num, rate_den) = covd::compute_rate(sell_atoms, buy_atoms).map_err(err)?;
+    let min_lot = {
+        let f = sell_atoms / 1000; // covenantMinLot: 0.1%, min 1 (partial-fillable)
+        if f > 0 {
+            f
+        } else {
+            1
+        }
+    };
+    let expiry = covd::order_expiry(tip_height, expiry_blocks);
+    let (maker_prog, _maker_spk, maker_x) = derive_maker_payout(&mnemonic, maker_index)?;
+
+    let payout = covenant_maker_address(mnemonic.clone(), maker_index)?;
+    let order = covd::DeriveOrder {
+        asset_a: sell_asset.clone(),
+        asset_b: buy_asset.clone(),
+        rate_num,
+        rate_den,
+        min_lot,
+        maker_prog: maker_prog.clone(),
+        maker_ver: 1,
+        expiry_locktime: expiry,
+        maker_x: maker_x.clone(),
+        internal_key: None, // NUMS: no maker key-path spend
+    };
+    let tap = covd::derive_taptree(&order).map_err(err)?;
+    let spk_hex = tohex(&tap.script_pubkey);
+    let script = lwk_wollet::elements::Script::from(tap.script_pubkey.clone());
+    let cov_address = lwk_wollet::elements::Address::from_script(&script, None, seq_addr_params())
+        .ok_or_else(|| err("cannot form covenant address".into()))?
+        .to_string();
+
+    let maker_pubkey = wire::maker_pubkey_hex(&maker_identity_priv(&mnemonic)?).map_err(err)?;
+    let required_b = covd::ceil_price(sell_atoms, rate_num, rate_den);
+    let internal_key_hex = tohex(&tap.internal_key);
+    let merkle_path: Vec<String> = tap.merkle_path.iter().map(|p| tohex(p)).collect();
+
+    let prepared = serde_json::json!({
+        "sell_asset": sell_asset,
+        "buy_asset": buy_asset,
+        "sell_atoms": sell_atoms.to_string(),
+        "buy_atoms": buy_atoms.to_string(),
+        "rate_num": rate_num.to_string(),
+        "rate_den": rate_den.to_string(),
+        "min_lot": min_lot.to_string(),
+        "expiry_locktime": expiry,
+        "maker_prog": maker_prog,
+        "maker_prog_ver": 1,
+        "maker_x": maker_x,
+        "internal_key": internal_key_hex,
+        "merkle_path": merkle_path,
+        "maker_recv_address": payout.address,
+        "maker_pubkey": maker_pubkey,
+        "spk_hex": spk_hex,
+    });
+
+    Ok(CovenantPrepared {
+        prepared_json: prepared.to_string(),
+        covenant_address: cov_address,
+        covenant_spk_hex: spk_hex,
+        required_b: required_b.to_string(),
+        min_lot: min_lot.to_string(),
+        expiry_locktime: expiry,
+        maker_index,
+        maker_pubkey,
+    })
+}
+
+/// After funding the covenant, assemble the `seqob.v1.Offer` (covenant resting
+/// SELL) from the prepared params + the funded `covenant_txid`:`covenant_vout`,
+/// sign it with the maker identity key, and return the signed offer JSON (hex
+/// `bytes` fields). The caller converts the covenant hex fields to base64 for the
+/// grpc-gateway POST (`seqob_client.dart`).
+pub fn covenant_finalize_offer(
+    mnemonic: String,
+    prepared_json: String,
+    covenant_txid: String,
+    covenant_vout: u32,
+) -> Result<String> {
+    let p: serde_json::Value =
+        serde_json::from_str(&prepared_json).map_err(|e| err(format!("bad prepared json: {e}")))?;
+    let s = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    let sell_asset = s("sell_asset");
+    let buy_asset = s("buy_asset");
+    let sell_atoms = s("sell_atoms");
+    let buy_atoms = s("buy_atoms");
+
+    let covenant = serde_json::json!({
+        "covenant_txid": covenant_txid,
+        "covenant_vout": covenant_vout,
+        "asset_a": sell_asset,
+        "asset_b": buy_asset,
+        "rate_num": s("rate_num"),
+        "rate_den": s("rate_den"),
+        "maker_prog": s("maker_prog"),
+        "maker_prog_ver": p.get("maker_prog_ver").and_then(|v| v.as_u64()).unwrap_or(1),
+        "min_lot": s("min_lot"),
+        "expiry_locktime": p.get("expiry_locktime").and_then(|v| v.as_u64()).unwrap_or(0),
+        "maker_x": s("maker_x"),
+        "internal_key": s("internal_key"),
+        "merkle_path": p.get("merkle_path").cloned().unwrap_or(serde_json::json!([])),
+    });
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ttl = 3600u64;
+    // A unique offer id derived from the funding outpoint + time (16 bytes hex).
+    let offer_id = {
+        use lwk_wollet::elements::hashes::{sha256, Hash};
+        let seed = format!("{covenant_txid}:{covenant_vout}:{now}");
+        let h = sha256::Hash::hash(seed.as_bytes()).to_byte_array();
+        tohex(&h[..8])
+    };
+
+    let mut offer = serde_json::json!({
+        "offer_id": offer_id,
+        "schema_version": 1,
+        "pair": { "base_asset": sell_asset, "quote_asset": buy_asset },
+        "trade_dir": 1, // SELL: maker gives base (asset A)
+        "base_amount": sell_atoms,
+        "offer_amount": sell_atoms, "offer_asset": sell_asset,
+        "want_amount": buy_atoms, "want_asset": buy_asset,
+        "allow_partial": true,
+        "min_fill": s("min_lot"),
+        "created_at_unix": now.to_string(),
+        "expires_at_unix": (now + ttl).to_string(),
+        "fee_asset_hint": buy_asset,
+        "same_chain": { "maker_recv_address": s("maker_recv_address") },
+        "covenant": covenant,
+    });
+
+    let priv_key = maker_identity_priv(&mnemonic)?;
+    wire::sign_offer(&mut offer, &priv_key).map_err(err)?;
+    Ok(offer.to_string())
+}
+
+/// Sign an already-assembled offer JSON with the maker identity key (used when the
+/// caller builds the offer object itself). Returns the signed offer JSON.
+pub fn seqob_sign_offer(mnemonic: String, offer_json: String) -> Result<String> {
+    let mut offer: serde_json::Value =
+        serde_json::from_str(&offer_json).map_err(|e| err(format!("bad offer json: {e}")))?;
+    let priv_key = maker_identity_priv(&mnemonic)?;
+    wire::sign_offer(&mut offer, &priv_key).map_err(err)?;
+    Ok(offer.to_string())
+}
+
+/// Verify a relay-served offer's maker signature locally (the relay is untrusted).
+pub fn seqob_verify_offer(offer_json: String) -> Result<bool> {
+    let offer: serde_json::Value =
+        serde_json::from_str(&offer_json).map_err(|e| err(format!("bad offer json: {e}")))?;
+    Ok(wire::verify_offer(&offer))
+}
+
+/// The maker's SeqOB identity pubkey hex (offer namespace + `myOffers` lookup).
+pub fn seqob_maker_pubkey(mnemonic: String) -> Result<String> {
+    wire::maker_pubkey_hex(&maker_identity_priv(&mnemonic)?).map_err(err)
+}
+
+/// Sign an `OfferCancel` for an offer this wallet made. Returns the cancel JSON
+/// to POST to `/v1/offers/cancel`.
+pub fn seqob_sign_cancel(mnemonic: String, offer_id: String, nonce: u64) -> Result<String> {
+    let priv_key = maker_identity_priv(&mnemonic)?;
+    let cancel = wire::sign_cancel(&offer_id, &priv_key, nonce).map_err(err)?;
+    Ok(cancel.to_string())
+}
+
+/// The built raw FILL/lift transaction: Elements hex + its txid.
+pub struct BuiltRawTx {
+    pub raw_hex: String,
+    pub txid: String,
+}
+
+/// Assemble + sign the permissionless covenant FILL (TAKE/lift) that fills a
+/// chosen resting offer. `covenant_terms_json` is the offer's `CovenantTerms`
+/// (from the relay book). The covenant is trustlessly re-derived and checked
+/// against the funded UTXO's on-chain scriptPubKey (anti-relay-lie); the taker's
+/// own asset-B + fee UTXOs fund the maker credit + network fee. `take_atoms` is
+/// clamped to the covenant's locked amount. The fee is paid in `fee_asset`
+/// (open fee market; must NOT be the sold asset A). Returns the raw Elements tx
+/// hex to broadcast via `xchain_seq_broadcast`.
+pub fn covenant_build_fill_tx(
+    mnemonic: String,
+    esplora_url: String,
+    covenant_terms_json: String,
+    take_atoms: u64,
+    fee_asset: String,
+    fee_atoms: u64,
+) -> Result<BuiltRawTx> {
+    let ct: serde_json::Value = serde_json::from_str(&covenant_terms_json)
+        .map_err(|e| err(format!("bad covenant terms json: {e}")))?;
+    let order = order_from_terms(&ct)?;
+    let cov_txid = ct_str(&ct, &["covenant_txid", "covenantTxid"]);
+    let cov_vout = ct_u64(&ct, &["covenant_vout", "covenantVout"]) as u32;
+    if cov_txid.is_empty() {
+        return Err(err("covenant terms missing covenant_txid".into()));
+    }
+
+    // Fetch the funded UTXO on-chain: its real spk (for the anti-relay-lie check),
+    // locked value, and asset.
+    let (onchain_spk, locked, onchain_asset) = fetch_utxo(&esplora_url, &cov_txid, cov_vout)?;
+    let onchain_spk_bytes = hexbytes(&onchain_spk)?;
+    let tap = covd::verify_against_spk(&order, &onchain_spk_bytes, false).map_err(err)?;
+    if onchain_asset != order.asset_a {
+        return Err(err(format!(
+            "funded covenant asset {onchain_asset} != terms asset_a {}",
+            order.asset_a
+        )));
+    }
+
+    let filled = take_atoms.min(locked);
+    let plan = covd::plan_fill(&order, locked, filled).map_err(err)?;
+
+    let a_asset = AssetId::from_str(&order.asset_a).map_err(rerr)?;
+    let b_asset = AssetId::from_str(&order.asset_b).map_err(rerr)?;
+    let fee_asset_id = AssetId::from_str(&fee_asset).map_err(rerr)?;
+    if fee_asset_id == a_asset {
+        return Err(err(
+            "fee asset must not be the covenant's sold asset A (fund the fee from asset B or another asset)".into(),
+        ));
+    }
+
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let signer = SwSigner::new(&mnemonic, false).map_err(rerr)?;
+
+        // Fund the maker credit (asset B) + the network fee (fee asset) from the
+        // taker's own coins. Asset A comes entirely from the covenant.
+        let mut need: std::collections::BTreeMap<AssetId, u64> = std::collections::BTreeMap::new();
+        *need.entry(b_asset).or_insert(0) += plan.required_b;
+        *need.entry(fee_asset_id).or_insert(0) += fee_atoms;
+
+        let taker_inputs = select_taker_inputs(wollet, &signer, &need, a_asset)?;
+
+        let receipt_addr = wollet
+            .address(None)
+            .map_err(rerr)?
+            .address()
+            .to_unconfidential();
+        let change_addr = receipt_addr.clone();
+
+        let remainder = if plan.partial {
+            Some(FillRemainder {
+                asset: a_asset,
+                value: plan.remainder,
+                spk: tap.script_pubkey.clone(),
+            })
+        } else {
+            None
+        };
+
+        let fill_plan = CovenantFillPlan {
+            covenant: CovenantInput {
+                txid: cov_txid.clone(),
+                vout: cov_vout,
+                asset: a_asset,
+                locked,
+                fill_leaf: tap.fill_leaf.clone(),
+                control_block: tap.control_block.clone(),
+            },
+            credit: FillCredit {
+                asset: b_asset,
+                program: hexbytes(&order.maker_prog)?,
+                version: order.maker_ver,
+                value: plan.required_b,
+            },
+            remainder,
+            taker_inputs,
+            receipt_addr,
+            change_addr,
+            fee_atoms,
+            fee_asset: fee_asset_id,
+        };
+
+        let (raw_hex, txid) = build_covenant_fill_tx(&fill_plan).map_err(rerr)?;
+        Ok(BuiltRawTx {
+            raw_hex,
+            txid: txid.to_string(),
+        })
+    })
+}
+
+/// Parse a relay `CovenantTerms` object into the pure derive order.
+fn order_from_terms(ct: &serde_json::Value) -> Result<covd::DeriveOrder> {
+    let internal_key = {
+        let ik = ct_str(ct, &["internal_key", "internalKey"]);
+        if ik.is_empty() {
+            None
+        } else {
+            Some(ik)
+        }
+    };
+    Ok(covd::DeriveOrder {
+        asset_a: ct_str(ct, &["asset_a", "assetA"]),
+        asset_b: ct_str(ct, &["asset_b", "assetB"]),
+        rate_num: ct_u64(ct, &["rate_num", "rateNum"]),
+        rate_den: ct_u64(ct, &["rate_den", "rateDen"]),
+        min_lot: ct_u64(ct, &["min_lot", "minLot"]),
+        maker_prog: ct_str(ct, &["maker_prog", "makerProg"]),
+        maker_ver: ct_u64(ct, &["maker_prog_ver", "makerProgVer"]).max(1) as u8,
+        expiry_locktime: ct_u64(ct, &["expiry_locktime", "expiryLocktime"]) as u32,
+        maker_x: ct_str(ct, &["maker_x", "makerX"]),
+        internal_key,
+    })
+}
+
+fn ct_str(o: &serde_json::Value, names: &[&str]) -> String {
+    for n in names {
+        if let Some(v) = o.get(*n) {
+            if let Some(s) = v.as_str() {
+                return s.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn ct_u64(o: &serde_json::Value, names: &[&str]) -> u64 {
+    for n in names {
+        if let Some(v) = o.get(*n) {
+            if let Some(u) = v.as_u64() {
+                return u;
+            }
+            if let Some(s) = v.as_str() {
+                if let Ok(u) = s.parse::<u64>() {
+                    return u;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Fetch a funded output's `(scriptpubkey_hex, value_atoms, asset_display_hex)`
+/// from the wallet's own esplora `/tx/{txid}`.
+fn fetch_utxo(esplora_url: &str, txid: &str, vout: u32) -> Result<(String, u64, String)> {
+    let url = format!("{}/tx/{}", esplora_url.trim_end_matches('/'), txid);
+    let mut req = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(rerr)?
+        .get(&url);
+    if let Some(auth) = crate::auth_header() {
+        req = req.header("Authorization", auth);
+    }
+    let resp = req.send().map_err(rerr)?;
+    if !resp.status().is_success() {
+        return Err(err(format!("esplora /tx/{txid} returned {}", resp.status())));
+    }
+    let tx: serde_json::Value = resp.json().map_err(rerr)?;
+    let outs = tx
+        .get("vout")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| err("esplora tx has no vout array".into()))?;
+    let o = outs
+        .get(vout as usize)
+        .ok_or_else(|| err(format!("tx {txid} has no vout {vout}")))?;
+    let spk = o
+        .get("scriptpubkey")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| err("vout missing scriptpubkey".into()))?
+        .to_string();
+    let value = o
+        .get("value")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| err("vout has no explicit value (confidential?)".into()))?;
+    let asset = o
+        .get("asset")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| err("vout has no explicit asset".into()))?
+        .to_string();
+    Ok((spk, value, asset))
+}
+
+/// Greedy largest-first coin selection of the taker's OWN p2wpkh UTXOs covering
+/// `need` (per asset), re-deriving each signing key at `m/84'/coin'/0'/chain/index`.
+/// Rejects funding the covenant's sold asset `a_asset`.
+fn select_taker_inputs(
+    wollet: &lwk_wollet::Wollet,
+    signer: &SwSigner,
+    need: &std::collections::BTreeMap<AssetId, u64>,
+    a_asset: AssetId,
+) -> Result<Vec<TakerFundingInput>> {
+    let utxos = wollet.utxos().map_err(rerr)?;
+    let mut out: Vec<TakerFundingInput> = Vec::new();
+    for (asset, target) in need {
+        if *asset == a_asset {
+            return Err(err("cannot fund the covenant's sold asset A".into()));
+        }
+        let mut cands: Vec<&lwk_wollet::WalletTxOut> = utxos
+            .iter()
+            .filter(|u| u.unblinded.asset == *asset && !u.is_spent)
+            .collect();
+        cands.sort_by(|a, b| b.unblinded.value.cmp(&a.unblinded.value));
+        let mut sum: u64 = 0;
+        for u in cands {
+            if sum >= *target {
+                break;
+            }
+            let spk = u.script_pubkey.as_bytes().to_vec();
+            if spk.len() != 22 || spk[0] != 0x00 || spk[1] != 0x14 {
+                continue; // only key-path p2wpkh coins are spendable by this builder
+            }
+            let chain = match u.ext_int {
+                Chain::Internal => 1u32,
+                Chain::External => 0u32,
+            };
+            let path = DerivationPath::from(vec![
+                ChildNumber::Hardened { index: 84 },
+                ChildNumber::Hardened { index: SEQ_COIN_TYPE },
+                ChildNumber::Hardened { index: 0 },
+                ChildNumber::Normal { index: chain },
+                ChildNumber::Normal { index: u.wildcard_index },
+            ]);
+            let xprv = signer.derive_xprv(&path).map_err(rerr)?;
+            let secret_key =
+                covenant_secret_from_hex(&tohex(&xprv.private_key.secret_bytes())).map_err(rerr)?;
+            out.push(TakerFundingInput {
+                txid: u.outpoint.txid.to_string(),
+                vout: u.outpoint.vout,
+                value: u.unblinded.value,
+                asset: *asset,
+                spk,
+                secret_key,
+            });
+            sum += u.unblinded.value;
+        }
+        if sum < *target {
+            return Err(err(format!(
+                "insufficient {asset}: need {target}, have {sum}"
+            )));
+        }
+    }
+    Ok(out)
 }
 
 // --- SeqDEX cross-chain (BTC <-> SEQ asset) HTLC swap -------------------------
