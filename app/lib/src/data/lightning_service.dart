@@ -3,7 +3,9 @@ import 'package:flutter/foundation.dart';
 import '../rust/api/signer.dart' as ffi;
 import 'config.dart';
 import 'lsp_client.dart';
+import 'seqln_keys.dart' as keys;
 import 'seqln_signer.dart';
+import 'wallet_repository.dart';
 
 /// Ambra's Lightning controller — the mobile twin of the web wallet's `seqln.js`
 /// module state + `index.html`'s `initLightning`. Under the hosted-SeqLN LSP
@@ -101,15 +103,133 @@ class LightningService extends ChangeNotifier {
     } catch (_) {}
     _signer = null;
     connected = false;
+    for (final n in _own.values) {
+      try {
+        await n.signer?.disconnect();
+      } catch (_) {}
+      n.signer = null;
+      n.connected = false;
+    }
+    _own.clear();
     _set('idle');
   }
 
   // -- LSP HTTP delegates (available even before the signer serves, for status) --
 
-  Future<LspStatus> getStatus() => LspClient.getStatus();
+  /// Hosted-node status. Pass [nodes] — this device's OWN provisioned-node keys (from
+  /// seqln_keys.dart) — so `/status` also reports THIS device's per-asset channels across restarts.
+  Future<LspStatus> getStatus({List<String>? nodes}) => LspClient.getStatus(nodes: nodes);
 
   Future<LspSwapResult> swap({required String side, required String asset, required num amount}) =>
       LspClient.swap(side: side, asset: asset, amount: amount);
+
+  // -- per-asset OWN-node signers: general Lightning pay / receive + Move-to-Lightning ----------
+  // The shared [start]/[_signer] above serves the DEMO node. General pay/receive and the Balance
+  // channel flows act on the user's OWN, per-asset (or per-BTC) hosted node, each with its own
+  // device signer. This registry keeps those signers keyed by LSP node_key so repeat calls
+  // re-attach idempotently. 100% Dart orchestration over the existing FFIs (the twin of seqln.js's
+  // provisionAndConnect + the provNodes map); no new Rust.
+
+  final Map<String, _OwnNode> _own = {};
+
+  /// The registry key for this device's OWN hosted node for [asset] (or the BTC node when
+  /// [chain] == 'btc'), reconstructable purely from the mnemonic. Used to thread `?nodes=` into
+  /// [getStatus] and to name the node in deposit/open/close.
+  String ownNodeKey(String mnemonic, {String chain = 'seq', String? asset}) =>
+      chain == 'btc' ? keys.ownNodeKeyForBtc(mnemonic) : keys.ownNodeKeyForAsset(mnemonic, asset!);
+
+  /// True once the OWN-node signer for [nodeKey] is connected (so its node can pay/receive/close).
+  bool ownConnected(String nodeKey) => _own[nodeKey]?.connected == true;
+
+  /// Provision (or re-attach) the user's OWN hosted node for [asset] (Sequentia) or the BTC node
+  /// ([chain] == 'btc'), and bring its on-device signer online over the node's Noise responder.
+  /// Idempotent per node_key: a live signer is reused. Returns the LSP registry node_key. Throws a
+  /// clean message when Lightning is not [configured] (dormant) or the signer cannot come online.
+  /// Mirrors seqln.js provisionAndConnect.
+  Future<String> connectNode(String mnemonic, {String chain = 'seq', String? asset}) async {
+    if (!configured) throw Exception('Lightning is not enabled on this node.');
+    final btc = chain == 'btc';
+    if (!btc && (asset == null || asset.isEmpty)) throw Exception('connectNode: an asset id is required.');
+    final id = btc ? keys.lnDeriveNode(mnemonic, 'btc') : keys.lnDeriveAsset(mnemonic, asset!);
+    final devicePub = keys.deviceTransportPubkey(id.transportPrivkey);
+    final label = btc ? 'BTC' : SeqAssets.labelFor(asset!).ticker;
+    final node = await LspClient.provisionNode(
+      deviceTransportPubkey: devicePub,
+      asset: btc ? null : asset,
+      chain: btc ? 'btc' : 'seq',
+      label: label,
+    );
+    final nodeKey = node.key.isNotEmpty
+        ? node.key
+        : (btc ? keys.ownNodeKeyForBtc(mnemonic) : keys.ownNodeKeyForAsset(mnemonic, asset!));
+    final existing = _own[nodeKey];
+    if (existing != null && existing.connected) return nodeKey; // already serving
+    final wsPath = node.publicWsPath;
+    final hostPub = node.hostPubkey;
+    if (wsPath == null || wsPath.isEmpty || hostPub == null || hostPub.isEmpty) {
+      throw Exception('Your Lightning node is still preparing; try again in a moment.');
+    }
+    // A freshly provisioned node boots + rescans before its RPC answers; wait (bounded) so the
+    // first use after connect never hits a "node not ready" error.
+    try {
+      await LspClient.waitNodeReady(nodeKey);
+    } catch (_) {/* the signer connect below surfaces a link error if it truly isn't up */}
+    final wsUrl = _wsBaseFor() + wsPath;
+    final signer = SeqlnSigner.fromMnemonic(mnemonic)
+      ..setPolicy(Backend.lnPolicy == 'enforce' ? SeqlnPolicy.enforce : SeqlnPolicy.permissive);
+    final own = _own[nodeKey] = _OwnNode();
+    signer.onStatus = (st) {
+      own.nodeId = st.nodeId ?? own.nodeId;
+      if (st.state == 'closed' || st.state == 'error') {
+        own.connected = false;
+        own.signer = null; // null the dead signer so a later reconnect rebuilds (mirrors seqln.js)
+      }
+    };
+    own.signer = signer;
+    try {
+      await signer.connect(
+        wsUrl: wsUrl,
+        hostStaticPubkey: _hexBytes(hostPub),
+        deviceStaticPrivkey: id.transportPrivkey,
+      );
+      own.nodeId = await signer.whenNodeId(timeout: const Duration(seconds: 30));
+      own.connected = true;
+      notifyListeners();
+    } catch (e) {
+      own.signer = null;
+      own.connected = false;
+      throw Exception(
+          'Could not bring your device signer online for your $label Lightning node: ${e.toString().replaceFirst('Exception: ', '')}');
+    }
+    return nodeKey;
+  }
+
+  /// Create a plain bolt11 to RECEIVE [amount] atoms of [asset] into the user's OWN hosted node.
+  /// Brings the node + signer online first (the node signs the invoice), then ensures best-effort
+  /// JIT inbound liquidity. Throws a clean message when Lightning is dormant.
+  Future<NodeInvoice> createInvoice({required String asset, required num amount, String? description}) async {
+    final m = await WalletRepository.instance.readMnemonic();
+    if (m == null) throw Exception('Your wallet is locked; unlock it and try again.');
+    final nodeKey = await connectNode(m, asset: asset);
+    try {
+      await LspClient.channelInbound(nodeKey: nodeKey, asset: asset, amount: amount);
+    } catch (_) {/* best-effort JIT; a funded channel may already have inbound room */}
+    return LspClient.nodeReceive(nodeKey: nodeKey, amount: amount, description: description);
+  }
+
+  /// Pay [bolt11] from the user's OWN hosted [asset] node (the device co-signs each HTLC). [asset]
+  /// selects which node pays, mirroring the web wallet's pay-from-asset dropdown. Throws a clean
+  /// message when Lightning is dormant.
+  Future<NodePayResult> payInvoice({required String bolt11, required String asset}) async {
+    final m = await WalletRepository.instance.readMnemonic();
+    if (m == null) throw Exception('Your wallet is locked; unlock it and try again.');
+    final nodeKey = await connectNode(m, asset: asset);
+    return LspClient.nodePay(nodeKey: nodeKey, bolt11: bolt11);
+  }
+
+  /// The wss base for a provisioned node's Noise responder: the active node origin, scheme-swapped
+  /// http->ws / https->wss (the per-node `public_ws_path` is appended). Mirrors seqln.js provWsUrl.
+  String _wsBaseFor() => Backend.origin.replaceFirst(RegExp(r'^http'), 'ws');
 
   // -- device transport key ---------------------------------------------------
 
@@ -133,4 +253,12 @@ class LightningService extends ChangeNotifier {
     }
     return out;
   }
+}
+
+/// One entry in the OWN-node signer registry (a per-asset or per-BTC hosted node the user provisioned
+/// and whose device signer this wallet serves). The twin of seqln.js's `provNodes` map value.
+class _OwnNode {
+  SeqlnSigner? signer;
+  bool connected = false;
+  String? nodeId;
 }

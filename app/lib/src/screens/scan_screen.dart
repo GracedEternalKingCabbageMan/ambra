@@ -5,7 +5,9 @@ import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:zxing2/qrcode.dart';
 
+import '../data/lightning_service.dart';
 import '../theme/theme.dart';
+import '../widgets/ln_cards.dart';
 import '../widgets/widgets.dart';
 
 /// Full-screen QR scanner built on the first-party camera (CameraX preview) and
@@ -100,10 +102,30 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
     if (code != null && code.trim().isNotEmpty && !_handled && mounted) {
       _handled = true;
       _controller?.stopImageStream();
-      Navigator.of(context).pop(code.trim());
+      final trimmed = code.trim();
+      // A scanned BOLT11 invoice isn't an on-chain address: route it to the Lightning pay card
+      // (the caller's Send screen only handles addresses). Only when Lightning is deployed — when
+      // dormant, pop the raw string so Send can show its own "not a valid address" message rather
+      // than opening a dead LN screen.
+      final invoice = _bolt11(trimmed);
+      if (invoice != null && LightningService.instance.configured) {
+        Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => LnPayScreen(invoice: invoice)));
+      } else {
+        Navigator.of(context).pop(trimmed);
+      }
       return;
     }
     _busy = false;
+  }
+
+  /// The BOLT11 invoice in [raw] (optionally behind a `lightning:` URI prefix), or null if the code
+  /// isn't a Lightning invoice. Matches the human-readable prefix for Bitcoin main/test/signet/regtest
+  /// (lnbc / lntb / lntbs / lnbcrt), case-insensitively.
+  static String? _bolt11(String raw) {
+    var s = raw.trim();
+    if (s.toLowerCase().startsWith('lightning:')) s = s.substring('lightning:'.length).trim();
+    final ok = RegExp(r'^(lnbcrt|lntbs|lnbc|lntb)[0-9]', caseSensitive: false).hasMatch(s);
+    return ok ? s : null;
   }
 
   /// Decode a QR from the frame's luminance (Y) plane. Returns null when there's

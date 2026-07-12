@@ -77,6 +77,14 @@ class Backend {
   /// Public block-explorer (Esplora SPA) page for a transaction.
   static String explorerTx(String txid) => '$_origin/explorer/tx/$txid';
 
+  /// Public block-explorer page for an asset (restricted-asset terms link).
+  static String explorerAsset(String assetId) => '$_origin/explorer/asset/$assetId';
+
+  /// The Bitcoin-anchor record for a Sequentia block hash. Returns
+  /// `{anchorheight: <int>, ...}`; used to derive a transfer's Bitcoin anchor
+  /// depth (reorg-aware, per anchoring supremacy — never sticky).
+  static String anchor(String blockHash) => '$_origin/anchor/$blockHash';
+
   /// Trim whitespace and trailing slashes so endpoint concatenation stays clean.
   static String _normalize(String v) {
     var s = v.trim();

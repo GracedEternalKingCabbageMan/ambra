@@ -1,19 +1,27 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 import '../rust/api.dart' as core;
+import '../data/api_client.dart';
 import '../data/btc_state.dart';
 import '../data/config.dart';
 import '../data/format.dart';
 import '../data/lightning_service.dart';
+import '../data/ln_rail.dart';
+import '../data/lsp_client.dart';
 import '../data/node_config.dart';
 import '../data/openamp_service.dart';
 import '../data/price_service.dart';
 import '../data/registry_service.dart';
+import '../data/seqln_keys.dart' as lnkeys;
 import '../data/wallet_cache.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
+import '../widgets/ln_cards.dart';
+import '../widgets/restricted_asset_detail.dart';
 import '../widgets/widgets.dart';
 import 'assets_screen.dart';
 import 'faucet_screen.dart';
@@ -103,6 +111,10 @@ class _BalanceTabState extends State<BalanceTab> {
   bool _btcStale = false; // true when the shown BTC balance is last-known (scan failed)
   List<core.AssetBalance>? _cachedBalances; // last-known, shown instantly while syncing
   List<core.AssetBalance> _openamp = const []; // restricted-asset balances (enclave)
+  // This device's OWN Lightning channels (node_key present), read back from the LSP so each balance
+  // row can show its on-chain vs Lightning split. Only OWN channels count as this wallet's funds
+  // (fresh-wallet rule): a shared/demo channel the LSP also reports is never folded in.
+  List<Map<dynamic, dynamic>> _lnChannels = const [];
   String? _error;
   bool _loading = true;
   DateTime? _lastSync; // time of the last successful Sequentia sync (for the chip)
@@ -174,6 +186,9 @@ class _BalanceTabState extends State<BalanceTab> {
       if (btc != null) WalletCache.saveBtc(btc.balanceSats); // persist last-known BTC
       // Feed both chains' indices into the shared cross-chain receive cycling.
       BtcState.instance.observe(btc: btc, seqNext: s.nextIndex);
+      // Read back this device's OWN Lightning channels for the per-row split (best-effort; dormant
+      // when LN isn't deployed). Non-blocking so the balance render never waits on the LSP.
+      unawaited(_refreshLn(m, s.balances));
       if (mounted) {
         setState(() {
           _sync = s;
@@ -229,6 +244,28 @@ class _BalanceTabState extends State<BalanceTab> {
       }
     }
     return any ? sum : null;
+  }
+
+  /// Read this device's OWN provisioned Lightning channels from the LSP so each row can show its
+  /// on-chain vs Lightning split and the Move-to-Lightning / close affordances. Passes the device's
+  /// own node keys (BTC + each held asset), reconstructed from the mnemonic, as `?nodes=` so the
+  /// status includes channels this wallet opened even across restarts. OWN-only (node_key present):
+  /// a shared/demo channel is never counted as this wallet's funds. Best-effort + fully gated on
+  /// [LightningService.configured] — a no-op when Lightning is dormant.
+  Future<void> _refreshLn(String mnemonic, List<core.AssetBalance> balances) async {
+    if (!LightningService.instance.configured) return;
+    try {
+      final nodes = <String>[
+        lnkeys.ownNodeKeyForBtc(mnemonic),
+        for (final b in balances) lnkeys.ownNodeKeyForAsset(mnemonic, b.assetId),
+      ];
+      final st = await LightningService.instance.getStatus(nodes: nodes);
+      final own = ((st.raw['channels'] as List?) ?? const [])
+          .whereType<Map>()
+          .where((c) => '${c['node_key'] ?? ''}'.isNotEmpty)
+          .toList();
+      if (mounted) setState(() => _lnChannels = own);
+    } catch (_) {/* LN status best-effort; the balance rows still render on-chain amounts */}
   }
 
   @override
@@ -300,8 +337,8 @@ class _BalanceTabState extends State<BalanceTab> {
             AmbraCard(
               padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 16),
               child: Column(children: [
-                if (hasBtc) _BtcRow(sats: btcSatsStr!, stale: _btcStale),
-                for (final b in held) _AssetRow(balance: b),
+                if (hasBtc) _BtcRow(sats: btcSatsStr!, stale: _btcStale, channels: _lnChannels, onChanged: _refresh),
+                for (final b in held) _AssetRow(balance: b, channels: _lnChannels, onChanged: _refresh),
               ]),
             ),
           ],
@@ -312,74 +349,521 @@ class _BalanceTabState extends State<BalanceTab> {
 }
 
 class _AssetRow extends StatelessWidget {
-  const _AssetRow({required this.balance});
+  const _AssetRow({required this.balance, this.channels = const [], this.onChanged});
   final core.AssetBalance balance;
+  final List<Map<dynamic, dynamic>> channels;
+  final VoidCallback? onChanged;
   @override
   Widget build(BuildContext context) {
     final label = SeqAssets.labelFor(balance.assetId);
     final amount = formatAtoms(balance.atoms, label.precision);
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 12),
-      child: Row(children: [
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(label.ticker,
-                style: const TextStyle(color: AmbraColors.txt, fontWeight: FontWeight.w600, fontSize: 15)),
-            const SizedBox(height: 2),
-            Text(label.subtitle ?? balance.assetId,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: label.subtitle != null ? AmbraText.sub : AmbraText.mono.copyWith(fontSize: 11)),
+    // Restricted (OpenAMP enclave) assets are not on-chain UTXOs, so they can't be moved into a
+    // Lightning channel; only issued on-chain assets get the split. The same flag opens the
+    // restriction-disclosure detail sheet on tap; ordinary rows stay non-interactive.
+    final restricted = OpenAmpService.instance.isRestricted(balance.assetId);
+    final movable = !restricted;
+    return Column(children: [
+      InkWell(
+        onTap: restricted ? () => showRestrictedAssetDetail(context, balance.assetId) : null,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          child: Row(children: [
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(label.ticker,
+                    style: const TextStyle(color: AmbraColors.txt, fontWeight: FontWeight.w600, fontSize: 15)),
+                const SizedBox(height: 2),
+                Text(label.subtitle ?? balance.assetId,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: label.subtitle != null ? AmbraText.sub : AmbraText.mono.copyWith(fontSize: 11)),
+              ]),
+            ),
+            const SizedBox(width: 12),
+            Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
+              Text(amount,
+                  style: AmbraText.mono.copyWith(color: AmbraColors.txt, fontSize: 15, fontWeight: FontWeight.w700)),
+              if (PriceService.instance.approx(label.ticker, balance.atoms, label.precision) != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Text(PriceService.instance.approx(label.ticker, balance.atoms, label.precision)!,
+                      style: AmbraText.sub),
+                ),
+            ]),
           ]),
         ),
-        const SizedBox(width: 12),
-        Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
-          Text(amount,
-              style: AmbraText.mono.copyWith(color: AmbraColors.txt, fontSize: 15, fontWeight: FontWeight.w700)),
-          if (PriceService.instance.approx(label.ticker, balance.atoms, label.precision) != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 2),
-              child: Text(PriceService.instance.approx(label.ticker, balance.atoms, label.precision)!,
-                  style: AmbraText.sub),
+      ),
+      if (movable)
+        _LnMeta(
+          channels: channels,
+          leg: _Leg(
+            chain: 'seq',
+            asset: balance.assetId,
+            ticker: label.ticker,
+            precision: label.precision,
+            target: RailTarget.asset(hex: balance.assetId, ticker: label.ticker),
+            onchainAtoms: BigInt.tryParse(balance.atoms) ?? BigInt.zero,
+          ),
+          onChanged: onChanged,
+        ),
+    ]);
+  }
+}
+
+/// The Bitcoin parent-chain balance row — first-class, same layout as [_AssetRow].
+class _BtcRow extends StatelessWidget {
+  const _BtcRow({required this.sats, this.stale = false, this.channels = const [], this.onChanged});
+  final String sats;
+  final bool stale; // showing the last-known balance because the latest scan failed
+  final List<Map<dynamic, dynamic>> channels;
+  final VoidCallback? onChanged;
+  @override
+  Widget build(BuildContext context) {
+    final amount = formatAtoms(sats, 8);
+    final approx = PriceService.instance.approx('BTC', sats, 8);
+    return Column(children: [
+      Padding(
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        child: Row(children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('BTC',
+                  style: TextStyle(color: AmbraColors.txt, fontWeight: FontWeight.w600, fontSize: 15)),
+              const SizedBox(height: 2),
+              Text(stale ? 'Bitcoin testnet4 · last known (offline)' : 'Bitcoin testnet4',
+                  style: stale ? AmbraText.sub.copyWith(color: AmbraColors.amber2) : AmbraText.sub),
+            ]),
+          ),
+          const SizedBox(width: 12),
+          Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
+            Text(amount,
+                style: AmbraText.mono.copyWith(color: AmbraColors.txt, fontSize: 15, fontWeight: FontWeight.w700)),
+            if (approx != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Text(approx, style: AmbraText.sub),
+              ),
+          ]),
+        ]),
+      ),
+      _LnMeta(
+        channels: channels,
+        leg: _Leg(
+          chain: 'btc',
+          asset: null,
+          ticker: 'BTC',
+          precision: 8,
+          target: RailTarget.btc(),
+          onchainAtoms: BigInt.tryParse(sats) ?? BigInt.zero,
+        ),
+        onChanged: onChanged,
+      ),
+    ]);
+  }
+}
+
+/// A per-row balance leg for the Lightning split + move/close actions.
+class _Leg {
+  const _Leg({
+    required this.chain,
+    required this.asset,
+    required this.ticker,
+    required this.precision,
+    required this.target,
+    required this.onchainAtoms,
+  });
+  final String chain; // 'btc' | 'seq'
+  final String? asset; // asset id hex for a Sequentia asset; null for BTC
+  final String ticker;
+  final int precision;
+  final RailTarget target;
+  final BigInt onchainAtoms;
+}
+
+/// The inline Lightning metacard beneath a balance row: the on-chain vs Lightning split plus the
+/// Move-to-Lightning / close affordances, driven by the existing [lsp_client] channels + [ln_rail]
+/// gating. Renders nothing when Lightning is dormant, and never on a zero row with no channel — so a
+/// fresh wallet's 0 BTC row shows no empty Lightning card.
+class _LnMeta extends StatelessWidget {
+  const _LnMeta({required this.channels, required this.leg, this.onChanged});
+  final List<Map<dynamic, dynamic>> channels;
+  final _Leg leg;
+  final VoidCallback? onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!LightningService.instance.configured) return const SizedBox.shrink();
+    final chans = channels.cast<Map>();
+    final liq = legLiquidity(chans, leg.target);
+    final hasChannel = liq.count > 0;
+    final movable = leg.onchainAtoms > BigInt.zero;
+    // No metacard on a zero row without a channel (never an empty "Not in Lightning yet" card).
+    if (!hasChannel && !movable) return const SizedBox.shrink();
+    final split = hasChannel
+        ? '${formatAtoms(liq.spendable.toString(), leg.precision)} ${leg.ticker} in Lightning · '
+            '${formatAtoms(leg.onchainAtoms.toString(), leg.precision)} on-chain'
+        : 'Not in Lightning yet · ${formatAtoms(leg.onchainAtoms.toString(), leg.precision)} ${leg.ticker} on-chain';
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AmbraColors.panelDeep,
+        border: Border.all(color: AmbraColors.line),
+        borderRadius: BorderRadius.circular(AmbraRadii.input),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: const [
+          Icon(Icons.bolt, color: AmbraColors.amber2, size: 15),
+          SizedBox(width: 4),
+          Text('Lightning', style: AmbraText.label),
+        ]),
+        const SizedBox(height: 6),
+        Text(split, style: AmbraText.sub),
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(
+            child: _LnActionButton(
+              label: hasChannel ? 'Add to Lightning' : 'Move to Lightning',
+              enabled: movable,
+              onTap: () => _showMoveDialog(context, leg, onChanged),
             ),
+          ),
+          if (hasChannel) ...[
+            const SizedBox(width: 8),
+            Expanded(
+              child: _LnActionButton(
+                label: 'Move to chain',
+                enabled: true,
+                onTap: () => _showCloseDialog(context, leg, chans, onChanged),
+              ),
+            ),
+          ],
         ]),
       ]),
     );
   }
 }
 
-/// The Bitcoin parent-chain balance row — first-class, same layout as [_AssetRow].
-class _BtcRow extends StatelessWidget {
-  const _BtcRow({required this.sats, this.stale = false});
-  final String sats;
-  final bool stale; // showing the last-known balance because the latest scan failed
+/// A compact ghost-style action button for the Lightning metacard.
+class _LnActionButton extends StatelessWidget {
+  const _LnActionButton({required this.label, required this.enabled, required this.onTap});
+  final String label;
+  final bool enabled;
+  final VoidCallback onTap;
   @override
   Widget build(BuildContext context) {
-    final amount = formatAtoms(sats, 8);
-    final approx = PriceService.instance.approx('BTC', sats, 8);
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 12),
-      child: Row(children: [
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('BTC',
-                style: TextStyle(color: AmbraColors.txt, fontWeight: FontWeight.w600, fontSize: 15)),
-            const SizedBox(height: 2),
-            Text(stale ? 'Bitcoin testnet4 · last known (offline)' : 'Bitcoin testnet4',
-                style: stale ? AmbraText.sub.copyWith(color: AmbraColors.amber2) : AmbraText.sub),
-          ]),
+    return Opacity(
+      opacity: enabled ? 1 : 0.45,
+      child: OutlinedButton(
+        onPressed: enabled ? onTap : null,
+        style: OutlinedButton.styleFrom(
+          backgroundColor: AmbraColors.buttonSurface,
+          side: const BorderSide(color: AmbraColors.line),
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AmbraRadii.control)),
         ),
-        const SizedBox(width: 12),
-        Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
-          Text(amount,
-              style: AmbraText.mono.copyWith(color: AmbraColors.txt, fontSize: 15, fontWeight: FontWeight.w700)),
-          if (approx != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 2),
-              child: Text(approx, style: AmbraText.sub),
-            ),
+        child: Text(label,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: AmbraColors.txt, fontWeight: FontWeight.w600, fontSize: 13)),
+      ),
+    );
+  }
+}
+
+/// Human-readable channel-open phase copy for the Move-to-Lightning progress line.
+const Map<String, String> _movePhaseCopy = {
+  'pending_deposit': 'Waiting for the deposit to confirm on-chain…',
+  'opening': 'Opening the Lightning channel (your device is co-signing)…',
+  'awaiting_lockin': 'Channel funding broadcast; waiting for it to confirm…',
+};
+
+void _showMoveDialog(BuildContext context, _Leg leg, VoidCallback? onChanged) {
+  showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: AmbraColors.panel,
+    shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+    builder: (_) => Padding(
+      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      child: _MoveSheet(leg: leg, onChanged: onChanged),
+    ),
+  );
+}
+
+void _showCloseDialog(BuildContext context, _Leg leg, List<Map> channels, VoidCallback? onChanged) {
+  final own = channels
+      .where((c) => channelMatches(c, leg.target) && channelActive(c) && '${c['node_key'] ?? ''}'.isNotEmpty)
+      .toList();
+  if (own.isEmpty) return;
+  showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: AmbraColors.panel,
+    shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+    builder: (_) => _CloseSheet(leg: leg, channel: own.first, onChanged: onChanged),
+  );
+}
+
+/// Build + sign + broadcast the on-chain deposit that funds a Lightning channel — a normal
+/// wallet-signed send (the LSP never holds the key). BTC uses the parent-chain path; a Sequentia
+/// asset pays the funding fee strictly in the asset being moved when a producer prices it, else in
+/// the tx-format's native tSEQ path (open fee market, no privileged coin).
+Future<void> _sendChannelDeposit(String mnemonic, _Leg leg, BigInt atoms, String address) async {
+  if (leg.chain == 'btc') {
+    final tx = await core.btcPrepare(
+        mnemonic: mnemonic, t4Api: Backend.testnet4, address: address, amountSats: atoms, feeRate: 0);
+    await core.btcBroadcast(t4Api: Backend.testnet4, txHex: tx.hex);
+    return;
+  }
+  final asset = leg.asset!;
+  core.FeeAsset? feeAsset;
+  if (asset != SeqAssets.policy) {
+    try {
+      final rates = await ApiClient.feeRates();
+      final rate = rates[leg.ticker] ?? rates[asset];
+      if (rate != null) feeAsset = core.FeeAsset(assetId: asset, rate: rate);
+    } catch (_) {/* fall back to the native tSEQ fee path */}
+  }
+  final pset = await core.buildSendTx(
+    mnemonic: mnemonic,
+    esploraUrl: Backend.esplora,
+    recipients: [core.Recipient(address: address, assetId: asset, satoshi: atoms)],
+    feeAsset: feeAsset,
+  );
+  final signed = await core.signPset(mnemonic: mnemonic, pset: pset);
+  await core.finalizeAndBroadcast(mnemonic: mnemonic, esploraUrl: Backend.esplora, pset: signed);
+}
+
+/// Modal: choose an amount, then run the non-custodial Move-to-Lightning flow (provision the user's
+/// OWN node, bring the device signer online, deposit on-chain, open a device-co-signed channel).
+class _MoveSheet extends StatefulWidget {
+  const _MoveSheet({required this.leg, this.onChanged});
+  final _Leg leg;
+  final VoidCallback? onChanged;
+  @override
+  State<_MoveSheet> createState() => _MoveSheetState();
+}
+
+class _MoveSheetState extends State<_MoveSheet> {
+  final _amount = TextEditingController();
+  bool _busy = false;
+  bool _done = false;
+  String? _status;
+  String? _error;
+
+  @override
+  void dispose() {
+    _amount.dispose();
+    super.dispose();
+  }
+
+  void _say(String t) {
+    if (mounted) setState(() => _status = t);
+  }
+
+  Future<void> _move() async {
+    final leg = widget.leg;
+    final atoms = parseAtoms(_amount.text, leg.precision);
+    if (atoms == null || atoms <= BigInt.zero) {
+      setState(() => _error = 'Enter an amount greater than zero.');
+      return;
+    }
+    if (atoms > leg.onchainAtoms) {
+      setState(() => _error = 'Amount exceeds your on-chain ${leg.ticker} balance.');
+      return;
+    }
+    if (leg.chain == 'btc' && atoms < BigInt.from(546)) {
+      setState(() => _error = 'Minimum channel is 546 sats (the dust limit).');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) throw Exception('Your wallet is locked; unlock it and try again.');
+      _say(leg.chain == 'btc'
+          ? 'Provisioning your Lightning BTC node…'
+          : 'Provisioning your ${leg.ticker} Lightning node…');
+      final nodeKey = await LightningService.instance.connectNode(m, chain: leg.chain, asset: leg.asset);
+      _say('Getting your hosted node deposit address…');
+      final addr = await LspClient.channelDeposit(chain: leg.chain, asset: leg.asset, node: nodeKey);
+      _say('Signing and sending the on-chain deposit…');
+      await _sendChannelDeposit(m, leg, atoms, addr);
+      _say('Opening the Lightning channel (your device is co-signing)…');
+      var job = await LspClient.channelOpen(chain: leg.chain, amount: atoms.toInt(), asset: leg.asset, node: nodeKey);
+      for (var i = 0; i < 120 && !job.isActive && !job.isFailed; i++) {
+        await Future<void>.delayed(const Duration(seconds: 2));
+        final poll = job.poll ?? job.jobId;
+        if (poll == null) break;
+        job = await LspClient.channelOpenPoll(poll);
+        final copy = _movePhaseCopy[job.status];
+        if (copy != null) _say(copy);
+      }
+      if (job.isFailed) throw Exception(job.error ?? 'the channel could not be opened');
+      if (!job.isActive) throw Exception('the channel is still opening; check back shortly');
+      if (mounted) {
+        setState(() {
+          _done = true;
+          _status = 'Done. Your ${leg.ticker} Lightning channel is active.';
+        });
+      }
+      widget.onChanged?.call();
+    } catch (e) {
+      if (mounted) setState(() => _error = 'Failed: ${_moveError(e, widget.leg.ticker)}');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final leg = widget.leg;
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Text('Move ${leg.ticker} to Lightning', style: AmbraText.h1),
+          const SizedBox(height: 12),
+          const Text(
+            'Your wallet sends this amount on-chain to your hosted node, then your device co-signs '
+            'opening a Lightning channel with it. Non-custodial: only your device can spend these funds.',
+            style: AmbraText.sub,
+          ),
+          const SizedBox(height: 14),
+          AmbraField(label: 'Amount (${leg.ticker})', controller: _amount, hint: '0.0', mono: true),
+          const SizedBox(height: 6),
+          Text('Available on-chain: ${formatAtoms(leg.onchainAtoms.toString(), leg.precision)} ${leg.ticker}',
+              style: AmbraText.sub),
+          const SizedBox(height: 14),
+          if (_error != null)
+            Padding(padding: const EdgeInsets.only(bottom: 10), child: Text(_error!, style: const TextStyle(color: AmbraColors.red)))
+          else if (_status != null)
+            Padding(padding: const EdgeInsets.only(bottom: 10), child: Text(_status!, style: AmbraText.sub)),
+          if (_done)
+            PrimaryButton(label: 'Done', onPressed: () => Navigator.pop(context))
+          else ...[
+            PrimaryButton(label: 'Move to Lightning', icon: Icons.bolt, busy: _busy, onPressed: _busy ? null : _move),
+            const SizedBox(height: 6),
+            GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
+          ],
         ]),
-      ]),
+      ),
+    );
+  }
+}
+
+/// Map the open-fee-market outcomes to honest copy (a funding tx no producer will mine is the fee
+/// market working as designed, not a bug).
+String _moveError(Object e, String ticker) {
+  final msg = e.toString().replaceFirst('Exception: ', '');
+  if (RegExp(r'fee asset is not accepted|no exchange rate|not accepted .*fee', caseSensitive: false).hasMatch(msg)) {
+    return 'No block producer currently accepts $ticker for the on-chain funding fee, so it cannot be '
+        'moved into Lightning yet. It becomes movable once a producer accepts it for fees.';
+  }
+  if (RegExp(r'insufficient funds|missing \d+ units', caseSensitive: false).hasMatch(msg)) {
+    return 'Not enough $ticker to cover the amount plus the on-chain network fee. Move a slightly '
+        'smaller amount so a little $ticker is left for the fee.';
+  }
+  return msg;
+}
+
+/// Modal: cooperatively close the user's OWN channel for a leg and return the funds on-chain to a
+/// fresh wallet address (device-signed; the LSP drives the close but can't redirect the funds).
+class _CloseSheet extends StatefulWidget {
+  const _CloseSheet({required this.leg, required this.channel, this.onChanged});
+  final _Leg leg;
+  final Map channel;
+  final VoidCallback? onChanged;
+  @override
+  State<_CloseSheet> createState() => _CloseSheetState();
+}
+
+class _CloseSheetState extends State<_CloseSheet> {
+  bool _busy = false;
+  bool _done = false;
+  String? _status;
+  String? _error;
+
+  void _say(String t) {
+    if (mounted) setState(() => _status = t);
+  }
+
+  Future<void> _close() async {
+    final leg = widget.leg;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) throw Exception('Your wallet is locked; unlock it and try again.');
+      _say('Connecting your device signer…');
+      final nodeKey = await LightningService.instance.connectNode(m, chain: leg.chain, asset: leg.asset);
+      // A fresh on-chain address of ours = where the reclaimed funds land.
+      final dest = (await core.receiveAddressAt(
+              mnemonic: m, index: BtcState.instance.unifiedNext, confidential: false))
+          .address;
+      _say('Closing the channel (your device is co-signing)…');
+      final scid = '${widget.channel['short_channel_id'] ?? widget.channel['scid'] ?? ''}';
+      final res = await LspClient.channelClose(
+        chain: leg.chain,
+        destination: dest,
+        asset: leg.asset,
+        node: nodeKey,
+        scid: scid.isEmpty ? null : scid,
+      );
+      final txid = res.closingTxid;
+      if (mounted) {
+        setState(() {
+          _done = true;
+          _status = txid != null && txid.length >= 16
+              ? 'Done. Closing transaction ${txid.substring(0, 16)}…. Your ${leg.ticker} returns on-chain once it confirms.'
+              : 'Done. The close was broadcast. Your ${leg.ticker} returns on-chain once it confirms.';
+        });
+      }
+      widget.onChanged?.call();
+    } catch (e) {
+      if (mounted) setState(() => _error = 'Failed: ${e.toString().replaceFirst('Exception: ', '')}');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final leg = widget.leg;
+    final spendable = BigInt.tryParse(
+            '${widget.channel['spendable_units'] ?? widget.channel['spendable'] ?? 0}'.split('.').first) ??
+        BigInt.zero;
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Text('Move ${leg.ticker} back on-chain', style: AmbraText.h1),
+          const SizedBox(height: 12),
+          Text(
+            'This closes your ${leg.ticker} Lightning channel and returns the funds to your wallet '
+            'on-chain. Your device co-signs the closing transaction, so only you can move these funds.',
+            style: AmbraText.sub,
+          ),
+          const SizedBox(height: 10),
+          Text('In Lightning: ${formatAtoms(spendable.toString(), leg.precision)} ${leg.ticker}', style: AmbraText.sub),
+          const SizedBox(height: 14),
+          if (_error != null)
+            Padding(padding: const EdgeInsets.only(bottom: 10), child: Text(_error!, style: const TextStyle(color: AmbraColors.red)))
+          else if (_status != null)
+            Padding(padding: const EdgeInsets.only(bottom: 10), child: Text(_status!, style: AmbraText.sub)),
+          if (_done)
+            PrimaryButton(label: 'Done', onPressed: () => Navigator.pop(context))
+          else ...[
+            PrimaryButton(label: 'Move to chain', busy: _busy, onPressed: _busy ? null : _close),
+            const SizedBox(height: 6),
+            GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
+          ],
+        ]),
+      ),
     );
   }
 }
@@ -664,6 +1148,12 @@ class _ReceiveTabState extends State<ReceiveTab> {
           title: const Text('Show confidential address', style: AmbraText.body),
           subtitle: const Text('A private address that hides the amount and asset.', style: AmbraText.sub),
         ),
+        // General Lightning receive — generate a BOLT11 into the user's own hosted node. Mounted
+        // only when Lightning is deployed for this build (dormant otherwise, so nothing shows).
+        if (LightningService.instance.configured) ...[
+          const SizedBox(height: 18),
+          const LnReceiveCard(),
+        ],
         if (_ampAid != null) ...[
           const SizedBox(height: 18),
           AmbraCard(

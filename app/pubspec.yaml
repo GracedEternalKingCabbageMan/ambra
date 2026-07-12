@@ -59,6 +59,11 @@ dependencies:
   path_provider: ^2.1.4
   # Open the block explorer in the device browser.
   url_launcher: ^6.3.1
+  # SHA-256 for the OpenAMP tagged-hash (challenge / document sign), computed in
+  # Dart then fed to the existing on-device Schnorr signer (no new Rust).
+  crypto: ^3.0.6
+  # Receive OpenAMP deep links (ambra://oamp-sign / ambra://oamp-send) as intents.
+  app_links: ^6.3.3
 
 dev_dependencies:
   flutter_test:
