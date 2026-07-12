@@ -130,6 +130,80 @@ class XSwapStatus {
       );
 }
 
+/// A reverse-swap quote: how much BTC the taker RECEIVES for selling `seqAmount`
+/// of the asset, plus the maker's timeouts (the maker's pubkeys + BTC leg arrive
+/// on `openReverse`, once the maker has locked the BTC).
+class XReverseQuote {
+  XReverseQuote({
+    required this.quoteId,
+    required this.seqAmount,
+    required this.btcAmount,
+    required this.priceSeqPerBtc,
+    required this.feeBtc,
+    required this.btcLocktime,
+    required this.seqLocktime,
+    required this.expiresAtUnix,
+  });
+  final String quoteId;
+  final BigInt seqAmount;
+  final BigInt btcAmount;
+  final double priceSeqPerBtc;
+  final BigInt feeBtc;
+  final int btcLocktime;
+  final int seqLocktime;
+  final int expiresAtUnix;
+  static XReverseQuote fromJson(Map j) => XReverseQuote(
+        quoteId: _str(pick(j, ['quote_id', 'quoteId'])),
+        seqAmount: _big(pick(j, ['seq_amount', 'seqAmount'])),
+        btcAmount: _big(pick(j, ['btc_amount', 'btcAmount'])),
+        priceSeqPerBtc: _dbl(pick(j, ['price_seq_per_btc', 'priceSeqPerBtc'])),
+        feeBtc: _big(pick(j, ['fee_btc', 'feeBtc'])),
+        btcLocktime: _int(pick(j, ['btc_locktime', 'btcLocktime'])),
+        seqLocktime: _int(pick(j, ['seq_locktime', 'seqLocktime'])),
+        expiresAtUnix: _int(pick(j, ['expires_at_unix', 'expiresAtUnix'])),
+      );
+}
+
+/// The maker's BTC HTLC leg in a reverse swap (the maker locked BTC first; the
+/// taker claims it with the revealed preimage, or the maker refunds after T_btc).
+class XBtcLeg {
+  XBtcLeg({required this.txid, required this.vout, required this.redeemScript, required this.amount});
+  final String txid;
+  int vout;
+  final String redeemScript;
+  final BigInt amount;
+  static XBtcLeg fromJson(Map m) => XBtcLeg(
+        txid: _str(pick(m, ['txid'])),
+        vout: _int(pick(m, ['vout'])),
+        redeemScript: _str(pick(m, ['redeem_script', 'redeemScript'])),
+        amount: _big(pick(m, ['amount'])),
+      );
+  Map<String, dynamic> toJson() =>
+      {'txid': txid, 'vout': vout, 'redeem_script': redeemScript, 'amount': amount.toString()};
+}
+
+/// The maker's response to `openReverse`: it locked the BTC leg and disclosed the
+/// hashlock + its pubkeys + the two CLTV timeouts. The taker RE-VERIFIES the BTC
+/// leg (rebuild its redeemScript, byte-compare) before funding the asset.
+class XReverseOpened {
+  XReverseOpened({
+    required this.swapId,
+    required this.hashHex,
+    required this.makerSeqClaimPub,
+    required this.makerBtcRefundPub,
+    required this.btcLeg,
+    required this.btcLocktime,
+    required this.seqLocktime,
+  });
+  final String swapId;
+  final String hashHex;
+  final String makerSeqClaimPub;
+  final String makerBtcRefundPub;
+  final XBtcLeg btcLeg;
+  final int btcLocktime;
+  final int seqLocktime;
+}
+
 /// The daemon rejected the swap in-band ({fail:{code,message}}, HTTP 200) — retry
 /// (e.g. BTC_LEG_UNCONFIRMED) or abort to refund.
 class XchainFail implements Exception {
@@ -215,5 +289,69 @@ class XchainClient {
   static Future<XSwapStatus> swap(String swapId) async {
     final j = await _post('/v1/xchain/swap', {'swap_id': swapId});
     return XSwapStatus.fromJson(j);
+  }
+
+  // -- REVERSE (Sequentia asset -> BTC) --------------------------------------
+
+  /// Quote SELLING `seqAmount` of `seqAsset` for BTC.
+  static Future<XReverseQuote> reverseQuote(String seqAsset, BigInt seqAmount) async {
+    final j = await _post('/v1/xchain/reverse/quote', {'seq_asset': seqAsset, 'seq_amount': seqAmount.toString()});
+    return XReverseQuote.fromJson(j);
+  }
+
+  /// Open the reverse swap: the maker locks the BTC leg first and returns it +
+  /// the hashlock + its pubkeys + the timeouts. Throws [XchainFail] on rejection.
+  static Future<XReverseOpened> openReverse({
+    required String quoteId,
+    required String takerBtcClaimPub,
+    required String takerSeqRefundPub,
+  }) async {
+    final j = await _post('/v1/xchain/reverse/open', {
+      'quote_id': quoteId,
+      'taker_btc_claim_pub': takerBtcClaimPub,
+      'taker_seq_refund_pub': takerSeqRefundPub,
+    });
+    final fail = pick(j, ['fail', 'swap_fail', 'swapFail']) as Map?;
+    if (fail != null) {
+      throw XchainFail('${pick(fail, ['code']) ?? 'FAIL'}', '${pick(fail, ['message']) ?? 'maker rejected the swap'}');
+    }
+    final opened = pick(j, ['opened', 'reverse_xchain_swap_opened', 'reverseXchainSwapOpened']) as Map? ?? j;
+    final leg = pick(opened, ['btc_leg', 'btcLeg']) as Map?;
+    if (leg == null) throw Exception('reverse open returned no BTC leg');
+    return XReverseOpened(
+      swapId: '${pick(opened, ['swap_id', 'swapId']) ?? ''}',
+      hashHex: '${pick(opened, ['hash', 'hash_h', 'hashHex']) ?? ''}',
+      makerSeqClaimPub: '${pick(opened, ['maker_seq_claim_pub', 'makerSeqClaimPub']) ?? ''}',
+      makerBtcRefundPub: '${pick(opened, ['maker_btc_refund_pub', 'makerBtcRefundPub', 'maker_refund_pub']) ?? ''}',
+      btcLeg: XBtcLeg.fromJson(leg),
+      btcLocktime: _int(pick(opened, ['btc_locktime', 'btcLocktime'])),
+      seqLocktime: _int(pick(opened, ['seq_locktime', 'seqLocktime'])),
+    );
+  }
+
+  /// Submit the taker's funded asset leg to the maker. Throws [XchainFail] on an
+  /// in-band rejection (e.g. the leg has not confirmed/anchored yet — retry).
+  static Future<void> submitSeq({
+    required String swapId,
+    required String seqTxid,
+    required int seqVout,
+    required String seqRedeemScript,
+    required BigInt seqAmount,
+    required String seqAssetId,
+  }) async {
+    final j = await _post('/v1/xchain/reverse/submit', {
+      'swap_id': swapId,
+      'seq_leg': {
+        'txid': seqTxid,
+        'vout': seqVout,
+        'redeem_script': seqRedeemScript,
+        'amount': seqAmount.toString(),
+        'asset_id': seqAssetId,
+      },
+    });
+    final fail = pick(j, ['fail', 'swap_fail', 'swapFail']) as Map?;
+    if (fail != null) {
+      throw XchainFail('${pick(fail, ['code']) ?? 'FAIL'}', '${pick(fail, ['message']) ?? 'maker rejected the asset leg'}');
+    }
   }
 }

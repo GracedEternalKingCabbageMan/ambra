@@ -23,6 +23,7 @@ class SeqObOffer {
     required this.covenant,
     required this.makerPubkey,
     required this.verified,
+    this.confidential = false,
   });
 
   final Map<String, dynamic> raw;
@@ -36,6 +37,13 @@ class SeqObOffer {
   final Map<String, dynamic>? covenant; // CovenantTerms sub-object (or null)
   final String makerPubkey;
   final bool verified;
+
+  /// Field-19 book-namespace tag: a blinded (confidential) resting offer whose
+  /// both legs settle confidentially. A confidential offer rests as an interactive
+  /// intent (NOT a covenant — a covenant FILL introspects EXPLICIT amounts, which
+  /// CT cannot satisfy), so it carries no on-chain covenant to permissionlessly
+  /// lift. See [SeqObClient.fetchBook] and the swap screen's Blinded book.
+  final bool confidential;
 
   /// Quote atoms per 1 base atom (the price a taker pays). Lower = cheaper base.
   double get priceAtomsPerBase =>
@@ -99,18 +107,33 @@ class SeqObClient {
     return j;
   }
 
-  /// Fetch the order book for (base, quote): resting covenant SELLs of `base` for
-  /// `quote`, verified locally and sorted cheapest-first. Only funded, fillable
-  /// covenant offers are returned (Stage 1a is the transparent same-chain book).
-  static Future<OrderBook> fetchBook(String baseAsset, String quoteAsset) async {
-    final j = await _get('/v1/market/$baseAsset/$quoteAsset/orderbook');
+  /// Fetch the order book for (base, quote), verified locally and sorted
+  /// cheapest-first.
+  ///
+  /// Default (Unblinded book): resting covenant SELLs of `base` for `quote` —
+  /// only funded, fillable covenant offers are returned (the transparent book,
+  /// byte-identical to the live route).
+  ///
+  /// `confidential: true` (Blinded book): requests the relay's segregated
+  /// confidential namespace (`?confidential=1`). These offers rest as interactive
+  /// intents (no on-chain covenant to lift), so they are returned regardless of a
+  /// covenant and shown read-only; interactive confidential settlement is the
+  /// documented courier residual.
+  static Future<OrderBook> fetchBook(String baseAsset, String quoteAsset,
+      {bool confidential = false}) async {
+    final q = confidential ? '?confidential=1' : '';
+    final j = await _get('/v1/market/$baseAsset/$quoteAsset/orderbook$q');
     final list = (j['offers'] as List?) ?? (j['Offers'] as List?) ?? const [];
     final offers = <SeqObOffer>[];
     for (final e in list) {
       if (e is! Map) continue;
       final o = Map<String, dynamic>.from(e);
       final offer = await _parseOffer(o);
-      if (offer != null && offer.isFillableCovenant && offer.baseAtoms > BigInt.zero) {
+      if (offer == null || offer.baseAtoms <= BigInt.zero) continue;
+      if (confidential) {
+        // Confidential offers carry no covenant; keep the ones tagged confidential.
+        if (offer.confidential) offers.add(offer);
+      } else if (offer.isFillableCovenant) {
         offers.add(offer);
       }
     }
@@ -136,6 +159,15 @@ class SeqObClient {
   /// grpc-gateway JSON wants base64 for proto `bytes`, so convert on the way out.
   static Future<void> postOffer(Map<String, dynamic> signedOffer) async {
     await _post('/v1/offers', _covenantOfferForPost(signedOffer));
+  }
+
+  /// POST a signed CONFIDENTIAL (blinded) offer. A confidential offer carries no
+  /// covenant (only `same_chain{maker_recv_address, maker_blinding_pub}` + the
+  /// signed `confidential:true` field-19 tag), so there is nothing to hex/base64
+  /// normalize — the signed object is posted verbatim into the relay's
+  /// confidential namespace.
+  static Future<void> postConfidentialOffer(Map<String, dynamic> signedOffer) async {
+    await _post('/v1/offers', signedOffer);
   }
 
   /// POST a signed OfferCancel (already assembled + signed by the core FFI).
@@ -168,8 +200,11 @@ class SeqObClient {
       covenant: cov,
       makerPubkey: '${pick(o, ['maker_pubkey', 'makerPubkey']) ?? ''}',
       verified: verified,
+      confidential: _bool(pick(o, ['confidential'])),
     );
   }
+
+  static bool _bool(dynamic v) => v == true || v == 1 || v == '1' || v == 'true';
 
   static int _dir(dynamic v) {
     if (v is int) return v;
