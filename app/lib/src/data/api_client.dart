@@ -13,6 +13,9 @@ class FaucetResult {
 }
 
 /// A restricted asset as described by the OpenAMP enclave (`GET /v1/assets`).
+/// Carries the disclosure the wallet must surface (spec 0.6/1.5(d)): clawback,
+/// the eligibility rules, a lock-in height, and the issuance terms hash. No
+/// privileged framing — a restricted asset is one row among equals.
 class OpenAmpAsset {
   OpenAmpAsset({
     required this.id,
@@ -20,12 +23,33 @@ class OpenAmpAsset {
     required this.name,
     required this.precision,
     this.clawback = false,
+    this.allowedCategories = const [],
+    this.lockinUntilHeight = 0,
+    this.termsHash = '',
   });
   final String id;
   final String ticker;
   final String name;
   final int precision;
   final bool clawback;
+
+  /// If non-empty, only holders in one of these categories may receive it.
+  final List<String> allowedCategories;
+
+  /// If > 0, the asset is locked until this Sequentia block height.
+  final int lockinUntilHeight;
+
+  /// The issuance-contract terms hash (64-hex), if disclosed.
+  final String termsHash;
+}
+
+/// A restricted-asset holder's enclave account record (`GET /v1/users/{aid}`).
+/// `categories`/`frozen` are omitempty on the wire, so both default to
+/// empty/false — absence is never an error (spec 1.5(c)).
+class OpenAmpUser {
+  OpenAmpUser({this.categories = const [], this.frozen = false});
+  final List<String> categories;
+  final bool frozen;
 }
 
 /// One input the wallet must Schnorr-sign for an OpenAMP transfer. [input] is the
@@ -253,16 +277,74 @@ class ApiClient {
         if (id is! String || ticker is! String || ticker.isEmpty) continue;
         final precRaw = e['precision'];
         final prec = precRaw is num ? precRaw.toInt() : int.tryParse('$precRaw') ?? 8;
+        // Disclosure fields: eligibility categories + lock-in height live under
+        // `rules`; the terms hash under the parsed issuance `contract`.
+        final rules = e['rules'];
+        final cats = <String>[];
+        int lockin = 0;
+        if (rules is Map) {
+          final ac = rules['allowed_categories'];
+          if (ac is List) {
+            for (final c in ac) {
+              if (c is String && c.isNotEmpty) cats.add(_clean(c, 32));
+            }
+          }
+          final lh = rules['lockin_until_height'];
+          lockin = lh is num ? lh.toInt() : (int.tryParse('$lh') ?? 0);
+        }
         out.add(OpenAmpAsset(
           id: id,
           ticker: _clean(ticker, 16),
           name: e['name'] is String ? _clean(e['name'] as String, 48) : ticker,
           precision: (prec < 0 || prec > 8) ? 8 : prec,
           clawback: e['clawback'] == true,
+          allowedCategories: cats,
+          lockinUntilHeight: lockin < 0 ? 0 : lockin,
+          termsHash: _termsHash(e['contract']),
         ));
       }
     }
     return out;
+  }
+
+  /// Pull the OpenAMP terms hash out of a restricted asset's issuance contract,
+  /// which openampd may embed as a JSON object or a JSON string. Returns '' when
+  /// absent or malformed (disclosure is best-effort; never throws).
+  static String _termsHash(Object? contract) {
+    dynamic c = contract;
+    if (c is String) {
+      try {
+        c = jsonDecode(c);
+      } catch (_) {
+        return '';
+      }
+    }
+    if (c is Map) {
+      final oamp = c['openamp'];
+      if (oamp is Map && oamp['terms_hash'] is String) {
+        return _clean(oamp['terms_hash'] as String, 64);
+      }
+    }
+    return '';
+  }
+
+  /// The holder's enclave account record (categories + frozen). Never throws on
+  /// absence: a missing/omitted field defaults to empty/not-frozen so a fresh
+  /// account isn't misread as frozen.
+  static Future<OpenAmpUser> openampUser(String aid) async {
+    final r = await http
+        .get(Uri.parse('${Backend.openamp}/v1/users/$aid'), headers: Backend.authHeaders)
+        .timeout(_openampTimeout);
+    if (r.statusCode != 200) _openampErr(r);
+    final j = jsonDecode(r.body) as Map<String, dynamic>;
+    final cats = <String>[];
+    final ac = j['categories'];
+    if (ac is List) {
+      for (final c in ac) {
+        if (c is String && c.isNotEmpty) cats.add(_clean(c, 32));
+      }
+    }
+    return OpenAmpUser(categories: cats, frozen: j['frozen'] == true);
   }
 
   /// Draft a transfer; the enclave returns the sighashes the wallet must sign.

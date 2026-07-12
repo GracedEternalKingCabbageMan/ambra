@@ -191,6 +191,61 @@ class LspClient {
     final j = _decode(await _get('/node/list'));
     return ((j['nodes'] as List?) ?? const []).whereType<Map>().map(ProvisionedNode.fromJson).toList();
   }
+
+  // -- generic Lightning pay / receive over the user's OWN hosted node ----------------
+  // The Dart twins of seqln.js's node/* wrappers. These drive general BOLT11 pay/receive (NOT the
+  // DEX swap rail): the user's own single-asset hosted node signs an invoice (receive) or co-signs
+  // every HTLC (pay), with the on-device signer (attached via LightningService.connectNode) online.
+
+  /// Generic Lightning RECEIVE: a plain (non-HODL) bolt11 for [amount] (asset sats) into the user's
+  /// OWN hosted node. The node signs the invoice, so the device signer must be online. Mirrors
+  /// seqln.js `seqlnNodeReceive`. Returns { bolt11, payment_hash }.
+  static Future<NodeInvoice> nodeReceive({
+    required String nodeKey,
+    required num amount,
+    String? description,
+  }) async {
+    final body = <String, dynamic>{'node_key': nodeKey, 'amount': amount};
+    if (description != null) body['description'] = description;
+    return NodeInvoice.fromJson(_decode(await _postJson('/node/receive', body)));
+  }
+
+  /// Generic Lightning SEND: the user's OWN hosted node PAYS [bolt11] (the device co-signs every
+  /// HTLC). Mirrors seqln.js `seqlnNodePay`. Returns { paid, preimage, amount_msat, destination }.
+  static Future<NodePayResult> nodePay({required String nodeKey, required String bolt11}) async =>
+      NodePayResult.fromJson(_decode(
+          await _postJson('/node/pay', {'node_key': nodeKey, 'bolt11': bolt11}, timeout: const Duration(seconds: 90))));
+
+  /// Register a HODL invoice by hash on the user's OWN node (the DEVICE keeps the preimage; the
+  /// node/LSP never learn it). The maker pays the hash by-hash. Mirrors seqln.js `seqlnNodeInvoice`.
+  /// [amount] in asset sats. Returns { payment_hash, bolt11:null, node_id, hodl:true }.
+  static Future<NodeInvoice> nodeInvoice({
+    required String nodeKey,
+    required String asset,
+    required num amount,
+    required String paymentHash,
+  }) async =>
+      NodeInvoice.fromJson(_decode(await _postJson(
+          '/node/invoice', {'node_key': nodeKey, 'asset': asset, 'amount': amount, 'payment_hash': paymentHash})));
+
+  /// Device-settle a HELD HODL invoice with the preimage: releases the held payment AND reveals the
+  /// preimage to the maker atomically. Mirrors seqln.js `seqlnNodeSettle`. Call only once held.
+  static Future<Map<String, dynamic>> nodeSettle({
+    required String nodeKey,
+    required String paymentHash,
+    required String preimage,
+  }) async =>
+      _decode(await _postJson('/node/settle', {'node_key': nodeKey, 'payment_hash': paymentHash, 'preimage': preimage}));
+
+  /// Best-effort JIT inbound liquidity so the user's OWN node can RECEIVE [amount] asset sats of
+  /// [asset] over Lightning. Mirrors seqln.js `seqlnChannelInbound`. Callers treat failure as
+  /// non-fatal (a funded channel may already have inbound room).
+  static Future<Map<String, dynamic>> channelInbound({
+    required String nodeKey,
+    required String asset,
+    required num amount,
+  }) async =>
+      _decode(await _postJson('/channel/inbound', {'node_key': nodeKey, 'asset': asset, 'amount': amount}));
 }
 
 /// One hosted channel's per-asset balances, as reported by `GET /status`.
@@ -359,6 +414,56 @@ class ChannelJob {
         shortChannelId: (j['short_channel_id'] ?? j['shortChannelId'])?.toString(),
         spendableMsat: (j['spendable_msat'] ?? j['spendableMsat'])?.toString(),
         error: j['error']?.toString(),
+        raw: j,
+      );
+}
+
+/// A bolt11 invoice created on the user's OWN hosted node (`/node/receive`, or the HODL
+/// `/node/invoice` which returns a null bolt11 + a payment hash).
+class NodeInvoice {
+  NodeInvoice({
+    required this.bolt11,
+    required this.paymentHash,
+    required this.nodeId,
+    required this.hodl,
+    required this.raw,
+  });
+  final String? bolt11;
+  final String? paymentHash;
+  final String? nodeId;
+  final bool hodl;
+  final Map<String, dynamic> raw;
+
+  static NodeInvoice fromJson(Map<String, dynamic> j) => NodeInvoice(
+        bolt11: j['bolt11']?.toString(),
+        paymentHash: (j['payment_hash'] ?? j['paymentHash'])?.toString(),
+        nodeId: (j['node_id'] ?? j['nodeId'])?.toString(),
+        hodl: j['hodl'] == true,
+        raw: j,
+      );
+}
+
+/// The result of paying a bolt11 from the user's OWN hosted node (`/node/pay`). Never "final" copy:
+/// a completed Lightning pay reports as "Paid", not a 0-conf finality claim.
+class NodePayResult {
+  NodePayResult({
+    required this.paid,
+    required this.preimage,
+    required this.amountMsat,
+    required this.destination,
+    required this.raw,
+  });
+  final bool paid;
+  final String? preimage;
+  final String? amountMsat;
+  final String? destination;
+  final Map<String, dynamic> raw;
+
+  static NodePayResult fromJson(Map<String, dynamic> j) => NodePayResult(
+        paid: j['paid'] == true,
+        preimage: j['preimage']?.toString(),
+        amountMsat: (j['amount_msat'] ?? j['amountMsat'])?.toString(),
+        destination: j['destination']?.toString(),
         raw: j,
       );
 }

@@ -1,8 +1,77 @@
+import 'dart:convert';
+
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 
 import '../rust/api.dart' as core;
 import 'api_client.dart';
 import 'config.dart';
+import 'wallet_cache.dart';
+
+/// The OpenAMP tagged hash (spec 0.4(2)):
+/// `tagged_hash(tag, m) = sha256(sha256(tag) || sha256(tag) || m)`, returned as
+/// 64-char hex. Domain-separated from an enclave-spend sighash, so a signature
+/// produced over a tagged hash can never authorize a transfer. Matches SWK
+/// `lwk_wollet/src/openamp.rs::tagged_hash` byte-for-byte.
+String openampTaggedHash(String tag, List<int> message) {
+  final tagHash = sha256.convert(utf8.encode(tag)).bytes;
+  final pre = <int>[...tagHash, ...tagHash, ...message];
+  final digest = sha256.convert(pre).bytes;
+  return _hex(digest);
+}
+
+/// The two OpenAMP tagged-sign tags (spec 0.4(2)). There is deliberately no
+/// third, raw-digest tag: every sign path here is tagged, so the sign surface
+/// structurally cannot become an enclave-spend authorization.
+const String kOpenampTagChallenge = 'openamp-challenge-v1';
+const String kOpenampTagDocument = 'openamp-document-v1';
+
+/// Sign a TAGGED, non-spending OpenAMP request with the on-device m/5/0 key. The
+/// tag is applied here (never by the caller), and the tagged hash — not any
+/// externally supplied 32-byte value — is what reaches the Schnorr signer.
+String openampSignTagged({
+  required String mnemonic,
+  required String tag,
+  required List<int> message,
+}) {
+  final taggedHex = openampTaggedHash(tag, message);
+  return core.openampSignSighash(mnemonic: mnemonic, sighashHex: taggedHex);
+}
+
+/// Sign a wallet-link / login challenge (tag `openamp-challenge-v1`) over the
+/// UTF-8 bytes of [challenge].
+String openampSignChallenge({required String mnemonic, required String challenge}) =>
+    openampSignTagged(mnemonic: mnemonic, tag: kOpenampTagChallenge, message: utf8.encode(challenge));
+
+/// Sign a document e-signature (tag `openamp-document-v1`) over the raw 32 bytes
+/// of a 64-hex [docHash]. Throws if [docHash] is not exactly 32 bytes of hex, so
+/// no over/under-sized value is ever tagged-signed.
+String openampSignDocument({required String mnemonic, required String docHash}) {
+  final bytes = _hexBytes(docHash.trim().toLowerCase());
+  if (bytes.length != 32) {
+    throw Exception('document hash must be 64 hex characters (32 bytes)');
+  }
+  return openampSignTagged(mnemonic: mnemonic, tag: kOpenampTagDocument, message: bytes);
+}
+
+String _hex(List<int> b) {
+  final sb = StringBuffer();
+  for (final x in b) {
+    sb.write(x.toRadixString(16).padLeft(2, '0'));
+  }
+  return sb.toString();
+}
+
+Uint8List _hexBytes(String s) {
+  if (s.length.isOdd || !RegExp(r'^[0-9a-f]*$').hasMatch(s)) {
+    throw Exception('invalid hex');
+  }
+  final out = Uint8List(s.length ~/ 2);
+  for (var i = 0; i < out.length; i++) {
+    out[i] = int.parse(s.substring(i * 2, i * 2 + 2), radix: 16);
+  }
+  return out;
+}
 
 /// Bridges the wallet to the OpenAMP restricted-asset enclave.
 ///
@@ -21,12 +90,28 @@ class OpenAmpService extends ChangeNotifier {
   String? _xonly;
   List<OpenAmpAsset> _assets = const [];
   List<core.AssetBalance> _balances = const [];
+  OpenAmpUser? _user;
 
   /// The enclave account id, once registered. Shown on Receive.
   String? get aid => _aid;
 
   /// The device x-only key (m/5/0) this account is registered under.
   String? get xonly => _xonly;
+
+  /// The last-known account record (categories + frozen), for the disclosure
+  /// view's frozen banner. Null until [refreshUser] runs.
+  OpenAmpUser? get user => _user;
+
+  /// True when this account is frozen by the issuer (transfers will be refused).
+  bool get isFrozen => _user?.frozen == true;
+
+  /// Whether the legacy m/3/0 identity's stranded balances can be enumerated.
+  /// The wallet registers OpenAMP under m/5/0; earlier builds (and the web
+  /// wallet's WW-1 path) used the m/3/0 SeqDEX-HTLC key. Ambra's core exposes no
+  /// keyless m/3/0 x-only FFI, so the legacy AID cannot be reproduced byte-exact
+  /// here — the disclosure view surfaces the concept read-only rather than
+  /// fabricate a wrong AID/balance. Flips true once such an FFI is added.
+  bool get legacyBalancesAvailable => false;
 
   /// The restricted assets the enclave offers.
   List<OpenAmpAsset> get assets => _assets;
@@ -89,6 +174,8 @@ class OpenAmpService extends ChangeNotifier {
       }
     } catch (_) {/* keep the last-known catalogue */}
 
+    await refreshUser();
+
     final held = <core.AssetBalance>[];
     for (final a in _assets) {
       try {
@@ -101,6 +188,18 @@ class OpenAmpService extends ChangeNotifier {
     _balances = held;
     notifyListeners();
     return held;
+  }
+
+  /// Refresh the account record (categories + frozen) for the disclosure view.
+  /// Fails soft: a transient error keeps the previous record rather than
+  /// blanking it (never treat a hiccup as "unfrozen -> frozen" flapping).
+  Future<void> refreshUser() async {
+    final aid = _aid;
+    if (aid == null) return;
+    try {
+      _user = await ApiClient.openampUser(aid);
+      notifyListeners();
+    } catch (_) {/* keep the last-known record */}
   }
 
   /// The enclave deposit address for a restricted [assetId] (for Receive).
@@ -198,6 +297,8 @@ class OpenAmpService extends ChangeNotifier {
     return OpenampPrepared(
       draftId: draft.id,
       assetId: assetId,
+      recipientAid: recipientAid,
+      atoms: atoms,
       localDigests: localDigests,
       effects: effects,
       convertAtoms: draft.convertAtoms,
@@ -213,7 +314,24 @@ class OpenAmpService extends ChangeNotifier {
     prepared.localDigests.forEach((input, digest) {
       sigs[input] = core.openampSignSighash(mnemonic: mnemonic, sighashHex: digest);
     });
-    return ApiClient.openampCompleteTransfer(prepared.draftId, sigs);
+    final txid = await ApiClient.openampCompleteTransfer(prepared.draftId, sigs);
+    // Track the sent transfer locally (openampd has no per-holder history): the
+    // History tab re-derives confirmation + Bitcoin anchor depth from this.
+    if (txid.isNotEmpty) {
+      final label = SeqAssets.labelFor(prepared.assetId);
+      try {
+        await WalletCache.addOampTransfer(OampTransfer(
+          asset: prepared.assetId,
+          ticker: label.ticker,
+          precision: label.precision,
+          recipientAid: prepared.recipientAid,
+          atoms: prepared.atoms.toString(),
+          txid: txid,
+          time: DateTime.now().millisecondsSinceEpoch,
+        ));
+      } catch (_) {/* tracking is best-effort; never block the completed send */}
+    }
+    return txid;
   }
 }
 
@@ -224,6 +342,8 @@ class OpenampPrepared {
   OpenampPrepared({
     required this.draftId,
     required this.assetId,
+    required this.recipientAid,
+    required this.atoms,
     required this.localDigests,
     required this.effects,
     this.convertAtoms,
@@ -235,6 +355,12 @@ class OpenampPrepared {
 
   /// The transacted asset id.
   final String assetId;
+
+  /// The recipient account id (for local transfer tracking).
+  final String recipientAid;
+
+  /// The transferred amount in atoms (for local transfer tracking).
+  final BigInt atoms;
 
   /// Input key (decimal index, as returned in `to_sign`) -> the LOCALLY
   /// recomputed 32-byte sighash hex to sign. Never the server's digest.
