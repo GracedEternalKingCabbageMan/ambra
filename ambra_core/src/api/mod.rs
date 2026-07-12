@@ -1047,6 +1047,298 @@ pub fn openamp_sign_sighash(mnemonic: String, sighash_hex: String) -> Result<Str
     Ok(tohex(&sig.serialize()))
 }
 
+// --- OpenAMP client-side safety mechanism (SWK-6, spec 0.4(3)) ---------------
+//
+// The enclave is hosted, so it MUST NOT be trusted to tell the wallet what it is
+// signing. These are the three primitives the Dart layer uses to (1) verify the
+// account id it registered under, (2) recompute every enclave-spend sighash
+// itself and refuse to sign anything whose digest it cannot reproduce, and (3)
+// decode a candidate spend into human-readable effects to show before signing.
+//
+// Ported from the SWK reference (`SWK/lwk_wollet/src/openamp.rs`); ambra_core
+// does not compile lwk_wollet's `openamp` feature, and flutter_rust_bridge can
+// only mirror structs declared in `crate::api`, so the pure functions + result
+// structs live here directly. The elements crate is the SAME vendored fork SWK
+// uses (`../../SWK/rust-elements`), so the taproot sighash is byte-identical
+// (locked by `enclave_sighash_parity_vector` below).
+
+use lwk_wollet::elements::hashes::{sha256, Hash, HashEngine};
+use lwk_wollet::elements::sighash::{Prevouts, SchnorrSighashType, ScriptPath, SighashCache};
+use lwk_wollet::elements::{confidential, BlockHash, Script, Transaction, TxOut};
+
+/// Tag prepended to the sorted pubkey set before hashing to the AID (spec 0.2).
+const OPENAMP_AID_TAG: &str = "openamp-aid-v1";
+
+/// A transaction prevout as the wallet knows it: explicit asset id, explicit
+/// value (atoms), and the scriptPubKey (hex). Restricted-asset transactions are
+/// transparent (spec 0.6), so these are always explicit. Aligned 1:1 with the
+/// transaction inputs when passed to [`enclave_sighash`] / [`decode_enclave_spend`].
+pub struct EnclavePrevout {
+    /// The prevout's asset id, display hex.
+    pub asset: String,
+    /// The prevout's explicit value, atoms.
+    pub value: u64,
+    /// The prevout's scriptPubKey, hex.
+    pub script: String,
+}
+
+/// One decoded input of a candidate enclave spend.
+pub struct EnclaveDecodedInput {
+    /// Input index in the transaction.
+    pub index: u32,
+    /// Prevout txid, display hex.
+    pub txid: String,
+    /// Prevout vout.
+    pub vout: u32,
+    /// Prevout asset id (display hex) if the prevout was supplied.
+    pub asset: Option<String>,
+    /// Prevout value (atoms) if the prevout was supplied.
+    pub value: Option<u64>,
+    /// True when the prevout scriptPubKey is one of MY enclave scripts.
+    pub mine: bool,
+}
+
+/// One decoded output of a candidate enclave spend.
+pub struct EnclaveDecodedOutput {
+    /// Output index in the transaction.
+    pub index: u32,
+    /// Explicit asset id (display hex), or `None` if the output is confidential.
+    pub asset: Option<String>,
+    /// Explicit value (atoms), or `None` if the output is confidential.
+    pub value: Option<u64>,
+    /// The output scriptPubKey, hex (empty for the Elements fee output).
+    pub script: String,
+    /// True for the explicit Elements fee output (empty scriptPubKey).
+    pub is_fee: bool,
+    /// True when this output pays one of MY enclave scripts (a receipt to me).
+    pub mine: bool,
+}
+
+/// The human-readable effects of a candidate enclave spend, shown to the user
+/// BEFORE signing (spec 0.4(3)): which of my UTXOs are spent, what each output
+/// pays and to whom, and whether anything is confidential (a red flag).
+pub struct EnclaveSpendEffects {
+    /// The transaction id.
+    pub txid: String,
+    /// Every input, with `mine` set for my enclave prevouts.
+    pub inputs: Vec<EnclaveDecodedInput>,
+    /// Every output, with `mine` set for receipts to my enclave scripts.
+    pub outputs: Vec<EnclaveDecodedOutput>,
+    /// Indices of the inputs that spend MY enclave UTXOs.
+    pub my_inputs_spent: Vec<u32>,
+    /// True if ANY output is confidential (restricted-asset spends must be fully
+    /// transparent, spec 2.4/0.6, so this is an integrity warning).
+    pub any_confidential: bool,
+}
+
+fn enclave_prevout_to_txout(p: &EnclavePrevout) -> Result<TxOut> {
+    let asset = AssetId::from_str(&p.asset)
+        .map_err(|e| err(format!("invalid asset id {}: {e}", p.asset)))?;
+    let spk = Script::from(hexbytes(&p.script)?);
+    Ok(TxOut {
+        asset: confidential::Asset::Explicit(asset),
+        value: confidential::Value::Explicit(p.value),
+        nonce: confidential::Nonce::Null,
+        script_pubkey: spk,
+        witness: Default::default(),
+    })
+}
+
+fn enclave_prevouts_to_txouts(prevouts: &[EnclavePrevout]) -> Result<Vec<TxOut>> {
+    prevouts.iter().map(enclave_prevout_to_txout).collect()
+}
+
+fn parse_openamp_tx(tx_hex: &str) -> Result<Transaction> {
+    let bytes = hexbytes(tx_hex)?;
+    lwk_wollet::elements::encode::deserialize(&bytes)
+        .map_err(|e| err(format!("invalid tx hex: {e}")))
+}
+
+/// Recompute the Elements taproot script-path sighash (SIGHASH_DEFAULT,
+/// genesis-committed) for a foreign NUMS enclave input, exactly as openampd does.
+/// The leaf version is recovered from the control block's first byte with the
+/// parity bit cleared (`0xc4` for an enclave leaf).
+fn enclave_sighash_inner(
+    tx: &Transaction,
+    input_index: usize,
+    prevouts: &[TxOut],
+    leaf_script: &Script,
+    control_block: &[u8],
+    genesis_hash: BlockHash,
+) -> Result<[u8; 32]> {
+    if control_block.is_empty() {
+        return Err(err("enclave control block is empty".to_string()));
+    }
+    if input_index >= tx.input.len() {
+        return Err(err(format!(
+            "input index {input_index} out of range ({} inputs)",
+            tx.input.len()
+        )));
+    }
+    if prevouts.len() != tx.input.len() {
+        return Err(err(format!(
+            "prevouts ({}) must align with inputs ({})",
+            prevouts.len(),
+            tx.input.len()
+        )));
+    }
+    let leaf_version = control_block[0] & 0xfe;
+    let script_path = ScriptPath::new(leaf_script, 0xFFFF_FFFF, leaf_version);
+    let mut cache = SighashCache::new(tx);
+    let sighash = cache
+        .taproot_script_spend_signature_hash(
+            input_index,
+            &Prevouts::All(prevouts),
+            script_path,
+            SchnorrSighashType::Default,
+            genesis_hash,
+        )
+        .map_err(|e| err(format!("enclave tapscript sighash: {e}")))?;
+    Ok(sighash.to_byte_array())
+}
+
+/// Compute an OpenAMP AID locally from a set of 64-hex x-only pubkeys, exactly
+/// matching Go `store.AID`: `hex(first 20 bytes of sha256("openamp-aid-v1" ||
+/// pubkeys lowercased, sorted lexicographically, concatenated as UTF-8))`. The
+/// wallet MUST call this and assert equality with the server's AID (spec 1.3);
+/// a mismatch means the server registered a different or additional key.
+#[flutter_rust_bridge::frb(sync)]
+pub fn openamp_compute_aid(pubkeys: Vec<String>) -> String {
+    let mut sorted: Vec<String> = pubkeys.iter().map(|p| p.trim().to_lowercase()).collect();
+    sorted.sort();
+    let mut engine = sha256::Hash::engine();
+    engine.input(OPENAMP_AID_TAG.as_bytes());
+    for p in &sorted {
+        engine.input(p.as_bytes());
+    }
+    let digest = sha256::Hash::from_engine(engine).to_byte_array();
+    tohex(&digest[..20])
+}
+
+/// The Sequentia network genesis block hash (hex), the taproot sighash domain
+/// separator the wallet must pass to [`enclave_sighash`]. Resolved from the
+/// active network so Dart never hardcodes it.
+#[flutter_rust_bridge::frb(sync)]
+pub fn sequentia_genesis_hash() -> String {
+    crate::sequentia_testnet().genesis_hash().to_string()
+}
+
+/// Recompute the enclave-spend sighash the wallet must sign (SWK-6, spec 0.4(3)).
+///
+/// - `tx_hex`: the FULL unsigned transaction the enclave asked the wallet to sign.
+/// - `input_index`: which input this enclave spend is.
+/// - `prevouts`: `{asset, value, script}` for EVERY input, aligned by index
+///   (taproot SIGHASH_DEFAULT commits to all prevout amounts + scripts).
+/// - `leaf_script_hex`: the enclave transfer leaf.
+/// - `control_block_hex`: the transfer-leaf control block (first byte = leaf
+///   version `0xc4` with the parity bit).
+/// - `genesis_hex`: the network genesis block hash (from [`sequentia_genesis_hash`]).
+///
+/// Returns the 32-byte sighash as hex. The wallet MUST sign THIS value and refuse
+/// if it differs from the server's `to_sign` digest.
+#[flutter_rust_bridge::frb(sync)]
+pub fn enclave_sighash(
+    tx_hex: String,
+    input_index: u32,
+    prevouts: Vec<EnclavePrevout>,
+    leaf_script_hex: String,
+    control_block_hex: String,
+    genesis_hex: String,
+) -> Result<String> {
+    let tx = parse_openamp_tx(&tx_hex)?;
+    let txouts = enclave_prevouts_to_txouts(&prevouts)?;
+    let leaf = Script::from(hexbytes(&leaf_script_hex)?);
+    let cb = hexbytes(&control_block_hex)?;
+    let genesis =
+        BlockHash::from_str(&genesis_hex).map_err(|e| err(format!("invalid genesis hash: {e}")))?;
+    let digest = enclave_sighash_inner(&tx, input_index as usize, &txouts, &leaf, &cb, genesis)?;
+    Ok(tohex(&digest))
+}
+
+/// Decode a candidate enclave-spend transaction into the effects a wallet must
+/// display before signing (SWK-6, spec 0.4(3)). `my_scripts` is the set of MY
+/// enclave scriptPubKeys (hex); a prevout or output matching one is flagged
+/// `mine`. `prevouts` aligns with the transaction inputs; pass an empty list to
+/// only enumerate each input's outpoint (txid/vout/index).
+#[flutter_rust_bridge::frb(sync)]
+pub fn decode_enclave_spend(
+    tx_hex: String,
+    prevouts: Vec<EnclavePrevout>,
+    my_scripts: Vec<String>,
+) -> Result<EnclaveSpendEffects> {
+    let tx = parse_openamp_tx(&tx_hex)?;
+    let txouts = enclave_prevouts_to_txouts(&prevouts)?;
+    let mine: std::collections::BTreeSet<String> =
+        my_scripts.iter().map(|s| s.trim().to_lowercase()).collect();
+
+    let mut inputs = Vec::with_capacity(tx.input.len());
+    let mut my_inputs_spent = Vec::new();
+    for (i, txin) in tx.input.iter().enumerate() {
+        let (asset, value, is_mine) = match txouts.get(i) {
+            Some(o) => {
+                let asset = match o.asset {
+                    confidential::Asset::Explicit(a) => Some(a.to_string()),
+                    _ => None,
+                };
+                let value = match o.value {
+                    confidential::Value::Explicit(v) => Some(v),
+                    _ => None,
+                };
+                let spk = tohex(o.script_pubkey.as_bytes());
+                (asset, value, mine.contains(&spk))
+            }
+            None => (None, None, false),
+        };
+        if is_mine {
+            my_inputs_spent.push(i as u32);
+        }
+        inputs.push(EnclaveDecodedInput {
+            index: i as u32,
+            txid: txin.previous_output.txid.to_string(),
+            vout: txin.previous_output.vout,
+            asset,
+            value,
+            mine: is_mine,
+        });
+    }
+
+    let mut outputs = Vec::with_capacity(tx.output.len());
+    let mut any_confidential = false;
+    for (i, o) in tx.output.iter().enumerate() {
+        let asset = match o.asset {
+            confidential::Asset::Explicit(a) => Some(a.to_string()),
+            _ => {
+                any_confidential = true;
+                None
+            }
+        };
+        let value = match o.value {
+            confidential::Value::Explicit(v) => Some(v),
+            _ => {
+                any_confidential = true;
+                None
+            }
+        };
+        let spk = tohex(o.script_pubkey.as_bytes());
+        outputs.push(EnclaveDecodedOutput {
+            index: i as u32,
+            asset,
+            value,
+            script: spk.clone(),
+            is_fee: o.is_fee(),
+            mine: mine.contains(&spk),
+        });
+    }
+
+    Ok(EnclaveSpendEffects {
+        txid: tx.txid().to_string(),
+        inputs,
+        outputs,
+        my_inputs_spent,
+        any_confidential,
+    })
+}
+
 #[cfg(test)]
 mod openamp_tests {
     use super::*;
@@ -1071,5 +1363,91 @@ mod openamp_tests {
         let msg_arr: [u8; 32] = hexbytes(sighash).unwrap().try_into().unwrap();
         let msg = Message::from_digest(msg_arr);
         assert!(secp.verify_schnorr(&sig, &msg, &xonly).is_ok());
+    }
+
+    // AID parity: sorted, lowercased, tag-prefixed sha256 first-20 (== Go store.AID).
+    #[test]
+    fn openamp_aid_is_sorted_and_case_insensitive() {
+        let pk = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let aid = openamp_compute_aid(vec![pk.to_string()]);
+        assert_eq!(aid.len(), 40, "AID is 20 bytes as hex");
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        assert_eq!(
+            openamp_compute_aid(vec![a.clone(), b.clone()]),
+            openamp_compute_aid(vec![b.clone(), a.to_uppercase()]),
+            "AID must be order- and case-independent"
+        );
+        assert_ne!(openamp_compute_aid(vec![a.clone(), b]), openamp_compute_aid(vec![a]));
+    }
+
+    // Byte-parity with the SWK reference vector (openamp.rs:829): the SAME fixed
+    // tx + prevout + 0xc4 NUMS transfer leaf must recompute to the SAME digest.
+    // This proves the shared rust-elements taproot sighash is identical across the
+    // two crates (the `sequentia` feature affects issuance parsing, not this path).
+    #[test]
+    fn enclave_sighash_parity_vector() {
+        use lwk_wollet::elements::{
+            confidential, AssetId, BlockHash, LockTime, OutPoint, Script, Sequence, Transaction,
+            TxIn, TxInWitness, TxOut, Txid,
+        };
+        const ENCLAVE_NUMS_HEX: &str =
+            "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
+        const ENCLAVE_LEAF_VERSION: u8 = 0xc4;
+        let asset = AssetId::from_slice(&[0x01u8; 32]).unwrap();
+        let value = 100_000u64;
+        let spk = Script::from(
+            hexbytes("5120aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap(),
+        );
+        // transfer leaf: <32B K_user> CHECKSIGVERIFY <32B K_policy> CHECKSIG
+        let mut leaf_bytes = vec![0x20u8];
+        leaf_bytes.extend_from_slice(&[0xbbu8; 32]);
+        leaf_bytes.push(0xad);
+        leaf_bytes.push(0x20);
+        leaf_bytes.extend_from_slice(&[0xccu8; 32]);
+        leaf_bytes.push(0xac);
+        let leaf = Script::from(leaf_bytes);
+        let mut cb = vec![ENCLAVE_LEAF_VERSION];
+        cb.extend_from_slice(&hexbytes(ENCLAVE_NUMS_HEX).unwrap());
+        let genesis = BlockHash::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000042",
+        )
+        .unwrap();
+        let tx = Transaction {
+            version: 2,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_str(&"11".repeat(32)).unwrap(), 0),
+                is_pegin: false,
+                script_sig: Script::new(),
+                sequence: Sequence::MAX,
+                asset_issuance: Default::default(),
+                witness: TxInWitness::default(),
+            }],
+            output: vec![
+                TxOut {
+                    asset: confidential::Asset::Explicit(asset),
+                    value: confidential::Value::Explicit(value - 1000),
+                    nonce: confidential::Nonce::Null,
+                    script_pubkey: spk.clone(),
+                    witness: Default::default(),
+                },
+                TxOut::new_fee(1000, asset),
+            ],
+        };
+        let prevout = TxOut {
+            asset: confidential::Asset::Explicit(asset),
+            value: confidential::Value::Explicit(value),
+            nonce: confidential::Nonce::Null,
+            script_pubkey: spk,
+            witness: Default::default(),
+        };
+        let sighash = enclave_sighash_inner(&tx, 0, &[prevout], &leaf, &cb, genesis).unwrap();
+        assert_eq!(
+            tohex(&sighash),
+            "1bff568af1b88b0518ea7b82374b047e5d8383b9bd230bb20df68452001db43c",
+            "enclave sighash drifted from the SWK reference vector"
+        );
     }
 }

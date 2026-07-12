@@ -109,6 +109,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BtcTx dco_decode_btc_tx(dynamic raw);
 
   @protected
+  EnclaveDecodedInput dco_decode_enclave_decoded_input(dynamic raw);
+
+  @protected
+  EnclaveDecodedOutput dco_decode_enclave_decoded_output(dynamic raw);
+
+  @protected
+  EnclavePrevout dco_decode_enclave_prevout(dynamic raw);
+
+  @protected
+  EnclaveSpendEffects dco_decode_enclave_spend_effects(dynamic raw);
+
+  @protected
   double dco_decode_f_32(dynamic raw);
 
   @protected
@@ -121,10 +133,27 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PlatformInt64 dco_decode_i_64(dynamic raw);
 
   @protected
+  List<String> dco_decode_list_String(dynamic raw);
+
+  @protected
   List<AssetBalance> dco_decode_list_asset_balance(dynamic raw);
 
   @protected
   List<AssetDelta> dco_decode_list_asset_delta(dynamic raw);
+
+  @protected
+  List<EnclaveDecodedInput> dco_decode_list_enclave_decoded_input(dynamic raw);
+
+  @protected
+  List<EnclaveDecodedOutput> dco_decode_list_enclave_decoded_output(
+    dynamic raw,
+  );
+
+  @protected
+  List<EnclavePrevout> dco_decode_list_enclave_prevout(dynamic raw);
+
+  @protected
+  Uint32List dco_decode_list_prim_u_32_strict(dynamic raw);
 
   @protected
   List<int> dco_decode_list_prim_u_8_loose(dynamic raw);
@@ -140,6 +169,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   LnNodeKeys dco_decode_ln_node_keys(dynamic raw);
+
+  @protected
+  String? dco_decode_opt_String(dynamic raw);
 
   @protected
   double? dco_decode_opt_box_autoadd_f_32(dynamic raw);
@@ -268,6 +300,24 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BtcTx sse_decode_btc_tx(SseDeserializer deserializer);
 
   @protected
+  EnclaveDecodedInput sse_decode_enclave_decoded_input(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  EnclaveDecodedOutput sse_decode_enclave_decoded_output(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  EnclavePrevout sse_decode_enclave_prevout(SseDeserializer deserializer);
+
+  @protected
+  EnclaveSpendEffects sse_decode_enclave_spend_effects(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   double sse_decode_f_32(SseDeserializer deserializer);
 
   @protected
@@ -280,12 +330,33 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PlatformInt64 sse_decode_i_64(SseDeserializer deserializer);
 
   @protected
+  List<String> sse_decode_list_String(SseDeserializer deserializer);
+
+  @protected
   List<AssetBalance> sse_decode_list_asset_balance(
     SseDeserializer deserializer,
   );
 
   @protected
   List<AssetDelta> sse_decode_list_asset_delta(SseDeserializer deserializer);
+
+  @protected
+  List<EnclaveDecodedInput> sse_decode_list_enclave_decoded_input(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<EnclaveDecodedOutput> sse_decode_list_enclave_decoded_output(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<EnclavePrevout> sse_decode_list_enclave_prevout(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  Uint32List sse_decode_list_prim_u_32_strict(SseDeserializer deserializer);
 
   @protected
   List<int> sse_decode_list_prim_u_8_loose(SseDeserializer deserializer);
@@ -301,6 +372,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   LnNodeKeys sse_decode_ln_node_keys(SseDeserializer deserializer);
+
+  @protected
+  String? sse_decode_opt_String(SseDeserializer deserializer);
 
   @protected
   double? sse_decode_opt_box_autoadd_f_32(SseDeserializer deserializer);
@@ -449,6 +523,30 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_btc_tx(BtcTx self, SseSerializer serializer);
 
   @protected
+  void sse_encode_enclave_decoded_input(
+    EnclaveDecodedInput self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_enclave_decoded_output(
+    EnclaveDecodedOutput self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_enclave_prevout(
+    EnclavePrevout self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_enclave_spend_effects(
+    EnclaveSpendEffects self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_f_32(double self, SseSerializer serializer);
 
   @protected
@@ -461,6 +559,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer);
 
   @protected
+  void sse_encode_list_String(List<String> self, SseSerializer serializer);
+
+  @protected
   void sse_encode_list_asset_balance(
     List<AssetBalance> self,
     SseSerializer serializer,
@@ -469,6 +570,30 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_list_asset_delta(
     List<AssetDelta> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_enclave_decoded_input(
+    List<EnclaveDecodedInput> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_enclave_decoded_output(
+    List<EnclaveDecodedOutput> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_enclave_prevout(
+    List<EnclavePrevout> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_prim_u_32_strict(
+    Uint32List self,
     SseSerializer serializer,
   );
 
@@ -492,6 +617,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_ln_node_keys(LnNodeKeys self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_String(String? self, SseSerializer serializer);
 
   @protected
   void sse_encode_opt_box_autoadd_f_32(double? self, SseSerializer serializer);

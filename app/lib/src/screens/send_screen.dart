@@ -869,9 +869,12 @@ class _BtcReviewSheetState extends State<_BtcReviewSheet> {
   }
 }
 
-/// Review + send a restricted (OpenAMP) asset. On confirm it drafts the transfer
-/// with the enclave, Schnorr-signs each returned sighash on-device (the key never
-/// leaves the phone), and completes it — returning the broadcast txid.
+/// Review + send a restricted (OpenAMP) asset. Two-phase, like [_ReviewSheet]:
+/// `_prepare` drafts the transfer and VERIFIES it on-device (recompute every
+/// enclave sighash, refuse on any mismatch, decode the real effects) before the
+/// user sees anything; `_confirm` signs the locally recomputed digests and
+/// completes it. The signing key never leaves the phone, and the wallet never
+/// blind-signs the server's digest (spec 0.4(3)).
 class _OpenampReviewSheet extends StatefulWidget {
   const _OpenampReviewSheet({
     required this.recipientAid,
@@ -891,57 +894,139 @@ class _OpenampReviewSheet extends StatefulWidget {
 }
 
 class _OpenampReviewSheetState extends State<_OpenampReviewSheet> {
-  bool _busy = false; // drafting + signing + completing
+  bool _busy = false; // signing + completing
+  bool _loading = true; // drafting + verifying + decoding
+  String? _error;
+  OpenampPrepared? _prepared;
 
-  Future<void> _confirm() async {
-    setState(() => _busy = true);
+  @override
+  void initState() {
+    super.initState();
+    _prepare();
+  }
+
+  Future<void> _prepare() async {
     try {
-      final ok = await WalletRepository.instance.requirePaymentAuth();
-      if (!ok) {
-        setState(() => _busy = false);
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(ambraSnack('Authentication cancelled; not sent.'));
-        return;
-      }
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) throw Exception('wallet unavailable');
-      final txid = await OpenAmpService.instance.sendTransfer(
+      final prepared = await OpenAmpService.instance.prepareTransfer(
         mnemonic: m,
         assetId: widget.assetId,
         recipientAid: widget.recipientAid,
         atoms: widget.atoms,
       );
+      if (mounted) {
+        setState(() {
+          _prepared = prepared;
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = _pretty(e);
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  String _tickerOf(String assetHex) => SeqAssets.labelFor(assetHex).ticker;
+  int _precisionOf(String assetHex) => SeqAssets.labelFor(assetHex).precision;
+
+  /// The decoded, locally verified effects as review rows.
+  List<Widget> _effectRows() {
+    final p = _prepared;
+    if (p == null) return const [];
+    final e = p.effects;
+    final rows = <Widget>[];
+    final spent = e.myInputsSpent.length;
+    rows.add(_Row('Spending', '$spent of your ${widget.ticker} enclave ${spent == 1 ? 'output' : 'outputs'}'));
+    if (p.convertAtoms != null && p.convertAtoms! > BigInt.zero) {
+      rows.add(_Row('Fee (converted)',
+          '${formatAtoms(p.convertAtoms!.toString(), _precisionOf(widget.assetId))} ${widget.ticker} (in-asset)'));
+    }
+    for (final o in e.outputs) {
+      if (o.isFee) continue; // the fee is summarised above
+      final amt = (o.value != null && o.asset != null)
+          ? '${formatAtoms(o.value!.toString(), _precisionOf(o.asset!))} ${_tickerOf(o.asset!)}'
+          : 'confidential';
+      final dest = o.mine ? 'to you (change/receipt)' : 'to recipient';
+      rows.add(_Row('Output', '$amt · $dest'));
+    }
+    return rows;
+  }
+
+  Future<void> _confirm() async {
+    final prepared = _prepared;
+    if (prepared == null) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final ok = await WalletRepository.instance.requirePaymentAuth();
+      if (!ok) {
+        setState(() {
+          _busy = false;
+          _error = 'Authentication failed or cancelled; payment not sent.';
+        });
+        return;
+      }
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) throw Exception('wallet unavailable');
+      final txid = await OpenAmpService.instance.completePrepared(prepared, m);
       if (mounted) Navigator.pop(context, txid);
     } catch (e) {
       if (mounted) {
-        setState(() => _busy = false);
-        ScaffoldMessenger.of(context).showSnackBar(ambraSnack(_pretty(e)));
+        setState(() {
+          _busy = false;
+          _error = _pretty(e);
+        });
       }
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final p = _prepared;
     return SafeArea(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
         child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           const Text('Confirm transfer', style: AmbraText.h1),
           const SizedBox(height: 18),
-          AmbraCard(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Column(children: [
-              _Row('Amount', '${widget.amountStr} ${widget.ticker}'),
-              _Row('To (AID)', widget.recipientAid, mono: true),
-              _Row('Via', 'OpenAMP enclave'),
-              _Row('Fee', 'taken by conversion in the enclave'),
-            ]),
-          ),
+          if (_loading)
+            const Padding(
+                padding: EdgeInsets.symmetric(vertical: 28),
+                child: Center(child: CircularProgressIndicator(color: AmbraColors.amber)))
+          else if (p != null) ...[
+            AmbraCard(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: Column(children: [
+                _Row('Amount', '${widget.amountStr} ${widget.ticker}'),
+                _Row('To (AID)', widget.recipientAid, mono: true),
+                _Row('Via', 'OpenAMP enclave (verified on-device)'),
+                ..._effectRows(),
+              ]),
+            ),
+            if (p.effects.anyConfidential)
+              const Padding(
+                padding: EdgeInsets.only(top: 12),
+                child: Text(
+                    'This transfer contains confidential outputs the wallet cannot fully decode. '
+                    'Review carefully before signing.',
+                    style: TextStyle(color: AmbraColors.red)),
+              ),
+          ],
           const SizedBox(height: 14),
+          if (_error != null)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
           PrimaryButton(
               label: 'Confirm & sign',
               busy: _busy,
               icon: Icons.fingerprint,
-              onPressed: _busy ? null : _confirm),
+              onPressed: (_busy || _loading || _prepared == null) ? null : _confirm),
           const SizedBox(height: 6),
           GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
         ]),

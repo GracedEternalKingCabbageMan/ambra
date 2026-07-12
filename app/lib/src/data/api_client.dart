@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import '../rust/api.dart' as core;
 import 'config.dart';
 
 class FaucetResult {
@@ -36,12 +37,40 @@ class OpenAmpToSign {
   final String pubkey;
 }
 
-/// A drafted OpenAMP transfer awaiting the wallet's signatures.
+/// A drafted OpenAMP transfer awaiting the wallet's signatures. [tx] is the full
+/// unsigned transaction (hex): the wallet uses it to recompute every enclave
+/// sighash locally and decode the effects, never trusting the server's `to_sign`.
 class OpenAmpTransfer {
-  OpenAmpTransfer({required this.id, required this.toSign, this.convertAtoms});
+  OpenAmpTransfer({
+    required this.id,
+    required this.tx,
+    required this.toSign,
+    this.convertAtoms,
+    this.feeSats,
+  });
   final String id;
+  final String tx;
   final List<OpenAmpToSign> toSign;
   final BigInt? convertAtoms; // fee taken by convert (fee_mode: "convert")
+  final BigInt? feeSats; // the equivalent network fee in sats
+}
+
+/// A per-asset enclave deposit address plus the taproot spend material the wallet
+/// needs to recompute an enclave sighash: the shared scriptPubKey, and the
+/// transfer leaf + control block of my enclave inputs for this asset.
+class EnclaveAddressInfo {
+  EnclaveAddressInfo({
+    required this.address,
+    required this.scriptPubkey,
+    required this.transferLeaf,
+    required this.transferControl,
+    required this.userPubkey,
+  });
+  final String address;
+  final String scriptPubkey;
+  final String transferLeaf;
+  final String transferControl;
+  final String userPubkey;
 }
 
 /// Thin HTTP client for the box sidecars (faucet now; registry/prices next).
@@ -150,6 +179,53 @@ class ApiClient {
     return '${j['address']}';
   }
 
+  /// The full enclave address record for [asset] under [aid]: the deposit
+  /// address plus the scriptPubKey and the transfer leaf + control block the
+  /// wallet needs to recompute the enclave sighash locally (spec 0.4(3)).
+  static Future<EnclaveAddressInfo> openampAddressInfo(String aid, String asset) async {
+    final u = Uri.parse('${Backend.openamp}/v1/users/$aid/address')
+        .replace(queryParameters: {'asset': asset});
+    final r = await http.get(u, headers: Backend.authHeaders).timeout(_openampTimeout);
+    if (r.statusCode != 200) _openampErr(r);
+    final j = jsonDecode(r.body) as Map<String, dynamic>;
+    return EnclaveAddressInfo(
+      address: '${j['address'] ?? ''}',
+      scriptPubkey: '${j['script_pubkey'] ?? ''}',
+      transferLeaf: '${j['transfer_leaf'] ?? ''}',
+      transferControl: '${j['transfer_control'] ?? ''}',
+      userPubkey: '${j['user_pubkey'] ?? ''}',
+    );
+  }
+
+  /// Resolve one transaction prevout from the block explorer, returning its
+  /// explicit asset id, value (atoms), and scriptPubKey aligned for a local
+  /// enclave-sighash recomputation. Throws if the output is confidential or
+  /// missing, since an unresolved prevout cannot be verified.
+  static Future<core.EnclavePrevout> prevoutAt(String txid, int vout) async {
+    final r = await http
+        .get(Uri.parse('${Backend.esplora}/tx/$txid'), headers: Backend.authHeaders)
+        .timeout(_openampTimeout);
+    if (r.statusCode != 200) {
+      throw Exception('explorer lookup failed for input $txid:$vout (HTTP ${r.statusCode})');
+    }
+    final j = jsonDecode(r.body) as Map<String, dynamic>;
+    final vouts = j['vout'];
+    if (vouts is! List || vout < 0 || vout >= vouts.length) {
+      throw Exception('prevout $txid:$vout not found');
+    }
+    final o = vouts[vout];
+    if (o is! Map) throw Exception('prevout $txid:$vout malformed');
+    final asset = o['asset'];
+    final valRaw = o['value'];
+    final spk = o['scriptpubkey'];
+    final value = valRaw is int ? BigInt.from(valRaw) : BigInt.tryParse('$valRaw');
+    if (asset is! String || asset.isEmpty || value == null || spk is! String || spk.isEmpty) {
+      throw Exception(
+          'input spends a confidential or unresolved prevout ($txid:$vout); cannot verify the sighash');
+    }
+    return core.EnclavePrevout(asset: asset, value: value, script: spk);
+  }
+
   /// The confirmed restricted-asset balance (atoms) for [asset] under [aid].
   static Future<BigInt> openampBalance(String aid, String asset) async {
     final u = Uri.parse('${Backend.openamp}/v1/users/$aid/balance')
@@ -196,16 +272,17 @@ class ApiClient {
     required String recipientAid,
     required BigInt atoms,
   }) async {
+    // atoms MUST be a JSON NUMBER: openampd uint64-decodes and rejects a string
+    // (spec 0.4(5)). jsonEncode(BigInt) throws, so the body is hand-assembled
+    // with a bare number literal; the string fields go through jsonEncode so
+    // they stay properly escaped.
+    final body = '{"asset":${jsonEncode(asset)},'
+        '"sender_aid":${jsonEncode(senderAid)},'
+        '"recipient_aid":${jsonEncode(recipientAid)},'
+        '"atoms":${atoms.toString()},'
+        '"fee_mode":"convert"}';
     final r = await http
-        .post(Uri.parse('${Backend.openamp}/v1/transfers'),
-            headers: _jsonHeaders,
-            body: jsonEncode({
-              'asset': asset,
-              'sender_aid': senderAid,
-              'recipient_aid': recipientAid,
-              'atoms': atoms.toString(),
-              'fee_mode': 'convert',
-            }))
+        .post(Uri.parse('${Backend.openamp}/v1/transfers'), headers: _jsonHeaders, body: body)
         .timeout(_openampTimeout);
     if (r.statusCode != 200) _openampErr(r);
     final j = jsonDecode(r.body) as Map<String, dynamic>;
@@ -223,8 +300,10 @@ class ApiClient {
     }
     return OpenAmpTransfer(
       id: '${j['id']}',
+      tx: '${j['tx'] ?? ''}',
       toSign: toSign,
       convertAtoms: BigInt.tryParse('${j['convert_atoms']}'),
+      feeSats: BigInt.tryParse('${j['fee_sats']}'),
     );
   }
 
