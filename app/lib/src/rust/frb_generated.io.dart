@@ -109,6 +109,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BtcTx dco_decode_btc_tx(dynamic raw);
 
   @protected
+  BuiltRawTx dco_decode_built_raw_tx(dynamic raw);
+
+  @protected
+  CovenantMakerAddress dco_decode_covenant_maker_address(dynamic raw);
+
+  @protected
+  CovenantPrepared dco_decode_covenant_prepared(dynamic raw);
+
+  @protected
   EnclaveDecodedInput dco_decode_enclave_decoded_input(dynamic raw);
 
   @protected
@@ -298,6 +307,17 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BtcTx sse_decode_btc_tx(SseDeserializer deserializer);
+
+  @protected
+  BuiltRawTx sse_decode_built_raw_tx(SseDeserializer deserializer);
+
+  @protected
+  CovenantMakerAddress sse_decode_covenant_maker_address(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  CovenantPrepared sse_decode_covenant_prepared(SseDeserializer deserializer);
 
   @protected
   EnclaveDecodedInput sse_decode_enclave_decoded_input(
@@ -521,6 +541,21 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_btc_tx(BtcTx self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_built_raw_tx(BuiltRawTx self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_covenant_maker_address(
+    CovenantMakerAddress self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_covenant_prepared(
+    CovenantPrepared self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_enclave_decoded_input(

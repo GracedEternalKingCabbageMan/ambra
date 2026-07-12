@@ -21,6 +21,12 @@ pub mod api;
 // implementation; api/mod.rs calls into it directly.
 /// SeqDEX same-chain atomic swap helpers (JSON serializer + bip32 strip).
 mod seqdex;
+/// SeqOB passive-CLOB covenant DERIVATION (port of covenant.js: leaves, taptree,
+/// planFill, ceilPrice, rate math) — pinned to SWK's golden vectors.
+pub mod seqob_covenant_derive;
+/// SeqOB relay WIRE (port of seqob.js: deterministic Offer codec + ECDSA
+/// sign/verify + cancel + maker identity key) — byte-matched to the Go relay.
+pub mod seqob_wire;
 // The cross-chain (BTC<->SEQ asset) swap glue now lives in the kit
 // (lwk_wollet::btc::xchain); api/mod.rs's xchain_* shims call into it.
 mod frb_generated;

@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `btc_params`, `clear_scan_marks`, `enclave_prevout_to_txout`, `enclave_prevouts_to_txouts`, `enclave_sighash_inner`, `err`, `esplora_client`, `hexbytes`, `last_scan`, `mark_scanned`, `openamp_keypair`, `parse_openamp_tx`, `rerr`, `scan_into`, `scanned_recently`, `tohex`, `with_synced_wollet`, `wollet_cache`
+// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `btc_params`, `clear_scan_marks`, `ct_str`, `ct_u64`, `derive_maker_payout`, `enclave_prevout_to_txout`, `enclave_prevouts_to_txouts`, `enclave_sighash_inner`, `err`, `esplora_client`, `fetch_utxo`, `hexbytes`, `last_scan`, `maker_identity_priv`, `mark_scanned`, `openamp_keypair`, `order_from_terms`, `parse_openamp_tx`, `rerr`, `scan_into`, `scanned_recently`, `select_taker_inputs`, `seq_addr_params`, `tohex`, `with_synced_wollet`, `wollet_cache`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
 String networkName() => RustLib.instance.api.crateApiNetworkName();
@@ -125,6 +125,112 @@ Future<String> seqdexSignAccept({
   mnemonic: mnemonic,
   esploraUrl: esploraUrl,
   acceptPset: acceptPset,
+);
+
+/// Derive the maker payout at `m/86'/coin'/0'/0/index` — the taproot output the
+/// covenant FILL credits, and the x-only key the REFUND leaf commits to.
+Future<CovenantMakerAddress> covenantMakerAddress({
+  required String mnemonic,
+  required int index,
+}) => RustLib.instance.api.crateApiCovenantMakerAddress(
+  mnemonic: mnemonic,
+  index: index,
+);
+
+/// Derive everything a covenant resting LIMIT order needs, WITHOUT wallet I/O:
+/// the covenant scriptPubKey/address to fund, the reduced rate, the min-lot, and
+/// the maker payout. The caller then funds `covenant_address` with `sell_atoms`
+/// of `sell_asset` (via the ordinary send path) and calls
+/// `covenant_finalize_offer` with the funded txid/vout.
+Future<CovenantPrepared> covenantPrepareOffer({
+  required String mnemonic,
+  required String sellAsset,
+  required BigInt sellAtoms,
+  required String buyAsset,
+  required BigInt buyAtoms,
+  required int tipHeight,
+  required int expiryBlocks,
+  required int makerIndex,
+}) => RustLib.instance.api.crateApiCovenantPrepareOffer(
+  mnemonic: mnemonic,
+  sellAsset: sellAsset,
+  sellAtoms: sellAtoms,
+  buyAsset: buyAsset,
+  buyAtoms: buyAtoms,
+  tipHeight: tipHeight,
+  expiryBlocks: expiryBlocks,
+  makerIndex: makerIndex,
+);
+
+/// After funding the covenant, assemble the `seqob.v1.Offer` (covenant resting
+/// SELL) from the prepared params + the funded `covenant_txid`:`covenant_vout`,
+/// sign it with the maker identity key, and return the signed offer JSON (hex
+/// `bytes` fields). The caller converts the covenant hex fields to base64 for the
+/// grpc-gateway POST (`seqob_client.dart`).
+Future<String> covenantFinalizeOffer({
+  required String mnemonic,
+  required String preparedJson,
+  required String covenantTxid,
+  required int covenantVout,
+}) => RustLib.instance.api.crateApiCovenantFinalizeOffer(
+  mnemonic: mnemonic,
+  preparedJson: preparedJson,
+  covenantTxid: covenantTxid,
+  covenantVout: covenantVout,
+);
+
+/// Sign an already-assembled offer JSON with the maker identity key (used when the
+/// caller builds the offer object itself). Returns the signed offer JSON.
+Future<String> seqobSignOffer({
+  required String mnemonic,
+  required String offerJson,
+}) => RustLib.instance.api.crateApiSeqobSignOffer(
+  mnemonic: mnemonic,
+  offerJson: offerJson,
+);
+
+/// Verify a relay-served offer's maker signature locally (the relay is untrusted).
+Future<bool> seqobVerifyOffer({required String offerJson}) =>
+    RustLib.instance.api.crateApiSeqobVerifyOffer(offerJson: offerJson);
+
+/// The maker's SeqOB identity pubkey hex (offer namespace + `myOffers` lookup).
+Future<String> seqobMakerPubkey({required String mnemonic}) =>
+    RustLib.instance.api.crateApiSeqobMakerPubkey(mnemonic: mnemonic);
+
+/// Sign an `OfferCancel` for an offer this wallet made. Returns the cancel JSON
+/// to POST to `/v1/offers/cancel`.
+Future<String> seqobSignCancel({
+  required String mnemonic,
+  required String offerId,
+  required BigInt nonce,
+}) => RustLib.instance.api.crateApiSeqobSignCancel(
+  mnemonic: mnemonic,
+  offerId: offerId,
+  nonce: nonce,
+);
+
+/// Assemble + sign the permissionless covenant FILL (TAKE/lift) that fills a
+/// chosen resting offer. `covenant_terms_json` is the offer's `CovenantTerms`
+/// (from the relay book). The covenant is trustlessly re-derived and checked
+/// against the funded UTXO's on-chain scriptPubKey (anti-relay-lie); the taker's
+/// own asset-B + fee UTXOs fund the maker credit + network fee. `take_atoms` is
+/// clamped to the covenant's locked amount. The fee is paid in `fee_asset`
+/// (open fee market; must NOT be the sold asset A). Returns the raw Elements tx
+/// hex to broadcast via `xchain_seq_broadcast`.
+Future<BuiltRawTx> covenantBuildFillTx({
+  required String mnemonic,
+  required String esploraUrl,
+  required String covenantTermsJson,
+  required BigInt takeAtoms,
+  required String feeAsset,
+  required BigInt feeAtoms,
+}) => RustLib.instance.api.crateApiCovenantBuildFillTx(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  covenantTermsJson: covenantTermsJson,
+  takeAtoms: takeAtoms,
+  feeAsset: feeAsset,
+  feeAtoms: feeAtoms,
 );
 
 /// Generate the swap preimage + hashlock.
@@ -758,6 +864,133 @@ class BtcTx {
           feeSats == other.feeSats &&
           vsize == other.vsize &&
           inputs == other.inputs;
+}
+
+/// The built raw FILL/lift transaction: Elements hex + its txid.
+class BuiltRawTx {
+  final String rawHex;
+  final String txid;
+
+  const BuiltRawTx({required this.rawHex, required this.txid});
+
+  @override
+  int get hashCode => rawHex.hashCode ^ txid.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is BuiltRawTx &&
+          runtimeType == other.runtimeType &&
+          rawHex == other.rawHex &&
+          txid == other.txid;
+}
+
+/// A BIP86 taproot maker-payout address + its 32-byte covenant `maker_prog`.
+class CovenantMakerAddress {
+  /// The 32-byte v1-taproot payout program hex (the offer's `maker_prog`).
+  final String programHex;
+
+  /// The `OP_1 <program>` scriptPubKey the FILL credit pays.
+  final String spkHex;
+
+  /// The unblinded (transparent) BIP86 taproot receive address.
+  final String address;
+
+  /// The x-only internal key hex (the offer's `maker_x`, REFUND authoriser).
+  final String internalKeyHex;
+
+  /// The derivation path `m/86'/coin'/0'/0/index`.
+  final String path;
+
+  const CovenantMakerAddress({
+    required this.programHex,
+    required this.spkHex,
+    required this.address,
+    required this.internalKeyHex,
+    required this.path,
+  });
+
+  @override
+  int get hashCode =>
+      programHex.hashCode ^
+      spkHex.hashCode ^
+      address.hashCode ^
+      internalKeyHex.hashCode ^
+      path.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is CovenantMakerAddress &&
+          runtimeType == other.runtimeType &&
+          programHex == other.programHex &&
+          spkHex == other.spkHex &&
+          address == other.address &&
+          internalKeyHex == other.internalKeyHex &&
+          path == other.path;
+}
+
+/// The prepared (pre-funding) parameters for a covenant resting LIMIT order.
+class CovenantPrepared {
+  /// Opaque JSON round-tripped back into `covenant_finalize_offer` after funding.
+  final String preparedJson;
+
+  /// The address the maker must FUND with `sell_atoms` of the sold asset.
+  final String covenantAddress;
+
+  /// The covenant scriptPubKey (used to locate the funded vout after funding).
+  final String covenantSpkHex;
+
+  /// Atoms of the wanted asset a FULL fill pays the maker (ceil price).
+  final String requiredB;
+
+  /// The min-lot floor (atoms of the sold asset) a taker may fill.
+  final String minLot;
+
+  /// The absolute REFUND expiry height.
+  final int expiryLocktime;
+
+  /// The fresh maker payout index used (persist to avoid credit collisions).
+  final int makerIndex;
+
+  /// The maker's SeqOB identity pubkey hex (offer namespace + cancel auth).
+  final String makerPubkey;
+
+  const CovenantPrepared({
+    required this.preparedJson,
+    required this.covenantAddress,
+    required this.covenantSpkHex,
+    required this.requiredB,
+    required this.minLot,
+    required this.expiryLocktime,
+    required this.makerIndex,
+    required this.makerPubkey,
+  });
+
+  @override
+  int get hashCode =>
+      preparedJson.hashCode ^
+      covenantAddress.hashCode ^
+      covenantSpkHex.hashCode ^
+      requiredB.hashCode ^
+      minLot.hashCode ^
+      expiryLocktime.hashCode ^
+      makerIndex.hashCode ^
+      makerPubkey.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is CovenantPrepared &&
+          runtimeType == other.runtimeType &&
+          preparedJson == other.preparedJson &&
+          covenantAddress == other.covenantAddress &&
+          covenantSpkHex == other.covenantSpkHex &&
+          requiredB == other.requiredB &&
+          minLot == other.minLot &&
+          expiryLocktime == other.expiryLocktime &&
+          makerIndex == other.makerIndex &&
+          makerPubkey == other.makerPubkey;
 }
 
 /// One decoded input of a candidate enclave spend.
