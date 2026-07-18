@@ -21,6 +21,7 @@ import '../rust/api.dart' as core;
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 import 'lightning_swap_screen.dart';
+import 'my_orders_screen.dart';
 import 'xchain_reverse_swap_screen.dart';
 import 'xchain_swap_screen.dart';
 
@@ -984,6 +985,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
               Text(_actionError!, style: const TextStyle(color: AmbraColors.red)),
             ],
           ],
+          _myOrdersLink(),
           _recentActivity(),
         ]),
       ),
@@ -1288,6 +1290,18 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
 
   /// A minimal local activity log (newest ~5): same-chain covenant fills + posts
   /// logged from the review sheets. Cross-chain / Lightning receipts live elsewhere.
+  /// Entry to the maker's resting-orders surface (view + reclaim a posted covenant
+  /// order after it expires). Always available so a maker can find + manage orders.
+  Widget _myOrdersLink() => Align(
+        alignment: Alignment.centerLeft,
+        child: GhostButton(
+          label: 'My resting orders →',
+          onPressed: () => Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => MyOrdersScreen(tipHeight: _tipHeight)),
+          ),
+        ),
+      );
+
   Widget _recentActivity() {
     if (_loading || _receipts.isEmpty) return const SizedBox.shrink();
     return Padding(
