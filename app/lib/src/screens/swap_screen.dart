@@ -10,6 +10,7 @@ import '../data/api_client.dart';
 import '../data/config.dart';
 import '../data/format.dart';
 import '../data/lightning_service.dart';
+import '../data/placed_orders.dart';
 import '../data/seqdex_client.dart';
 import '../data/seqob_client.dart';
 import '../data/wallet_repository.dart';
@@ -1137,6 +1138,26 @@ class _PostReviewSheetState extends State<_PostReviewSheet> {
       setState(() => _status = 'Locating the funded output…');
       final covVout = await resolveCovenantVout(covTxid, prepared.covenantSpkHex);
 
+      // FUND-SAFETY: the covenant is now funded ON-CHAIN. Persist its reclaim material (the funding
+      // outpoint + preparedJson + makerIndex + expiry) BEFORE finalizing and posting, so a post failure
+      // (relay reject, dropped connection) can never strand the funds without a local record to reclaim
+      // them. Flip posted:true once the relay accepts the offer.
+      var placed = PlacedCovenant(
+        covTxid: covTxid,
+        covVout: covVout,
+        pay: widget.payAsset,
+        receive: widget.recvAsset,
+        sellAtoms: widget.sellAtoms.toString(),
+        recvAtoms: widget.buyAtoms.toString(),
+        makerIndex: makerIndex,
+        covenantSpkHex: prepared.covenantSpkHex,
+        preparedJson: prepared.preparedJson,
+        expiryLocktime: prepared.expiryLocktime,
+        posted: false,
+        createdMs: DateTime.now().millisecondsSinceEpoch,
+      );
+      await PlacedOrders.put(placed);
+
       setState(() => _status = 'Signing & posting your order…');
       final signedOffer = await core.covenantFinalizeOffer(
         mnemonic: m,
@@ -1144,7 +1165,11 @@ class _PostReviewSheetState extends State<_PostReviewSheet> {
         covenantTxid: covTxid,
         covenantVout: covVout,
       );
-      await SeqObClient.postOffer(jsonDecode(signedOffer) as Map<String, dynamic>);
+      final offer = jsonDecode(signedOffer) as Map<String, dynamic>;
+      placed = placed.copyWith(offerId: offer['offer_id'] as String?);
+      await PlacedOrders.put(placed);
+      await SeqObClient.postOffer(offer);
+      await PlacedOrders.put(placed.copyWith(posted: true));
 
       if (mounted) Navigator.pop(context, covTxid);
     } catch (e) {
