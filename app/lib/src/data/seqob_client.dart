@@ -73,6 +73,28 @@ class OrderBook {
   BigInt get depthBaseAtoms => offers.fold(BigInt.zero, (a, o) => a + o.baseAtoms);
 }
 
+/// One executed trade from the relay's `/trades` feed (a completed same-chain
+/// fill). `price` is quote-per-base atoms as the relay recorded it; `size` is in
+/// base atoms; `ts` is unix seconds. The frame (which asset is base) is the pair
+/// the caller queried — a pair has ONE canonical direction, so a feed is either
+/// canonical or its inverse (the caller inverts prices when it queried the flip).
+class SeqObTrade {
+  SeqObTrade({required this.price, required this.size, required this.ts});
+  final double price; // quote atoms per 1 base atom, as recorded
+  final BigInt size; // base atoms traded
+  final int ts; // unix seconds
+}
+
+/// One OHLCV candle from the relay's `/candles` feed. `o/h/l/c` are quote-per-base
+/// prices; `v` is volume in the base (size) asset's atoms; `t` is the bucket start
+/// (unix seconds). Same one-canonical-direction rule as [SeqObTrade].
+class SeqObCandle {
+  SeqObCandle({required this.t, required this.o, required this.h, required this.l, required this.c, required this.v});
+  final int t;
+  final double o, h, l, c;
+  final BigInt v;
+}
+
 /// Thin HTTP client for the SeqOB relay (grpc-gateway REST under [Backend.seqob]).
 /// All signing/verification is delegated to the ambra_core FFIs so the bytes match
 /// the Go relay; this client is pure transport + parsing.
@@ -139,6 +161,57 @@ class SeqObClient {
     }
     offers.sort((a, b) => a.priceAtomsPerBase.compareTo(b.priceAtomsPerBase));
     return OrderBook(baseAsset, quoteAsset, offers);
+  }
+
+  /// Recent executed trades for (base, quote), newest first. Empty (never throws)
+  /// on a missing/one-directional market — the caller queries the canonical
+  /// direction, then the inverse, and inverts prices for whichever has data.
+  static Future<List<SeqObTrade>> fetchTrades(String baseAsset, String quoteAsset, {int limit = 30}) async {
+    try {
+      final j = await _get('/v1/market/$baseAsset/$quoteAsset/trades?limit=$limit');
+      final list = (j['trades'] as List?) ?? (j['Trades'] as List?) ?? const [];
+      final out = <SeqObTrade>[];
+      for (final e in list) {
+        if (e is! Map) continue;
+        final m = Map<String, dynamic>.from(e);
+        out.add(SeqObTrade(
+          price: _num(pick(m, ['price', 'Price'])),
+          size: _big(pick(m, ['size', 'Size'])),
+          ts: _num(pick(m, ['ts', 'Ts', 'time'])).toInt(),
+        ));
+      }
+      out.sort((a, b) => b.ts.compareTo(a.ts));
+      return out;
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// OHLCV candles for (base, quote), oldest first. Same tolerant, never-throws
+  /// contract as [fetchTrades]; `interval` is seconds per bucket (3600 = 1h).
+  static Future<List<SeqObCandle>> fetchCandles(String baseAsset, String quoteAsset,
+      {int interval = 3600, int limit = 48}) async {
+    try {
+      final j = await _get('/v1/market/$baseAsset/$quoteAsset/candles?interval=$interval&limit=$limit');
+      final list = (j['candles'] as List?) ?? (j['Candles'] as List?) ?? const [];
+      final out = <SeqObCandle>[];
+      for (final e in list) {
+        if (e is! Map) continue;
+        final m = Map<String, dynamic>.from(e);
+        out.add(SeqObCandle(
+          t: _num(pick(m, ['t', 'T', 'time', 'ts'])).toInt(),
+          o: _num(pick(m, ['o', 'O', 'open'])),
+          h: _num(pick(m, ['h', 'H', 'high'])),
+          l: _num(pick(m, ['l', 'L', 'low'])),
+          c: _num(pick(m, ['c', 'C', 'close'])),
+          v: _big(pick(m, ['v', 'V', 'volume'])),
+        ));
+      }
+      out.sort((a, b) => a.t.compareTo(b.t));
+      return out;
+    } catch (_) {
+      return const [];
+    }
   }
 
   /// A maker's own resting orders (for a My-Orders list + cancel).
@@ -215,6 +288,8 @@ class SeqObClient {
   }
 
   static BigInt _big(dynamic v) => BigInt.tryParse('${v ?? 0}') ?? BigInt.zero;
+
+  static double _num(dynamic v) => v is num ? v.toDouble() : (double.tryParse('${v ?? 0}') ?? 0);
 }
 
 // --- byte-field normalization (hex <-> base64) -------------------------------
