@@ -11,6 +11,7 @@ import '../data/config.dart';
 import '../data/format.dart';
 import '../data/lightning_service.dart';
 import '../data/placed_orders.dart';
+import '../data/price_service.dart';
 import '../data/seqdex_client.dart';
 import '../data/seqob_client.dart';
 import '../data/wallet_repository.dart';
@@ -84,6 +85,11 @@ class _SwapTabState extends State<SwapTab> {
   String _mode = 'take';
   bool _modeTouched = false;
   String _edited = 'pay'; // which amount the user last typed
+
+  // Price DISPLAY direction toggle. The book prices a pair ONE canonical way ("1 base = N
+  // quote", the higher-rank asset is the quote) so buy and sell read the same; this flips the
+  // display only. Per-pair (reset on a pair change), and forced off on a BTC (cross) pair.
+  bool _priceFlip = false;
 
   OrderBook? _orderBook;
   SeqObOffer? _selected;
@@ -381,6 +387,7 @@ class _SwapTabState extends State<SwapTab> {
         _reconcileReceive();
         _feeAsset = null;
         _feeRateCtl.clear();
+        _priceFlip = false; // display flip is per-pair
       });
       _cache();
       _fetchBook();
@@ -392,7 +399,10 @@ class _SwapTabState extends State<SwapTab> {
     if (recv.isEmpty) return _snack('Nothing trades against ${_tk(_payAsset)} yet');
     final picked = await _assetSheet('Receive', recv);
     if (picked != null) {
-      setState(() => _receiveAsset = picked);
+      setState(() {
+        _receiveAsset = picked;
+        _priceFlip = false; // display flip is per-pair
+      });
       _cache();
       _fetchBook();
     }
@@ -625,6 +635,35 @@ class _SwapTabState extends State<SwapTab> {
   }
 
   String _tk(String? hex) => hex == null ? '—' : SeqAssets.labelFor(hex).ticker;
+
+  // --- canonical price direction (mirrors the web wallet's swap.js) -----------
+
+  /// Fixed pricing-numeraire rank: in a pair, the higher-rank asset is the QUOTE, so a market
+  /// reads ONE way ("1 base = N quote") whether you buy or sell. Only genuine units of account
+  /// (BTC + the fiat stablecoins) are numeraires; the Sequence token and the commodities keep
+  /// EQUAL standing as ordinary base assets (Principle 3) at the generic tier.
+  int _quoteRank(String hex) {
+    final t = SeqAssets.labelFor(hex).ticker.toUpperCase();
+    if (t == 'BTC') return 1000;
+    const r = {'USDX': 900, 'EURX': 890, 'FEEUSD': 880, 'USDT': 870, 'USDC': 865, 'USD': 860};
+    return r[t] ?? 400; // unknown issued asset (incl. tSEQ/SEQ/GOLD/SILVR/OILX): generic base tier
+  }
+
+  /// True when either side of a pair is BTC — a cross pair, whose ladder is fixed to "1 asset =
+  /// N BTC" and can't honour the flip toggle (so the toggle is hidden + the flip forced off).
+  bool _pairIsCross(String a, String b) => _quoteRank(a) == 1000 || _quoteRank(b) == 1000;
+
+  /// The pair's DISPLAY direction {base, quote}: the higher-rank asset is the quote, ties broken
+  /// by asset id so the direction is stable across buy/sell. Honours the flip toggle, except on a
+  /// cross pair where the flip is ignored.
+  ({String base, String quote}) _pairDir(String a, String b) {
+    final ra = _quoteRank(a), rb = _quoteRank(b);
+    final canon = ra != rb
+        ? (ra > rb ? (base: b, quote: a) : (base: a, quote: b))
+        : (a.compareTo(b) < 0 ? (base: a, quote: b) : (base: b, quote: a));
+    final flip = _priceFlip && !_pairIsCross(a, b);
+    return flip ? (base: canon.quote, quote: canon.base) : canon;
+  }
 
   void _snack(String m) => ScaffoldMessenger.of(context).showSnackBar(ambraSnack(m));
 
@@ -895,6 +934,21 @@ class _SwapTabState extends State<SwapTab> {
           const Spacer(),
           Text('depth ${formatAtoms(book.depthBaseAtoms.toString(), recvPrec)} ${_tk(_receiveAsset)}',
               style: AmbraText.sub),
+          // Flip the price DISPLAY direction (hidden on a BTC/cross pair, which is fixed to "1 asset = N BTC").
+          if (!_pairIsCross(_payAsset!, _receiveAsset!)) ...[
+            const SizedBox(width: 6),
+            Tooltip(
+              message: 'Flip price direction',
+              child: InkWell(
+                borderRadius: BorderRadius.circular(6),
+                onTap: () => setState(() => _priceFlip = !_priceFlip),
+                child: const Padding(
+                  padding: EdgeInsets.all(4),
+                  child: Icon(Icons.swap_vert, size: 16, color: AmbraColors.dim),
+                ),
+              ),
+            ),
+          ],
         ]),
         const Divider(height: 16, color: AmbraColors.line),
         for (final o in rows) _bookRow(o, recvPrec, payPrec),
@@ -912,7 +966,12 @@ class _SwapTabState extends State<SwapTab> {
 
   Widget _bookRow(SeqObOffer o, int recvPrec, int payPrec) {
     final on = identical(o, _selected);
-    final price = (o.wantAtoms.toDouble() / _pow10(payPrec)) / (o.baseAtoms.toDouble() / _pow10(recvPrec));
+    // pay-per-receive (quote-per-base in the OFFER's frame, whose base is the receive asset)…
+    final payPerRecv = (o.wantAtoms.toDouble() / _pow10(payPrec)) / (o.baseAtoms.toDouble() / _pow10(recvPrec));
+    // …re-expressed in the pair's CANONICAL display frame so buy and sell read identically:
+    // qpb = quote per base = pay-per-receive when the display base is the receive asset, else its inverse.
+    final dir = _pairDir(_payAsset!, _receiveAsset!);
+    final qpb = dir.base == _receiveAsset ? payPerRecv : (payPerRecv > 0 ? 1 / payPerRecv : 0);
     return InkWell(
       onTap: _mode == 'take'
           ? () {
@@ -927,7 +986,7 @@ class _SwapTabState extends State<SwapTab> {
               size: 16, color: on ? AmbraColors.amber : AmbraColors.dim),
           const SizedBox(width: 10),
           Expanded(
-            child: Text('${_fmtPrice(price)} ${_tk(_payAsset)}/${_tk(_receiveAsset)}',
+            child: Text('1 ${_tk(dir.base)} = ${_fmtPrice(qpb)} ${_tk(dir.quote)}',
                 style: AmbraText.mono.copyWith(color: on ? AmbraColors.amber : AmbraColors.txt)),
           ),
           Text(formatAtoms(o.baseAtoms.toString(), recvPrec), style: AmbraText.mono),
@@ -953,6 +1012,16 @@ Future<int> resolveCovenantVout(String txid, String spkHex) async {
     if ('${o['scriptpubkey'] ?? ''}'.toLowerCase() == spkHex.toLowerCase()) return i;
   }
   throw Exception('funded covenant output not found in $txid');
+}
+
+/// The fee amount in its own asset plus a reference-currency approximation when the asset is
+/// priced, e.g. "12.3 GOLD  (≈ 49.20 USD)". Falls back to just the amount when the asset is
+/// unpriced (PriceService.approx returns null for an asset the feed can't value).
+String _feeWithApprox(String hex, BigInt atoms) {
+  final l = SeqAssets.labelFor(hex);
+  final amt = '${formatAtoms(atoms.toString(), l.precision)} ${l.ticker}';
+  final approx = PriceService.instance.approx(l.ticker, atoms.toString(), l.precision);
+  return approx == null ? amt : '$amt  ($approx)';
 }
 
 class _PickerRow extends StatelessWidget {
@@ -1069,7 +1138,7 @@ class _TakeReviewSheetState extends State<_TakeReviewSheet> {
             child: Column(children: [
               _Row('You pay', _amt(widget.payAsset, widget.payAtoms)),
               _Row('You receive', _amt(widget.recvAsset, widget.recvAtoms)),
-              _Row('Network fee', _amt(widget.feeAsset, widget.feeAtoms)),
+              _Row('Network fee', _feeWithApprox(widget.feeAsset, widget.feeAtoms)),
               _Row('Settlement', 'Permissionless covenant fill; settles in full or not at all.'),
               _Row('Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'),
             ]),
@@ -1230,7 +1299,7 @@ class _PostReviewSheetState extends State<_PostReviewSheet> {
             child: Column(children: [
               _Row('You sell', _amt(widget.payAsset, widget.sellAtoms)),
               _Row('You want', _amt(widget.recvAsset, widget.buyAtoms)),
-              _Row('Funding fee', _amt(widget.feeAsset, widget.feeAtoms)),
+              _Row('Funding fee', _feeWithApprox(widget.feeAsset, widget.feeAtoms)),
               _Row('Order', 'Rests as a funded covenant; a taker fills it at your price.'),
               _Row('Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'),
             ]),
