@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -23,7 +24,8 @@ final BigInt _kClaimFeeSats = BigInt.from(440);
 /// preimage + the maker's BTC HTLC terms are persisted at [SubSellStep.claiming] BEFORE the first
 /// on-chain claim, and [SubassetSellService.resume] re-attempts the claim idempotently on reload.
 enum SubSellStep {
-  paying, // paying the asset over Lightning (transient; not normally persisted)
+  paying, // about to pay / paying the asset over Lightning; PERSISTED with a swap_nonce BEFORE the pay
+  // so a lost response (asset possibly paid) is recoverable by re-calling the swap with the same nonce
   claiming, // asset paid + preimage known; claiming the BTC HTLC on-chain (the recovery window)
   done, // BTC claimed; swap complete
   failed,
@@ -34,10 +36,16 @@ class SubSellRecord {
     required this.step,
     required this.asset,
     required this.ticker,
-    required this.preimage,
-    required this.hashHex,
-    required this.btcLeg,
     required this.expectedBtc,
+    this.preimage = '',
+    this.hashHex = '',
+    this.btcLeg,
+    this.swapNonce,
+    this.amount,
+    this.btcClaimPub,
+    this.offerId,
+    this.makerPubkey,
+    this.startedMs,
     this.claimTxid = '',
     this.shortfall = false,
   });
@@ -45,15 +53,24 @@ class SubSellRecord {
   SubSellStep step;
   final String asset; // the Sequentia asset paid over Lightning
   final String ticker;
-  final String preimage; // NOT HD-derivable — the recovery-critical secret (claims the BTC)
-  final String hashHex;
-  final SubBtcHtlc btcLeg; // the maker's BTC HTLC the taker claims with [preimage]
+  final String preimage; // NOT HD-derivable — the recovery-critical secret (claims the BTC); '' at 'paying'
+  final String hashHex; // '' until the maker returns it (known from 'claiming' on)
+  final SubBtcHtlc? btcLeg; // the maker's BTC HTLC the taker claims with [preimage]; null at 'paying'
   final BigInt expectedBtc; // the BTC the offer quoted (economic gate); 0 when no offer was attached
+  // Recovery fields for the 'paying' step (asset possibly paid, response lost): everything needed to
+  // RE-CALL swapSub with the SAME [swapNonce] so the LSP returns the settle idempotently, without
+  // re-paying the asset. All null on records written before this recovery mechanism existed.
+  final String? swapNonce; // the idempotency key sent to the LSP
+  final num? amount; // the sell amount, to re-issue the swap
+  final String? btcClaimPub; // our device claim pubkey (also re-derivable from the mnemonic)
+  final String? offerId;
+  final String? makerPubkey;
+  final int? startedMs; // wall-clock ms when 'paying' began (bounds the recovery TTL)
   String claimTxid;
   bool shortfall; // the on-chain HTLC value came in below [expectedBtc] (claimed anyway, flagged)
 
-  /// The BTC value actually locked in the maker's HTLC (what the claim recovers).
-  BigInt get gotBtc => btcLeg.amount;
+  /// The BTC value actually locked in the maker's HTLC (what the claim recovers). Zero until known.
+  BigInt get gotBtc => btcLeg?.amount ?? BigInt.zero;
 
   Map<String, dynamic> toJson() => {
         'step': step.name,
@@ -61,27 +78,40 @@ class SubSellRecord {
         'ticker': ticker,
         'preimage': preimage,
         'hashHex': hashHex,
-        'btcLeg': btcLeg.toJson(),
+        'btcLeg': btcLeg?.toJson(),
         'expectedBtc': expectedBtc.toString(),
         'claimTxid': claimTxid,
         'shortfall': shortfall,
+        'swapNonce': swapNonce,
+        'amount': amount,
+        'btcClaimPub': btcClaimPub,
+        'offerId': offerId,
+        'makerPubkey': makerPubkey,
+        'startedMs': startedMs,
       };
 
   static SubSellRecord fromJson(Map<String, dynamic> j) => SubSellRecord(
         step: SubSellStep.values.firstWhere((s) => s.name == j['step'], orElse: () => SubSellStep.failed),
         asset: '${j['asset']}',
         ticker: '${j['ticker']}',
-        preimage: '${j['preimage']}',
-        hashHex: '${j['hashHex']}',
-        btcLeg: SubBtcHtlc.fromJson((j['btcLeg'] as Map?) ?? const {}),
+        preimage: '${j['preimage'] ?? ''}',
+        hashHex: '${j['hashHex'] ?? ''}',
+        btcLeg: j['btcLeg'] is Map ? SubBtcHtlc.fromJson(j['btcLeg'] as Map) : null,
         expectedBtc: BigInt.tryParse('${j['expectedBtc'] ?? 0}') ?? BigInt.zero,
         claimTxid: '${j['claimTxid'] ?? ''}',
         shortfall: j['shortfall'] == true,
+        swapNonce: (j['swapNonce'] is String && (j['swapNonce'] as String).isNotEmpty) ? j['swapNonce'] as String : null,
+        amount: j['amount'] is num ? j['amount'] as num : null,
+        btcClaimPub: j['btcClaimPub'] is String ? j['btcClaimPub'] as String : null,
+        offerId: j['offerId'] is String ? j['offerId'] as String : null,
+        makerPubkey: j['makerPubkey'] is String ? j['makerPubkey'] as String : null,
+        startedMs: j['startedMs'] is num ? (j['startedMs'] as num).toInt() : null,
       );
 
-  /// True while the asset has been paid but the BTC claim has not confirmed — the recovery window
-  /// where [SubassetSellService.resume] must re-attempt the claim.
-  bool get inFlight => step == SubSellStep.claiming;
+  /// True while a sell is in flight and its recovery handle must be protected: either the asset has
+  /// been paid and the BTC claim has not confirmed ('claiming'), or the asset MAY have been paid but
+  /// the swap response was lost ('paying'). [SubassetSellService.resume] advances/recovers both.
+  bool get inFlight => step == SubSellStep.claiming || step == SubSellStep.paying;
 }
 
 /// Persists the single active sub-asset SELL. It carries the preimage (the only thing that claims the
@@ -119,10 +149,43 @@ class SubassetSellService {
   /// `_sellStarting`.
   static bool _starting = false;
 
+  /// After this long a still-'paying' record can't complete (any unsettled Lightning payment has
+  /// auto-returned past its own timeout), so [resume] clears it rather than re-attempting forever.
+  static const int _kPayingTtlMs = 24 * 60 * 60 * 1000;
+
   static Future<String> _mnemonic() async {
     final m = await WalletRepository.instance.readMnemonic();
     if (m == null) throw Exception('wallet unavailable');
     return m;
+  }
+
+  /// A fresh 32-byte random hex idempotency key for a sub-asset sell (CSPRNG). Persisted in the
+  /// 'paying' record BEFORE the asset-paying swapSub and re-sent on recovery so the LSP returns the
+  /// already-settled result without re-paying the asset. Mirrors the web wallet's `newSwapNonce`.
+  static String _newSwapNonce() {
+    final r = Random.secure();
+    final b = List<int>.generate(32, (_) => r.nextInt(256));
+    return b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
+  }
+
+  /// Heuristic: did the swap call fail in a way that means the request MAY have completed server-side
+  /// (a LOST RESPONSE — network / timeout / connection error) rather than a DEFINITIVE LSP rejection
+  /// (a decoded ok:false body, thrown as a bare Exception by [LspClient])? Fund-safety leans KEEP: the
+  /// 'paying' record is discarded only when we are confident no asset was paid.
+  static bool _payMayHaveCompleted(Object e) {
+    final s = e.toString().toLowerCase();
+    return s.contains('socketexception') ||
+        s.contains('clientexception') ||
+        s.contains('httpexception') ||
+        s.contains('timeout') ||
+        s.contains('timed out') ||
+        s.contains('connection') ||
+        s.contains('failed host lookup') ||
+        s.contains('network') ||
+        s.contains('handshake') ||
+        s.contains('broken pipe') ||
+        s.contains('reset by peer') ||
+        s.contains('connection refused');
   }
 
   /// True while a sell is persisted with its BTC claim not yet confirmed — the single-active guard +
@@ -156,39 +219,71 @@ class SubassetSellService {
       final btcClaimPub = await core.xchainBtcClaimPubkey(mnemonic: m);
       // Bring our OWN hosted asset node's device signer online so the LSP can command the LN pay.
       final nodeKey = await LightningService.instance.connectNode(m, asset: asset);
-      // Pay the asset over Lightning; on settle the maker reveals the preimage, returned WITH the BTC
-      // HTLC terms. The LSP never claims (no claim key) — we claim on-chain ourselves.
-      final resp = await LightningService.instance.swapSub(
-        side: 'sell',
+      // FUND-SAFETY: the asset is paid INSIDE swapSub. Persist a PENDING ('paying') record carrying a
+      // fresh nonce + everything needed to RE-CALL swapSub, BEFORE that call. If its response is lost
+      // after the LSP already paid the asset, resume() re-calls with this SAME nonce and the LSP
+      // returns the settled result idempotently (it never re-pays for a stored nonce).
+      final swapNonce = _newSwapNonce();
+      await SubSellStore.save(SubSellRecord(
+        step: SubSellStep.paying,
         asset: asset,
-        nodeKey: nodeKey,
+        ticker: ticker,
+        expectedBtc: offer?.btcSats ?? BigInt.zero,
+        swapNonce: swapNonce,
         amount: amount,
-        // State the rails EXPLICITLY (asset over LN, BTC on-chain) so the LSP routes this to the
-        // sub-asset SELL, not the pure-LN default.
-        payRail: 'ln',
-        recvRail: 'chain',
         btcClaimPub: btcClaimPub,
         offerId: offer?.offerId,
         makerPubkey: offer?.makerPubkey,
-      );
-      final s = resp.settle;
-      if (!(s.settled && s.preimage.isNotEmpty && s.btcHtlc != null)) {
-        throw Exception('The sell did not settle over Lightning.');
+        startedMs: DateTime.now().millisecondsSinceEpoch,
+      ));
+      var paidCallStarted = false;
+      try {
+        // Pay the asset over Lightning; on settle the maker reveals the preimage, returned WITH the BTC
+        // HTLC terms. The LSP never claims (no claim key) — we claim on-chain ourselves.
+        paidCallStarted = true; // from here a lost response means the asset MAY be paid -> keep for recovery
+        final resp = await LightningService.instance.swapSub(
+          side: 'sell',
+          asset: asset,
+          nodeKey: nodeKey,
+          amount: amount,
+          // State the rails EXPLICITLY (asset over LN, BTC on-chain) so the LSP routes this to the
+          // sub-asset SELL, not the pure-LN default.
+          payRail: 'ln',
+          recvRail: 'chain',
+          btcClaimPub: btcClaimPub,
+          offerId: offer?.offerId,
+          makerPubkey: offer?.makerPubkey,
+          swapNonce: swapNonce,
+        );
+        final s = resp.settle;
+        if (!(s.settled && s.preimage.isNotEmpty && s.btcHtlc != null)) {
+          throw Exception('The sell did not settle over Lightning.');
+        }
+        // PERSIST BEFORE the on-chain claim: the asset is now paid, so the BTC claim is the fund step and
+        // MUST survive a reload — resume() re-attempts it from here.
+        final rec = SubSellRecord(
+          step: SubSellStep.claiming,
+          asset: asset,
+          ticker: ticker,
+          preimage: s.preimage,
+          hashHex: s.hashHex.isNotEmpty ? s.hashHex : s.btcHtlc!.raw['hash_h']?.toString() ?? '',
+          btcLeg: s.btcHtlc!,
+          expectedBtc: offer?.btcSats ?? BigInt.zero,
+          swapNonce: swapNonce,
+        );
+        await SubSellStore.save(rec);
+        await claim(rec); // verify + claim; mutates + persists rec
+        return rec;
+      } catch (e) {
+        // A LOST RESPONSE (network error after we may have paid) KEEPS the 'paying' record so resume()
+        // recovers via the nonce; a DEFINITIVE rejection (LSP ok:false — the sell never settled) means
+        // NO asset was paid, so discard it (else it blocks future sells + re-runs on the next resume).
+        if (paidCallStarted && !_payMayHaveCompleted(e)) {
+          final cur = await SubSellStore.load();
+          if (cur != null && cur.step == SubSellStep.paying) await SubSellStore.clear();
+        }
+        rethrow;
       }
-      // PERSIST BEFORE the on-chain claim: the asset is now paid, so the BTC claim is the fund step and
-      // MUST survive a reload — resume() re-attempts it from here.
-      final rec = SubSellRecord(
-        step: SubSellStep.claiming,
-        asset: asset,
-        ticker: ticker,
-        preimage: s.preimage,
-        hashHex: s.hashHex.isNotEmpty ? s.hashHex : s.btcHtlc!.raw['hash_h']?.toString() ?? '',
-        btcLeg: s.btcHtlc!,
-        expectedBtc: offer?.btcSats ?? BigInt.zero,
-      );
-      await SubSellStore.save(rec);
-      await claim(rec); // verify + claim; mutates + persists rec
-      return rec;
     } finally {
       _starting = false;
     }
@@ -201,6 +296,7 @@ class SubassetSellService {
   static Future<void> verifyClaimable(SubSellRecord rec) async {
     final m = await _mnemonic();
     final h = rec.btcLeg;
+    if (h == null) throw Exception('No BTC HTLC to verify (the sell has not settled yet).');
     final ours = (await core.xchainBtcClaimPubkey(mnemonic: m)).toLowerCase();
     if (h.takerClaimPubkey.toLowerCase() != ours) {
       throw Exception('The BTC HTLC is not locked to this wallet\'s claim key.');
@@ -243,6 +339,7 @@ class SubassetSellService {
     await verifyClaimable(rec);
     final m = await _mnemonic();
     final h = rec.btcLeg;
+    if (h == null) throw Exception('No BTC HTLC to claim (the sell has not settled yet).');
     final dest = await core.receiveAddress(mnemonic: m); // our own tb1
     final hex = await core.xchainBtcClaim(
       mnemonic: m,
@@ -273,12 +370,67 @@ class SubassetSellService {
   /// place on success (terminal 'done'); a failure keeps it 'claiming' for the next retry.
   static Future<void> resume() async {
     final rec = await SubSellStore.load();
-    if (rec == null || rec.step != SubSellStep.claiming || rec.preimage.isEmpty) return;
-    try {
-      await claim(rec);
-    } catch (_) {
-      // Leave persisted; the HTLC may already be claimed, or the claim needs a retry — surfaced when
-      // the user re-enters the sub-asset SELL screen.
+    if (rec == null) return;
+    // (A) Asset paid + response received: preimage + HTLC persisted -> re-attempt the on-chain claim.
+    if (rec.step == SubSellStep.claiming && rec.preimage.isNotEmpty) {
+      try {
+        await claim(rec);
+      } catch (_) {
+        // Leave persisted; the HTLC may already be claimed, or the claim needs a retry — surfaced when
+        // the user re-enters the sub-asset SELL screen.
+      }
+      return;
+    }
+    // (B) Asset MAY have been paid but the swapSub response was LOST (a network blip after the LSP
+    //     settled): 'paying' with a nonce, no preimage. RE-CALL swapSub with the SAME nonce — the LSP
+    //     returns the already-settled result idempotently (never re-paying), then claim. This is the
+    //     window that would otherwise LOSE the asset (paid, but with no preimage/HTLC to claim the BTC).
+    if (rec.step == SubSellStep.paying && (rec.swapNonce?.isNotEmpty ?? false) && rec.preimage.isEmpty) {
+      // Bounded: past the Lightning leg's own timeout any unsettled asset payment has auto-returned, so a
+      // still-'paying' record this old can't complete — clear it rather than re-attempt (or re-run) forever.
+      final startedMs = rec.startedMs ?? 0;
+      if (startedMs > 0 && DateTime.now().millisecondsSinceEpoch - startedMs > _kPayingTtlMs) {
+        await SubSellStore.clear();
+        return;
+      }
+      try {
+        final m = await _mnemonic();
+        final asset = rec.asset;
+        // Re-derive our claim key + bring our node online the SAME way begin does (deterministic).
+        final btcClaimPub = (rec.btcClaimPub != null && rec.btcClaimPub!.isNotEmpty)
+            ? rec.btcClaimPub!
+            : await core.xchainBtcClaimPubkey(mnemonic: m);
+        final nodeKey = await LightningService.instance.connectNode(m, asset: asset);
+        final resp = await LightningService.instance.swapSub(
+          side: 'sell',
+          asset: asset,
+          nodeKey: nodeKey,
+          amount: rec.amount,
+          payRail: 'ln',
+          recvRail: 'chain',
+          btcClaimPub: btcClaimPub,
+          offerId: rec.offerId,
+          makerPubkey: rec.makerPubkey,
+          swapNonce: rec.swapNonce,
+        );
+        final s = resp.settle;
+        if (!(s.settled && s.preimage.isNotEmpty && s.btcHtlc != null)) return; // not settled yet; keep for a later retry
+        final claiming = SubSellRecord(
+          step: SubSellStep.claiming,
+          asset: asset,
+          ticker: rec.ticker,
+          preimage: s.preimage,
+          hashHex: s.hashHex.isNotEmpty ? s.hashHex : s.btcHtlc!.raw['hash_h']?.toString() ?? '',
+          btcLeg: s.btcHtlc!,
+          expectedBtc: rec.expectedBtc,
+          swapNonce: rec.swapNonce,
+        );
+        await SubSellStore.save(claiming);
+        await claim(claiming);
+      } catch (_) {
+        // Leave the 'paying' record; its nonce keeps recovery idempotent on the next resume.
+      }
+      return;
     }
   }
 }

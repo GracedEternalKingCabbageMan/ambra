@@ -149,6 +149,7 @@ class LightningService extends ChangeNotifier {
     String? btcClaimPub,
     String? offerId,
     String? makerPubkey,
+    String? swapNonce,
   }) =>
       LspClient.swapSub(
         side: side,
@@ -164,6 +165,7 @@ class LightningService extends ChangeNotifier {
         btcClaimPub: btcClaimPub,
         offerId: offerId,
         makerPubkey: makerPubkey,
+        swapNonce: swapNonce,
       );
 
   /// Bring the user's OWN hosted [asset] node online (provision + device signer) and return its LSP
