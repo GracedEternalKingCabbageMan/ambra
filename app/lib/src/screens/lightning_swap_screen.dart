@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../data/config.dart';
 import '../data/lightning_service.dart';
@@ -235,14 +234,6 @@ class _LightningSwapScreenState extends State<LightningSwapScreen> {
           _Row('You received', got),
           if (r.settledMs != null) _Row('Settled in', '${r.settledMs} ms'),
           _Row('Finality', _ln.finalityCopy()),
-          const SizedBox(height: 8),
-          InkWell(
-            onTap: () {
-              Clipboard.setData(ClipboardData(text: r.preimage));
-              _snack('Preimage copied');
-            },
-            child: _Row('Preimage', r.preimage.length > 16 ? '${r.preimage.substring(0, 16)}…  (copy)' : r.preimage),
-          ),
         ]),
       ),
       const SizedBox(height: 16),

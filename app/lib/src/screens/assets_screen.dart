@@ -163,7 +163,11 @@ class _AssetsScreenState extends State<AssetsScreen> {
     final feeHex = _pickFeeAsset(burn ? null : id);
     if (feeHex == null) return _snack('You need some funds to pay the network fee. Use the faucet (More tab).');
     final known = label.subtitle != null; // a built-in asset => precision is known
-    final line = '${formatAtoms(amt.toString(), label.precision)} ${label.ticker}  (${amt.toString()} atoms)';
+    // Show the raw atom count only for an unknown-precision asset, where the body copy below relies
+    // on it ("the atom amount above ..."); for a known asset it is just jargon, so drop the suffix.
+    final line = known
+        ? '${formatAtoms(amt.toString(), label.precision)} ${label.ticker}'
+        : '${formatAtoms(amt.toString(), label.precision)} ${label.ticker}  (${amt.toString()} atoms)';
     final feeLine = '\n\nThe network fee is paid in ${_feeTicker(feeHex)}.';
     final ok = await _confirm(
       title: burn ? 'Burn asset' : 'Reissue asset',
