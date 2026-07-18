@@ -298,6 +298,7 @@ class LspClient {
     String? btcClaimPub,
     String? offerId,
     String? makerPubkey,
+    String? swapNonce,
   }) async {
     final body = <String, dynamic>{
       'side': side,
@@ -314,6 +315,10 @@ class LspClient {
     if (btcClaimPub != null) body['btc_claim_pub'] = btcClaimPub;
     if (offerId != null) body['offer_id'] = offerId;
     if (makerPubkey != null) body['maker_pubkey'] = makerPubkey;
+    // Sub-asset SELL idempotency key: the wallet persists it BEFORE this call and re-sends the SAME
+    // value on recovery, so the LSP returns the already-settled result without re-paying the asset.
+    // Serialized ONLY when present, so the pure-LN swap and the sub-asset BUY bodies are untouched.
+    if (swapNonce != null) body['swap_nonce'] = swapNonce;
     final r = await _postJson('/swap', body, timeout: const Duration(seconds: 90));
     return SubSwapResult.fromJson(_decode(r));
   }
