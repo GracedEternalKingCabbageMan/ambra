@@ -17,6 +17,8 @@ import '../data/openamp_service.dart';
 import '../data/price_service.dart';
 import '../data/registry_service.dart';
 import '../data/seqln_keys.dart' as lnkeys;
+import '../data/subasset_buy_service.dart';
+import '../data/subasset_sell_service.dart';
 import '../data/wallet_cache.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
@@ -57,7 +59,13 @@ class _ShellState extends State<Shell> {
   Future<void> _initLightning() async {
     if (!LightningService.instance.configured) return; // LN not deployed here
     final m = await WalletRepository.instance.readMnemonic();
-    if (m != null) await LightningService.instance.start(m);
+    if (m == null) return;
+    await LightningService.instance.start(m);
+    // Fund-recovery on cold start: resume any in-flight sub-asset swap so a locked BTC HTLC settles or
+    // refunds (BUY) and an unclaimed BTC gets re-claimed (SELL) even if the user never re-opens Swap.
+    // Fire-and-forget: each loads its own persisted record and no-ops when there is nothing to resume.
+    unawaited(SubassetBuyService.resume());
+    unawaited(SubassetSellService.resume());
   }
 
   Future<void> _initOpenamp() async {

@@ -15,6 +15,8 @@ import '../data/placed_orders.dart';
 import '../data/price_service.dart';
 import '../data/seqdex_client.dart';
 import '../data/seqob_client.dart';
+import '../data/subasset_buy_service.dart';
+import '../data/subasset_sell_service.dart';
 import '../data/trade_receipts.dart';
 import '../data/wallet_repository.dart';
 import '../rust/api.dart' as core;
@@ -22,6 +24,8 @@ import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 import 'lightning_swap_screen.dart';
 import 'my_orders_screen.dart';
+import 'subasset_buy_screen.dart';
+import 'subasset_sell_screen.dart';
 import 'xchain_reverse_swap_screen.dart';
 import 'xchain_swap_screen.dart';
 
@@ -77,6 +81,17 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   String? _payAsset;
   String? _receiveAsset;
   String? _feeAsset; // null => default (the paid asset)
+
+  // Sub-asset (asset over Lightning <-> BTC on-chain HTLC) rail availability for the current composer
+  // assets, probed from the LSP book — mirrors the web's subassetCapable/sellCapable dynamic gating.
+  // The `*InFlight` flags keep the entry reachable to resume/refund an in-flight swap even if live
+  // counterparty liquidity has since dried up (fund-safety).
+  bool _subBuyAvail = false;
+  bool _subSellAvail = false;
+  bool _subBuyInFlight = false;
+  bool _subSellInFlight = false;
+  String? _subBuyAsset; // the in-flight buy's asset (so its entry stays reachable even off-pair)
+  String? _subSellAsset; // the in-flight sell's asset
 
   // Book namespace: Unblinded (transparent, the default, byte-identical to the
   // live covenant rail) vs Blinded (confidential). The Blinded book routes to the
@@ -394,6 +409,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       });
       _cache();
       _fetchBook();
+      unawaited(_probeSubasset());
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -402,6 +418,60 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         });
       }
     }
+  }
+
+  /// Probe the sub-asset book for the current receive (BUY) + pay (SELL) assets, and whether an
+  /// in-flight sub-asset swap is persisted, to gate the two "over Lightning · BTC on-chain" entry
+  /// buttons. Best-effort + dormant unless Lightning is available. Mirrors the web's
+  /// subassetCapable/sellCapable: a rail lights only when REAL resting counterparty liquidity exists.
+  Future<void> _probeSubasset() async {
+    // Whether a persisted swap needs resuming does NOT depend on live liquidity — read the records
+    // either way so the entry stays reachable (to refund/retry) even if the maker has since gone.
+    final buyRec = await SubBuyStore.load();
+    final sellRec = await SubSellStore.load();
+    final buyInFlight = buyRec != null && buyRec.inFlight;
+    final sellInFlight = sellRec != null && sellRec.inFlight;
+    var buyAvail = false, sellAvail = false;
+    if (LightningService.instance.available) {
+      final recv = _receiveAsset, pay = _payAsset;
+      if (recv != null) {
+        try {
+          buyAvail = (await LightningService.instance.subassetBook(recv)).buyAvailable;
+        } catch (_) {/* dynamic gating: no book => rail dark */}
+      }
+      if (pay != null) {
+        try {
+          sellAvail = (await LightningService.instance.subassetBook(pay)).sellAvailable;
+        } catch (_) {}
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _subBuyAvail = buyAvail;
+      _subSellAvail = sellAvail;
+      _subBuyInFlight = buyInFlight;
+      _subSellInFlight = sellInFlight;
+      _subBuyAsset = buyInFlight ? buyRec.asset : null;
+      _subSellAsset = sellInFlight ? sellRec.asset : null;
+    });
+  }
+
+  /// Open the sub-asset BUY screen for the composer's receive asset (or the in-flight buy's asset),
+  /// then re-probe availability on return.
+  Future<void> _openSubBuy() async {
+    final asset = _subBuyAsset ?? _receiveAsset;
+    if (asset == null) return;
+    await Navigator.of(context).push(MaterialPageRoute(builder: (_) => SubassetBuyScreen(asset: asset)));
+    await _probeSubasset();
+  }
+
+  /// Open the sub-asset SELL screen for the composer's pay asset (or the in-flight sell's asset), then
+  /// re-probe availability on return.
+  Future<void> _openSubSell() async {
+    final asset = _subSellAsset ?? _payAsset;
+    if (asset == null) return;
+    await Navigator.of(context).push(MaterialPageRoute(builder: (_) => SubassetSellScreen(asset: asset)));
+    await _probeSubasset();
   }
 
   // --- asset sets ------------------------------------------------------------
@@ -600,6 +670,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       });
       _cache();
       _fetchBook();
+      unawaited(_probeSubasset());
     }
   }
 
@@ -614,6 +685,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       });
       _cache();
       _fetchBook();
+      unawaited(_probeSubasset());
     }
   }
 
@@ -904,17 +976,40 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           ),
           ListenableBuilder(
             listenable: LightningService.instance,
-            builder: (context, _) => LightningService.instance.available
-                ? Padding(
-                    padding: const EdgeInsets.only(top: 10),
-                    child: SecondaryButton(
-                      label: 'Instant (Lightning)',
-                      icon: Icons.bolt,
-                      onPressed: () =>
-                          Navigator.of(context).push(MaterialPageRoute(builder: (_) => const LightningSwapScreen())),
-                    ),
-                  )
-                : const SizedBox.shrink(),
+            builder: (context, _) {
+              if (!LightningService.instance.available) return const SizedBox.shrink();
+              // Sub-asset rails: light a button only when REAL resting counterparty liquidity exists for
+              // the composer's asset (BUY -> the receive asset; SELL -> the pay asset), mirroring the
+              // web's subassetCapable/sellCapable. An in-flight swap keeps its entry reachable regardless
+              // (to resume / refund), even if that liquidity has since dried up.
+              final showBuy = _subBuyAvail || _subBuyInFlight;
+              final showSell = _subSellAvail || _subSellInFlight;
+              return Column(children: [
+                const SizedBox(height: 10),
+                SecondaryButton(
+                  label: 'Instant (Lightning)',
+                  icon: Icons.bolt,
+                  onPressed: () =>
+                      Navigator.of(context).push(MaterialPageRoute(builder: (_) => const LightningSwapScreen())),
+                ),
+                if (showBuy) ...[
+                  const SizedBox(height: 10),
+                  SecondaryButton(
+                    label: 'Buy over Lightning · BTC on-chain',
+                    icon: Icons.south_west,
+                    onPressed: (_subBuyAsset ?? _receiveAsset) == null ? null : _openSubBuy,
+                  ),
+                ],
+                if (showSell) ...[
+                  const SizedBox(height: 10),
+                  SecondaryButton(
+                    label: 'Sell over Lightning · BTC on-chain',
+                    icon: Icons.north_east,
+                    onPressed: (_subSellAsset ?? _payAsset) == null ? null : _openSubSell,
+                  ),
+                ],
+              ]);
+            },
           ),
           const SizedBox(height: 20),
           if (_loading)
