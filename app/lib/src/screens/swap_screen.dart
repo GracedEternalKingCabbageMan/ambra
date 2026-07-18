@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -14,6 +15,7 @@ import '../data/placed_orders.dart';
 import '../data/price_service.dart';
 import '../data/seqdex_client.dart';
 import '../data/seqob_client.dart';
+import '../data/trade_receipts.dart';
 import '../data/wallet_repository.dart';
 import '../rust/api.dart' as core;
 import '../theme/theme.dart';
@@ -31,6 +33,11 @@ const double _kDefaultSatPerVb = 0.5;
 
 /// 1e8 = exchange_rate_scale (native atoms per reference unit).
 final BigInt _kScale = BigInt.from(100000000);
+
+/// Derived 24h stats for the active pair, in the canonical quote-per-base frame.
+/// `pts` are the in-window closes (for the sparkline); `sizeAsset` is the hex of
+/// the asset `vol` is denominated in (the candle feed's base/size asset).
+typedef _PairStats = ({List<double> pts, double changePct, double hi, double lo, BigInt vol, String sizeAsset});
 
 /// SeqOB same-chain order book: TAKE (lift a resting covenant offer) or POST (rest
 /// your own signed LIMIT order). Pay one Sequentia asset, receive another, settled
@@ -56,7 +63,7 @@ class _SwapCache {
   static int makerIndexSeed = DateTime.now().millisecondsSinceEpoch % 100000;
 }
 
-class _SwapTabState extends State<SwapTab> {
+class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   final _payAmount = TextEditingController();
   final _recvAmount = TextEditingController();
   final _feeRateCtl = TextEditingController();
@@ -99,11 +106,38 @@ class _SwapTabState extends State<SwapTab> {
   String? _error;
   String? _actionError;
 
+  // --- live market data (foreground poll; the web uses a WS, mobile polls) -----
+  // A 5s foreground poll refreshes the book + trades + stats. It pauses in the
+  // background (battery) via the app-lifecycle observer, and never surfaces a
+  // market-data fetch error; the sections just stay empty on a transient failure.
+  Timer? _poll;
+  bool _appActive = true; // false while backgrounded; gates the poll
+  bool _refreshing = false; // in-flight guard so polls never pile up
+  int _tradesReq = 0; // request-seq: drop a superseded trades fetch (pair changed)
+  int _statsReq = 0; // request-seq for the stats fetch
+
+  // Recent trades for the active pair, plus which asset `size` is denominated in.
+  // A pair has ONE canonical direction, so the feed is either canonical or its
+  // inverse; `_tradesInv` inverts the shown price, and the size asset follows the
+  // direction that actually returned data (canonical => base, inverse => quote).
+  List<SeqObTrade> _trades = const [];
+  bool _tradesInv = false;
+  String? _tradesSizeAsset;
+
+  // Derived 24h stats + sparkline points for the active pair (null => render none).
+  _PairStats? _stats;
+
+  // A small local activity log (same-chain covenant fills + posts logged below).
+  List<TradeReceipt> _receipts = const [];
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _payAmount.addListener(_onPayChanged);
     _recvAmount.addListener(_onRecvChanged);
+    _startPoll();
+    _loadReceipts();
     if (_SwapCache.markets != null) {
       _markets = _SwapCache.markets!;
       _balances = _SwapCache.balances ?? [];
@@ -151,12 +185,181 @@ class _SwapTabState extends State<SwapTab> {
 
   @override
   void dispose() {
+    _poll?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     _payAmount.removeListener(_onPayChanged);
     _recvAmount.removeListener(_onRecvChanged);
     _payAmount.dispose();
     _recvAmount.dispose();
     _feeRateCtl.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Pause the poll in the background; on resume, refresh once immediately.
+    final active = state == AppLifecycleState.resumed;
+    _appActive = active;
+    if (active) _pollTick();
+  }
+
+  // --- live market data ------------------------------------------------------
+
+  void _startPoll() {
+    _poll?.cancel();
+    _poll = Timer.periodic(const Duration(seconds: 5), (_) => _pollTick());
+  }
+
+  /// One poll iteration: re-fetch the book (quietly, no loading flash) + trades +
+  /// stats, but only when foregrounded, a pair is chosen, and nothing heavier is
+  /// already in flight. All fetches are best-effort and never surface an error.
+  Future<void> _pollTick() async {
+    if (!mounted || !_appActive || _refreshing) return;
+    if (_loading || _bookLoading) return; // a full load / pair-change fetch owns it
+    final pay = _payAsset, recv = _receiveAsset;
+    if (pay == null || recv == null || pay == recv) return;
+    _refreshing = true;
+    try {
+      await _refreshBookQuiet(pay, recv);
+      await _refreshTrades(pay, recv);
+      await _refreshStats(pay, recv);
+    } finally {
+      _refreshing = false;
+    }
+  }
+
+  /// Re-fetch the book WITHOUT the loading flash (for the poll). Preserves the
+  /// user's selected offer if it still rests (matched by id), else falls back to
+  /// the best offer, mirroring [_fetchBook]'s selection/mode rules.
+  Future<void> _refreshBookQuiet(String pay, String recv) async {
+    try {
+      final book = await SeqObClient.fetchBook(recv, pay, confidential: _confBook);
+      if (!mounted || _payAsset != pay || _receiveAsset != recv) return;
+      setState(() {
+        _orderBook = book;
+        if (_confBook) {
+          _selected = null;
+          _mode = 'post';
+        } else {
+          final prevId = _selected?.offerId;
+          SeqObOffer? keep;
+          if (prevId != null && prevId.isNotEmpty) {
+            for (final o in book.offers) {
+              if (o.offerId == prevId) {
+                keep = o;
+                break;
+              }
+            }
+          }
+          _selected = keep ?? book.best;
+          if (!_modeTouched) _mode = book.isEmpty ? 'post' : 'take';
+        }
+      });
+      _relink();
+    } catch (_) {
+      // Best-effort live refresh; keep the last good book on a transient failure.
+    }
+  }
+
+  /// Recent trades for the active pair. Queries the canonical direction, falls back
+  /// to the inverse (inverting the shown price), and stores which asset `size` is
+  /// in. A request-seq guards against a superseded pair. Never throws.
+  Future<void> _refreshTrades(String pay, String recv) async {
+    final req = ++_tradesReq;
+    final dir = _pairDir(pay, recv);
+    var inv = false;
+    var sizeAsset = dir.base;
+    var trades = await SeqObClient.fetchTrades(dir.base, dir.quote);
+    if (trades.isEmpty) {
+      final alt = await SeqObClient.fetchTrades(dir.quote, dir.base);
+      if (alt.isNotEmpty) {
+        trades = alt;
+        inv = true;
+        sizeAsset = dir.quote;
+      }
+    }
+    if (!mounted || req != _tradesReq) return; // superseded by a newer pair
+    setState(() {
+      _trades = trades;
+      _tradesInv = inv;
+      _tradesSizeAsset = sizeAsset;
+    });
+  }
+
+  /// 24h stats + sparkline points for the active pair, from the /candles feed.
+  /// Same canonical-direction handling as [_refreshTrades]; inverting an inverse
+  /// feed swaps each candle's high and low. Never throws.
+  Future<void> _refreshStats(String pay, String recv) async {
+    final req = ++_statsReq;
+    final dir = _pairDir(pay, recv);
+    var inv = false;
+    var sizeAsset = dir.base;
+    var candles = await SeqObClient.fetchCandles(dir.base, dir.quote);
+    if (candles.isEmpty) {
+      final alt = await SeqObClient.fetchCandles(dir.quote, dir.base);
+      if (alt.isNotEmpty) {
+        candles = alt;
+        inv = true;
+        sizeAsset = dir.quote;
+      }
+    }
+    if (!mounted || req != _statsReq) return;
+    if (candles.isEmpty) {
+      setState(() => _stats = null);
+      return;
+    }
+    // Normalise every candle to the canonical quote-per-base frame.
+    double iv(double x) => x > 0 ? 1 / x : 0;
+    final norm = candles
+        .map((c) => inv
+            ? (t: c.t, o: iv(c.o), c: iv(c.c), h: iv(c.l), l: iv(c.h), v: c.v)
+            : (t: c.t, o: c.o, c: c.c, h: c.h, l: c.l, v: c.v))
+        .toList();
+    final cutoff = DateTime.now().millisecondsSinceEpoch ~/ 1000 - 86400;
+    var win = norm.where((c) => c.t >= cutoff).toList();
+    if (win.isEmpty) win = [norm.last]; // nothing in 24h => show the latest as a flat point
+    var hi = double.negativeInfinity, lo = double.infinity;
+    var vol = BigInt.zero;
+    for (final c in win) {
+      if (c.h > hi) hi = c.h;
+      if (c.l < lo) lo = c.l;
+      vol += c.v;
+    }
+    final first = win.first, last = win.last;
+    final changePct = first.o > 0 ? (last.c - first.o) / first.o * 100 : 0.0;
+    final pts = <double>[for (final c in win) if (c.c.isFinite) c.c];
+    setState(() => _stats = (pts: pts, changePct: changePct, hi: hi, lo: lo, vol: vol, sizeAsset: sizeAsset));
+  }
+
+  Future<void> _loadReceipts() async {
+    try {
+      final r = await TradeReceipts.list();
+      if (mounted) setState(() => _receipts = r);
+    } catch (_) {
+      // the activity log is best-effort; never blocks the composer
+    }
+  }
+
+  /// Compact "N s/m/h/d ago" for trade + receipt timestamps (unix seconds).
+  String _ago(int ts) {
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final s = now - ts;
+    final v = s < 0 ? 0 : s;
+    if (v < 60) return '${v}s';
+    if (v < 3600) return '${v ~/ 60}m';
+    if (v < 86400) return '${v ~/ 3600}h';
+    return '${v ~/ 86400}d';
+  }
+
+  /// Flip the price DISPLAY direction, and re-fetch trades + stats so they read the
+  /// same way as the (instantly-reframed) book rather than lagging until the poll.
+  void _toggleFlip() {
+    setState(() => _priceFlip = !_priceFlip);
+    final pay = _payAsset, recv = _receiveAsset;
+    if (pay != null && recv != null && pay != recv) {
+      unawaited(_refreshTrades(pay, recv));
+      unawaited(_refreshStats(pay, recv));
+    }
   }
 
   void _cache() {
@@ -302,6 +505,8 @@ class _SwapTabState extends State<SwapTab> {
       setState(() {
         _orderBook = null;
         _selected = null;
+        _trades = const [];
+        _stats = null;
       });
       return;
     }
@@ -332,6 +537,9 @@ class _SwapTabState extends State<SwapTab> {
         _mode = 'post';
       });
     }
+    // Live-data companions for this pair (best-effort; independent of the book).
+    unawaited(_refreshTrades(pay, recv));
+    unawaited(_refreshStats(pay, recv));
   }
 
   // --- amount linking (TAKE only) --------------------------------------------
@@ -575,6 +783,7 @@ class _SwapTabState extends State<SwapTab> {
       ),
     ));
     _load();
+    _loadReceipts();
   }
 
   /// The covenant-enforced pay for taking `take` base atoms from offer `o`:
@@ -752,7 +961,9 @@ class _SwapTabState extends State<SwapTab> {
               hint: _mode == 'post' ? 'how much you want' : '0.0',
             ),
             const SizedBox(height: 18),
+            _pairStatsStrip(),
             _bookPanel(book),
+            _recentTradesPanel(),
             const SizedBox(height: 18),
             const SectionLabel('Network fee'),
             const SizedBox(height: 8),
@@ -773,6 +984,7 @@ class _SwapTabState extends State<SwapTab> {
               Text(_actionError!, style: const TextStyle(color: AmbraColors.red)),
             ],
           ],
+          _recentActivity(),
         ]),
       ),
       if (canAct)
@@ -941,7 +1153,7 @@ class _SwapTabState extends State<SwapTab> {
               message: 'Flip price direction',
               child: InkWell(
                 borderRadius: BorderRadius.circular(6),
-                onTap: () => setState(() => _priceFlip = !_priceFlip),
+                onTap: _toggleFlip,
                 child: const Padding(
                   padding: EdgeInsets.all(4),
                   child: Icon(Icons.swap_vert, size: 16, color: AmbraColors.dim),
@@ -997,6 +1209,155 @@ class _SwapTabState extends State<SwapTab> {
       ),
     );
   }
+
+  // --- live-data sections (24h stats, recent trades, recent activity) ---------
+
+  /// One-line 24h strip near the book header: sparkline, 24h change, high, low,
+  /// volume. Renders nothing until candle data exists (honest on an empty market).
+  Widget _pairStatsStrip() {
+    final s = _stats;
+    if (s == null) return const SizedBox.shrink();
+    final up = s.changePct >= 0;
+    final col = up ? const Color(0xFF3DDC84) : AmbraColors.amber2;
+    final chg = '${up ? '+' : ''}${s.changePct.toStringAsFixed(2)}%';
+    final vl = SeqAssets.labelFor(s.sizeAsset);
+    Widget chip(String label, String value) => Text.rich(TextSpan(style: AmbraText.sub, children: [
+          TextSpan(text: '$label '),
+          TextSpan(text: value, style: AmbraText.mono),
+        ]));
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Wrap(
+        spacing: 12,
+        runSpacing: 4,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          if (s.pts.length >= 2)
+            SizedBox(width: 84, height: 20, child: CustomPaint(painter: _SparklinePainter(s.pts, col))),
+          Text.rich(TextSpan(style: AmbraText.sub, children: [
+            const TextSpan(text: '24h '),
+            TextSpan(text: chg, style: TextStyle(color: col, fontWeight: FontWeight.w700, fontSize: 13)),
+          ])),
+          if (s.hi.isFinite) chip('H', _fmtPrice(s.hi)),
+          if (s.lo.isFinite) chip('L', _fmtPrice(s.lo)),
+          chip('vol', '${formatAtoms(s.vol.toString(), vl.precision)} ${vl.ticker}'),
+        ],
+      ),
+    );
+  }
+
+  /// Compact recent-trades feed under the book panel. Renders nothing when the
+  /// active pair has no trades. Price is the canonical quote-per-base (inverted
+  /// when the feed came back on the inverse direction); size is the size asset.
+  Widget _recentTradesPanel() {
+    final trades = _trades;
+    if (trades.isEmpty || _payAsset == null || _receiveAsset == null) return const SizedBox.shrink();
+    final dir = _pairDir(_payAsset!, _receiveAsset!);
+    final bl = SeqAssets.labelFor(dir.base), ql = SeqAssets.labelFor(dir.quote);
+    final sl = SeqAssets.labelFor(_tradesSizeAsset ?? dir.base);
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: AmbraCard(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Row(children: [
+            Text('Recent trades', style: AmbraText.body.copyWith(fontWeight: FontWeight.w600)),
+            const Spacer(),
+            Text('price ${bl.ticker}/${ql.ticker}', style: AmbraText.sub),
+          ]),
+          const SizedBox(height: 4),
+          for (final t in trades.take(12)) _tradeRow(t, sl.ticker, sl.precision),
+        ]),
+      ),
+    );
+  }
+
+  Widget _tradeRow(SeqObTrade t, String sizeTicker, int sizePrec) {
+    final p = _tradesInv ? (t.price > 0 ? 1 / t.price : 0) : t.price;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(children: [
+        Expanded(child: Text(_fmtPrice(p), style: AmbraText.mono)),
+        Text('${formatAtoms(t.size.toString(), sizePrec)} $sizeTicker',
+            style: AmbraText.mono.copyWith(color: AmbraColors.dim)),
+        const SizedBox(width: 10),
+        SizedBox(width: 34, child: Text(_ago(t.ts), textAlign: TextAlign.right, style: AmbraText.sub)),
+      ]),
+    );
+  }
+
+  /// A minimal local activity log (newest ~5): same-chain covenant fills + posts
+  /// logged from the review sheets. Cross-chain / Lightning receipts live elsewhere.
+  Widget _recentActivity() {
+    if (_loading || _receipts.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 22),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        const SectionLabel('Recent activity'),
+        const SizedBox(height: 8),
+        AmbraCard(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+          child: Column(children: [
+            for (final r in _receipts.take(5)) _receiptRow(r),
+          ]),
+        ),
+      ]),
+    );
+  }
+
+  Widget _receiptRow(TradeReceipt r) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(r.title, style: AmbraText.body),
+              const SizedBox(height: 2),
+              Text(r.status, style: AmbraText.sub),
+            ]),
+          ),
+          const SizedBox(width: 10),
+          Text(_ago(r.ts), style: AmbraText.sub),
+        ]),
+      );
+}
+
+/// A tiny polyline sparkline of the in-window closes, min/max-normalised to the
+/// paint box. Under 2 points it draws nothing (the strip hides it anyway).
+class _SparklinePainter extends CustomPainter {
+  _SparklinePainter(this.points, this.color);
+  final List<double> points;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (points.length < 2) return;
+    var min = points.first, max = points.first;
+    for (final p in points) {
+      if (p < min) min = p;
+      if (p > max) max = p;
+    }
+    final rng = (max - min) == 0 ? 1.0 : (max - min);
+    final path = Path();
+    for (var i = 0; i < points.length; i++) {
+      final x = i / (points.length - 1) * size.width;
+      final y = size.height - (points[i] - min) / rng * size.height;
+      if (i == 0) {
+        path.moveTo(x, y);
+      } else {
+        path.lineTo(x, y);
+      }
+    }
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.5
+      ..strokeJoin = StrokeJoin.round
+      ..strokeCap = StrokeCap.round;
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(_SparklinePainter old) => old.color != color || old.points != points;
 }
 
 /// Resolve the funded vout for a covenant scriptPubKey on the wallet's esplora.
@@ -1114,6 +1475,10 @@ class _TakeReviewSheetState extends State<_TakeReviewSheet> {
       );
       setState(() => _status = 'Broadcasting…');
       final txid = await core.xchainSeqBroadcast(seqEsplora: Backend.esplora, txHex: built.rawHex);
+      // Local activity receipt for the completed same-chain covenant fill.
+      final recvTk = SeqAssets.labelFor(widget.recvAsset).ticker;
+      final payTk = SeqAssets.labelFor(widget.payAsset).ticker;
+      await TradeReceipts.log(id: 'take:$txid', title: 'Bought $recvTk with $payTk', status: 'Filled', txid: txid);
       if (mounted) Navigator.pop(context, txid);
     } catch (e) {
       if (mounted) {
@@ -1274,6 +1639,16 @@ class _PostReviewSheetState extends State<_PostReviewSheet> {
       await PlacedOrders.put(placed);
       await SeqObClient.postOffer(offer);
       await PlacedOrders.put(placed.copyWith(posted: true));
+
+      // Local activity receipt: the offer is now accepted by the relay and resting.
+      final sellTk = SeqAssets.labelFor(widget.payAsset).ticker;
+      final wantTk = SeqAssets.labelFor(widget.recvAsset).ticker;
+      final offerId = '${offer['offer_id'] ?? ''}';
+      await TradeReceipts.log(
+        id: 'post:${offerId.isEmpty ? covTxid : offerId}',
+        title: 'Posted $sellTk→$wantTk order',
+        status: 'Resting',
+      );
 
       if (mounted) Navigator.pop(context, covTxid);
     } catch (e) {
