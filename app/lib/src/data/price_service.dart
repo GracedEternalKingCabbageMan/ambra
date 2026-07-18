@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'api_client.dart';
+import 'format.dart';
 
 /// Wallet-wide reference-currency valuation. Prices are USD-base from /prices;
 /// the user picks a reference (USD, BTC, or any priced ticker) and every amount
@@ -89,6 +90,14 @@ class PriceService extends ChangeNotifier {
             : abs >= 0.01
                 ? 4
                 : 6;
-    return v.toStringAsFixed(digits);
+    // Thousands-separate the whole part (e.g. 64,793.75) so large values read
+    // clearly; keep the fractional part as-is. Sign handled separately since the
+    // grouper takes unsigned digit strings.
+    final s = abs.toStringAsFixed(digits);
+    final dot = s.indexOf('.');
+    final grouped = dot < 0
+        ? groupThousands(s)
+        : '${groupThousands(s.substring(0, dot))}${s.substring(dot)}';
+    return v < 0 ? '-$grouped' : grouped;
   }
 }

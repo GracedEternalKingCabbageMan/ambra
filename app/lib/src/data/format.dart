@@ -5,11 +5,11 @@ String formatAtoms(String atoms, int precision) {
   final digits = neg ? atoms.substring(1) : atoms;
   final value = BigInt.tryParse(digits) ?? BigInt.zero;
   final sign = neg ? '-' : '';
-  if (precision <= 0) return '$sign${_group(value.toString())}';
+  if (precision <= 0) return '$sign${groupThousands(value.toString())}';
   final base = BigInt.from(10).pow(precision);
   final whole = value ~/ base;
   final frac = (value % base).toString().padLeft(precision, '0').replaceFirst(RegExp(r'0+$'), '');
-  final wholeStr = _group(whole.toString());
+  final wholeStr = groupThousands(whole.toString());
   return frac.isEmpty ? '$sign$wholeStr' : '$sign$wholeStr.$frac';
 }
 
@@ -43,7 +43,7 @@ String friendlyError(Object e, {bool pullToRefresh = true}) {
   return s.length > 160 ? '${s.substring(0, 160)}…' : s;
 }
 
-String _group(String intStr) {
+String groupThousands(String intStr) {
   final out = StringBuffer();
   for (var i = 0; i < intStr.length; i++) {
     if (i > 0 && (intStr.length - i) % 3 == 0) out.write(',');
