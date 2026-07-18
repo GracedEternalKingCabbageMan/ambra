@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../data/config.dart';
 import '../data/lightning_service.dart';
 import '../data/lsp_client.dart';
+import '../data/trade_receipts.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 
@@ -108,6 +109,16 @@ class _LightningSwapScreenState extends State<LightningSwapScreen> {
         _busy = false;
         _result = r;
       });
+      // Log the settled swap to the shared DEX activity log (only a real settlement
+      // carries a preimage). Keyed by preimage so it is recorded exactly once.
+      if (r.preimage.isNotEmpty) {
+        final tk = SeqAssets.labelFor(asset).ticker;
+        TradeReceipts.log(
+          id: 'ln:${r.preimage}',
+          title: r.direction == 'sold' ? 'Sold $tk for BTC (Lightning)' : 'Bought $tk with BTC (Lightning)',
+          status: 'Settled',
+        ).ignore();
+      }
     } catch (e) {
       if (mounted) {
         setState(() {
