@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../data/btc_state.dart';
 import '../data/config.dart';
 import '../data/format.dart';
 import '../data/xchain_client.dart';
@@ -10,6 +11,12 @@ import '../data/xchain_swap_service.dart';
 import '../rust/api.dart' as core;
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
+
+/// A small BTC miner-fee headroom (sats) reserved on top of the quoted lock amount in the
+/// cross-buy affordability pre-check: locking the BTC leg also pays an on-chain fee, so a
+/// near-max buy that ignored it would pass Review then fail at btcPrepare. The exact fee is
+/// computed when the funding tx is built.
+final BigInt _kBtcMinerHeadroomSats = BigInt.from(1000);
 
 /// Cross-chain swap wizard: buy a Sequentia asset by locking Bitcoin (testnet4).
 /// The reveal of the preimage is HARD-gated on the anchor check; an in-flight
@@ -48,7 +55,10 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
 
   Future<void> _load() async {
     try {
-      final rec = await XchainStore.load();
+      var rec = await XchainStore.load();
+      // FUND-SAFETY: reconcile a funding step whose confirmed lock was never recorded (e.g. the app
+      // died mid-broadcast). Safe + non-broadcasting; see XchainSwapService.resumeFunding.
+      if (rec != null) rec = await XchainSwapService.resumeFunding(rec);
       final markets = await XchainClient.markets();
       if (!mounted) return;
       setState(() {
@@ -122,13 +132,36 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
     if (atoms == null || atoms <= BigInt.zero) return _snack('Enter an amount of ${l.ticker} to buy');
     await _run('Quoting…', () async {
       final rec = await XchainSwapService.begin(m.seqAsset, atoms);
+      // Affordability pre-check: locking the BTC leg needs the quoted amount PLUS an on-chain miner
+      // fee, so require a little headroom. Block here (nothing has moved yet) instead of failing later
+      // at btcPrepare/fundBtc. Best-effort: skip when the BTC balance isn't known yet (fundBtc still
+      // fails-closed on a true shortfall). No money moved, so discard the stub before bailing.
+      final bal = BigInt.tryParse(BtcState.instance.last?.balanceSats ?? '');
+      if (bal != null && rec.btcAmount + _kBtcMinerHeadroomSats > bal) {
+        await XchainStore.clear();
+        throw Exception(
+            'You only hold ${_btc(bal)}. Locking ${_btc(rec.btcAmount)} plus an on-chain fee needs more; reduce the amount.');
+      }
       if (mounted) setState(() => _rec = rec);
     });
   }
 
   Future<void> _fundBtc() => _run('Locking BTC…', () async {
-        final rec = await XchainSwapService.fundBtc(_rec!);
-        if (mounted) setState(() => _rec = rec);
+        try {
+          final rec = await XchainSwapService.fundBtc(_rec!);
+          if (mounted) setState(() => _rec = rec);
+        } catch (_) {
+          // FUND-SAFETY: fundBtc persists the record (with the funding txid) at btcFunding BEFORE it
+          // broadcasts. If the broadcast throws, reload the PERSISTED record so the in-memory _rec
+          // reflects what actually happened — otherwise _rec stays stale at secretReady and the UI
+          // re-shows "Lock BTC", and a re-tap would re-fund (picking different UTXOs if the first tx
+          // is already in the mempool) and double-lock the BTC. On a pre-save throw (auth/prepare)
+          // the persisted step is unchanged, so the Lock button correctly remains. Rethrow so _run
+          // still surfaces the error; recovery from btcFunding is the poll/refund off-ramp.
+          final saved = await XchainStore.load();
+          if (saved != null && mounted) setState(() => _rec = saved);
+          rethrow;
+        }
       });
 
   Future<void> _checkBtcLock() async {
@@ -286,7 +319,7 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
             child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
               const SectionLabel('Lock your Bitcoin'),
               const SizedBox(height: 8),
-              Text('Funds ${_btc(r.btcAmount)} into the HTLC address:', style: AmbraText.sub),
+              Text('Funds ${_btc(r.btcAmount)} into the on-chain lock address:', style: AmbraText.sub),
               const SizedBox(height: 6),
               SelectableText(r.btcP2shAddress, style: AmbraText.mono.copyWith(fontSize: 13)),
             ]),

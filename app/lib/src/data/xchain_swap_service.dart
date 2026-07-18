@@ -236,11 +236,34 @@ class XchainSwapService {
       amountSats: r.btcAmount,
       feeRate: feeRate,
     );
-    final txid = await core.btcBroadcast(t4Api: Backend.testnet4, txHex: tx.hex);
+    // FUND-SAFETY: the prepared tx is fully signed, so its txid is final (the funding tx spends
+    // segwit inputs, so the txid is witness-independent and equals the broadcast txid). Persist the
+    // txid + advance the step BEFORE broadcasting: if the app dies after a node accepts the tx but
+    // before btcBroadcast returns, the txid is already saved so pollBtcLock / resumeFunding can
+    // recover the locked BTC. (Previously the txid was captured only from btcBroadcast's return and
+    // was lost in that window, stranding the lock.) A broadcast that then throws does NOT roll the
+    // step back — re-funding could overwrite this outpoint and strand the BTC if the tx had in fact
+    // propagated; the poll/refund off-ramp is the recovery path instead.
     r
-      ..btcFundingTxid = txid
+      ..btcFundingTxid = tx.txid
       ..step = XStep.btcFunding;
     await XchainStore.save(r);
+    await core.btcBroadcast(t4Api: Backend.testnet4, txHex: tx.hex);
+    return r;
+  }
+
+  /// Load-time recovery for the funding step. If a funding txid was persisted (now done BEFORE
+  /// broadcast, see [fundBtc]) but the confirmed lock was never recorded, reconcile it against the
+  /// chain and advance to [XStep.btcLocked] once the HTLC output is funded + confirmed. Never
+  /// broadcasts. NOTE: [core.xchainFindBtcFunding] fetches a tx BY txid, so it can only reconcile a
+  /// record that HAS a txid; there is no FFI to scan the P2SH scriptPubKey's UTXO set by address
+  /// alone, so a record with the spk but no txid cannot be recovered here. With [fundBtc] now
+  /// persisting the txid before broadcast, that no-txid window is closed, so this is safe + minimal.
+  static Future<XchainSwapRecord> resumeFunding(XchainSwapRecord r) async {
+    if (r.step != XStep.btcFunding || r.btcFundingTxid.isEmpty) return r;
+    try {
+      await pollBtcLock(r); // find-by-txid; mutates + persists r to btcLocked if confirmed
+    } catch (_) {/* tx not visible yet / offline: leave the periodic poll to retry */}
     return r;
   }
 
