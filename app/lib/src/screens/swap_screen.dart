@@ -585,10 +585,43 @@ class _SwapTabState extends State<SwapTab> {
     return v;
   }
 
+  // Amount for an INPUT field: 8dp, trailing zeros stripped, and NEVER sci-notation — double.toString()
+  // switches to "1e-7" below 1e-6, which would make the amount field unparseable.
   String _trim(num n) {
     if (!n.isFinite) return '';
     final r = (n * 1e8).round() / 1e8;
-    return r.toString();
+    if (r == 0) return '0';
+    var s = r.toStringAsFixed(8);
+    if (s.contains('.')) s = s.replaceAll(RegExp(r'0+$'), '').replaceAll(RegExp(r'\.$'), '');
+    return s;
+  }
+
+  // A DISPLAY price: magnitude-appropriate precision + thousands separators, never sci-notation, and
+  // never a nonzero price rendered as "0" (a cheap asset priced in BTC). Use for prices/mids/spreads;
+  // use formatAtoms/_trim for raw amounts written into fields.
+  String _fmtPrice(num n) {
+    if (!n.isFinite) return '—';
+    if (n == 0) return '0';
+    final a = n.abs();
+    if (a < 1e-8) return '${n < 0 ? '-' : ''}<0.00000001';
+    final dp = a >= 1000 ? 2 : (a >= 1 ? 4 : (a >= 0.01 ? 6 : 8));
+    var s = n.toStringAsFixed(dp);
+    if (s.contains('.')) s = s.replaceAll(RegExp(r'0+$'), '').replaceAll(RegExp(r'\.$'), '');
+    return _group(s);
+  }
+
+  // Thousands-group the integer part of an already-formatted decimal string.
+  String _group(String s) {
+    var neg = false;
+    if (s.startsWith('-')) {
+      neg = true;
+      s = s.substring(1);
+    }
+    final dot = s.indexOf('.');
+    final intPart = dot < 0 ? s : s.substring(0, dot);
+    final frac = dot < 0 ? '' : s.substring(dot);
+    final grouped = intPart.replaceAllMapped(RegExp(r'\B(?=(\d{3})+(?!\d))'), (_) => ',');
+    return (neg ? '-' : '') + grouped + frac;
   }
 
   String _tk(String? hex) => hex == null ? '—' : SeqAssets.labelFor(hex).ticker;
@@ -894,7 +927,7 @@ class _SwapTabState extends State<SwapTab> {
               size: 16, color: on ? AmbraColors.amber : AmbraColors.dim),
           const SizedBox(width: 10),
           Expanded(
-            child: Text('${_trim(price)} ${_tk(_payAsset)}/${_tk(_receiveAsset)}',
+            child: Text('${_fmtPrice(price)} ${_tk(_payAsset)}/${_tk(_receiveAsset)}',
                 style: AmbraText.mono.copyWith(color: on ? AmbraColors.amber : AmbraColors.txt)),
           ),
           Text(formatAtoms(o.baseAtoms.toString(), recvPrec), style: AmbraText.mono),
