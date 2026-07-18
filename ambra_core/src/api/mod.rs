@@ -499,7 +499,9 @@ pub fn covenant_finalize_offer(
         "created_at_unix": now.to_string(),
         "expires_at_unix": (now + ttl).to_string(),
         "fee_asset_hint": buy_asset,
-        "same_chain": { "maker_recv_address": s("maker_recv_address") },
+        // ONLY `covenant` in the settlement oneof. Emitting `same_chain` here too made every covenant
+        // POST fail to decode at the relay ("oneof seqob.v1.Offer.settlement is already set"); the
+        // covenant self-describes its payout via maker_prog, so a separate maker_recv_address is redundant.
         "covenant": covenant,
     });
 
