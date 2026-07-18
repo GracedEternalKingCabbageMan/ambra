@@ -1,5 +1,5 @@
 /// App version shown in the More footer. Bump alongside pubspec on release.
-const kAppVersion = '0.10.3';
+const kAppVersion = '0.13.0';
 
 /// Backend node the wallet talks to. Defaults to the public Sequentia testnet
 /// node; users can point Ambra at their own (persisted via [NodeConfig]). Every
@@ -7,8 +7,9 @@ const kAppVersion = '0.10.3';
 class Backend {
   Backend._();
 
-  /// The public Sequentia testnet node (the default backend).
-  static const defaultOrigin = 'http://159.195.15.140';
+  /// The public Sequentia testnet node (the default backend). The domain over TLS,
+  /// not a bare IP: it survives an IP change and every derived endpoint is https.
+  static const defaultOrigin = 'https://sequentiatestnet.com';
 
   static String _origin = defaultOrigin;
   static String get origin => _origin;

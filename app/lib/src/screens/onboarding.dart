@@ -6,6 +6,7 @@ import '../rust/api.dart' as core;
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
+import 'recover_screen.dart';
 
 const _wordmark = TextStyle(fontSize: 34, fontWeight: FontWeight.w800, letterSpacing: -0.7, color: AmbraColors.txt);
 
@@ -64,8 +65,11 @@ class WelcomeScreen extends StatelessWidget {
                 const SizedBox(height: 12),
                 SecondaryButton(
                   label: 'Import a recovery phrase',
+                  // The primary import path is the keylogger-safe on-screen
+                  // keyboard; the free-text paste import remains reachable from
+                  // there as a fallback ("Paste phrase" in the app bar).
                   onPressed: () =>
-                      Navigator.of(context).push(MaterialPageRoute(builder: (_) => const ImportScreen())),
+                      Navigator.of(context).push(MaterialPageRoute(builder: (_) => const RecoverScreen())),
                 ),
               ]),
             ],
@@ -283,7 +287,10 @@ class _ImportScreenState extends State<ImportScreen> {
   }
 
   Future<void> _import() async {
-    final phrase = _ctrl.text.trim().replaceAll(RegExp(r'\s+'), ' ');
+    // BIP39 words are always lowercase; normalize in the background so a phrase
+    // typed with auto-capitalization or stray case still restores (case must never
+    // matter to recovery), and collapse any runs of whitespace to single spaces.
+    final phrase = _ctrl.text.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
     setState(() {
       _busy = true;
       _error = null;
