@@ -471,47 +471,45 @@ class _SuggestionChip extends StatelessWidget {
   }
 }
 
-/// The alphabetical on-screen keyboard: a-z (in order) plus backspace. Plain
-/// buttons only, never a [TextField], so no system IME is ever invoked.
+/// The QWERTY on-screen keyboard (the standard phone layout: qwertyuiop /
+/// asdfghjkl / zxcvbnm) plus backspace. Plain buttons only, never a [TextField],
+/// so no system IME is ever invoked.
 class _Keyboard extends StatelessWidget {
   const _Keyboard({required this.onLetter, required this.onBackspace});
   final ValueChanged<String> onLetter;
   final VoidCallback onBackspace;
 
-  static const _rows = <String>['abcdefg', 'hijklmn', 'opqrstu', 'vwxyz'];
+  static const _rows = <String>['qwertyuiop', 'asdfghjkl', 'zxcvbnm'];
 
   @override
   Widget build(BuildContext context) {
+    // Every letter key is flex 2; the row-2 side spacers (flex 1 = half a key)
+    // and the row-3 wide backspace (flex 6 = three keys) keep every letter a
+    // consistent 1/10 width across the rows, matching a phone QWERTY.
+    Widget cap(Widget child, {int flex = 2}) => Expanded(
+          flex: flex,
+          child: Padding(padding: const EdgeInsets.all(3), child: child),
+        );
+    Widget letter(String ch) => cap(_KeyCap(label: ch, onTap: () => onLetter(ch)));
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        for (final row in _rows)
-          Row(
-            children: [
-              for (final ch in row.split(''))
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.all(3),
-                    child: _KeyCap(label: ch, onTap: () => onLetter(ch)),
-                  ),
-                ),
-              // Backspace shares the last row, kept in the far bottom-right
-              // corner (the conventional spot); the gap pads the row to a full
-              // 7 columns so every key keeps a consistent width.
-              if (row == _rows.last) ...[
-                const Spacer(),
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.all(3),
-                    child: _KeyCap(
-                      onTap: onBackspace,
-                      child: const Icon(Icons.backspace_outlined, size: 20, color: AmbraColors.txt),
-                    ),
-                  ),
-                ),
-              ],
-            ],
+        Row(children: [for (final ch in _rows[0].split('')) letter(ch)]),
+        Row(children: [
+          const Spacer(),
+          for (final ch in _rows[1].split('')) letter(ch),
+          const Spacer(),
+        ]),
+        Row(children: [
+          for (final ch in _rows[2].split('')) letter(ch),
+          cap(
+            _KeyCap(
+              onTap: onBackspace,
+              child: const Icon(Icons.backspace_outlined, size: 20, color: AmbraColors.txt),
+            ),
+            flex: 6,
           ),
+        ]),
       ],
     );
   }
