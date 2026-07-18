@@ -123,6 +123,60 @@ class LightningService extends ChangeNotifier {
   Future<LspSwapResult> swap({required String side, required String asset, required num amount}) =>
       LspClient.swap(side: side, asset: asset, amount: amount);
 
+  // -- sub-asset swap rail delegates (asset over Lightning <-> BTC on-chain HTLC) ---------------
+  // Thin pass-throughs to the [LspClient] sub-asset methods, plus [assetNodeKey] which brings the
+  // user's OWN hosted asset node online (provision + device signer) and returns its LSP node_key —
+  // the twin of the web wallet's `L.assetNodeKey`. The sub-asset SELL/BUY services drive the flow.
+
+  Future<SubassetBook> subassetBook(String asset) => LspClient.subassetBook(asset);
+
+  Future<HodlInvoiceStatus> invoiceStatus({required String nodeKey, required String paymentHash}) =>
+      LspClient.invoiceStatus(nodeKey: nodeKey, paymentHash: paymentHash);
+
+  Future<SwapJob> jobStatus(String pollPathOrId) => LspClient.jobStatus(pollPathOrId);
+
+  Future<SubSwapResult> swapSub({
+    required String side,
+    required String asset,
+    required String nodeKey,
+    num? amount,
+    bool hodl = false,
+    String? paymentHash,
+    BigInt? assetAmount,
+    required String payRail,
+    required String recvRail,
+    Map<String, dynamic>? btcHtlc,
+    String? btcClaimPub,
+    String? offerId,
+    String? makerPubkey,
+  }) =>
+      LspClient.swapSub(
+        side: side,
+        asset: asset,
+        nodeKey: nodeKey,
+        amount: amount,
+        hodl: hodl,
+        paymentHash: paymentHash,
+        assetAmount: assetAmount,
+        payRail: payRail,
+        recvRail: recvRail,
+        btcHtlc: btcHtlc,
+        btcClaimPub: btcClaimPub,
+        offerId: offerId,
+        makerPubkey: makerPubkey,
+      );
+
+  /// Bring the user's OWN hosted [asset] node online (provision + device signer) and return its LSP
+  /// node_key — the node that pays / receives / settles the asset leg over Lightning. Mirrors the web
+  /// wallet's `assetNodeKey`. Falls back to the deterministic [ownNodeKey] if the connect returns no
+  /// key. Throws a clean message when Lightning is dormant (via [connectNode], fail-closed).
+  Future<String> assetNodeKey(String asset) async {
+    final m = await WalletRepository.instance.readMnemonic();
+    if (m == null) throw Exception('Your wallet is locked; unlock it and try again.');
+    final key = await connectNode(m, asset: asset);
+    return key.isNotEmpty ? key : ownNodeKey(m, asset: asset);
+  }
+
   // -- per-asset OWN-node signers: general Lightning pay / receive + Move-to-Lightning ----------
   // The shared [start]/[_signer] above serves the DEMO node. General pay/receive and the Balance
   // channel flows act on the user's OWN, per-asset (or per-BTC) hosted node, each with its own

@@ -246,6 +246,85 @@ class LspClient {
     required num amount,
   }) async =>
       _decode(await _postJson('/channel/inbound', {'node_key': nodeKey, 'asset': asset, 'amount': amount}));
+
+  // -- Sub-asset swap rail (asset over Lightning <-> BTC on-chain HTLC) ----------------
+  // The Dart twins of seqln.js's invoiceStatus / jobStatus / swap(sub-asset branch) / book,
+  // ADDED without touching the pure-LN [swap] above. They drive the 4th BTC<->asset leg-combo:
+  // the ASSET leg moves over Lightning, the BTC leg is an on-chain HTLC. Two flows share them —
+  // SELL (pay asset over LN, claim BTC on-chain) and BUY (fund BTC on-chain, receive asset over LN).
+
+  /// Poll a HODL invoice's state on the user's OWN node (mirrors seqln.js `seqlnInvoiceStatus`):
+  /// `{ held /* the maker's payment is accepted + held */, settled }`. The sub-asset BUY driver
+  /// waits for `held`, then device-settles with the preimage. May throw (offline / 404); the caller
+  /// treats a throw as "keep waiting" (mirrors the web's `.catch(() => null)`).
+  static Future<HodlInvoiceStatus> invoiceStatus({required String nodeKey, required String paymentHash}) async {
+    final r = await _get(
+        '/node/invoice-status?node=${Uri.encodeComponent(nodeKey)}&payment_hash=${Uri.encodeComponent(paymentHash)}');
+    return HodlInvoiceStatus.fromJson(_decode(r));
+  }
+
+  /// Advisory liveness of an async LSP swap job (mirrors seqln.js `seqlnJobStatus`). [pollPathOrId]
+  /// is the poll path the /swap 202 returned (`/swap/<id>`) or a bare id. TOLERANT: a non-2xx / 404
+  /// / parse failure returns a DEAD [SwapJob] (never throws), so the BUY driver can treat
+  /// failed / interrupted / gone uniformly as "re-issue the swap".
+  static Future<SwapJob> jobStatus(String pollPathOrId) async {
+    final path = pollPathOrId.startsWith('/') ? pollPathOrId : '/swap/$pollPathOrId';
+    try {
+      final r = await _get(path);
+      if (r.statusCode < 200 || r.statusCode >= 300) return SwapJob.dead();
+      final j = r.body.isNotEmpty ? jsonDecode(r.body) as Map<String, dynamic> : <String, dynamic>{};
+      return SwapJob.fromJson(j);
+    } catch (_) {
+      return SwapJob.dead();
+    }
+  }
+
+  /// Take a SUB-ASSET offer (asset over Lightning <-> BTC on-chain HTLC) — the Dart twin of the
+  /// sub-asset branch of seqln.js's `seqlnSwap`. Kept SEPARATE from the pure-LN [swap] so that
+  /// byte-identical call is never disturbed. Parses the response UNION:
+  ///   • SELL (payRail:ln, recvRail:chain) -> `{ settled, preimage, hash_h, btc_htlc }`
+  ///   • BUY  (payRail:chain, recvRail:ln, hodl:true) -> a 202 `{ job_id, poll, held:false }`
+  static Future<SubSwapResult> swapSub({
+    required String side,
+    required String asset,
+    required String nodeKey,
+    num? amount,
+    bool hodl = false,
+    String? paymentHash,
+    BigInt? assetAmount,
+    required String payRail,
+    required String recvRail,
+    Map<String, dynamic>? btcHtlc,
+    String? btcClaimPub,
+    String? offerId,
+    String? makerPubkey,
+  }) async {
+    final body = <String, dynamic>{
+      'side': side,
+      'asset': asset,
+      'node_key': nodeKey,
+      'payRail': payRail,
+      'recvRail': recvRail,
+    };
+    if (amount != null) body['amount'] = amount;
+    if (hodl) body['hodl'] = true;
+    if (paymentHash != null) body['payment_hash'] = paymentHash;
+    if (assetAmount != null) body['asset_amount'] = assetAmount.toInt();
+    if (btcHtlc != null) body['btc_htlc'] = btcHtlc;
+    if (btcClaimPub != null) body['btc_claim_pub'] = btcClaimPub;
+    if (offerId != null) body['offer_id'] = offerId;
+    if (makerPubkey != null) body['maker_pubkey'] = makerPubkey;
+    final r = await _postJson('/swap', body, timeout: const Duration(seconds: 90));
+    return SubSwapResult.fromJson(_decode(r));
+  }
+
+  /// The sub-asset order book for [asset] (mirrors seqln.js `seqlnBook`): rail availability + the
+  /// resting offers on each side. Gates the sub-asset rail buttons and sources the best offer.
+  /// `{ sell_available, buy_available, sell_offers[], buy_offers[] }`.
+  static Future<SubassetBook> subassetBook(String asset) async {
+    final r = await _get('/book?asset=${Uri.encodeComponent(asset)}');
+    return SubassetBook.fromJson(_decode(r));
+  }
 }
 
 /// One hosted channel's per-asset balances, as reported by `GET /status`.
@@ -481,6 +560,199 @@ class CloseResult {
         type: j['type']?.toString(),
         scid: j['scid']?.toString(),
         destination: j['destination']?.toString(),
+        raw: j,
+      );
+}
+
+/// Parse a JSON scalar as an int (number or numeric string), else null. Shared by the sub-asset
+/// models below, whose height/vout/cltv fields arrive as numbers OR strings across the FFI/relay.
+int? _asInt(Object? v) => v is num ? v.toInt() : int.tryParse('${v ?? ''}');
+
+/// A HODL invoice's state on the user's own node (`GET /node/invoice-status`): whether the maker's
+/// pay-by-hash payment is HELD (ready for the device to settle with the preimage) and whether it has
+/// already been settled. Mirrors seqln.js's `seqlnInvoiceStatus` shape.
+class HodlInvoiceStatus {
+  HodlInvoiceStatus({required this.held, required this.settled, required this.raw});
+  final bool held;
+  final bool settled;
+  final Map<String, dynamic> raw;
+  static HodlInvoiceStatus fromJson(Map<String, dynamic> j) =>
+      HodlInvoiceStatus(held: j['held'] == true, settled: j['settled'] == true, raw: j);
+}
+
+/// Advisory status of an async LSP swap job (`GET /swap/<id>`). [alive] is false once the maker's
+/// pay-by-hash is no longer being driven (failed / interrupted / gone) — the signal the BUY driver
+/// uses to drop a stale job id and re-issue the swap. A [dead] instance encodes a 404 / non-2xx.
+class SwapJob {
+  SwapJob({required this.ok, required this.status, required this.interrupted, required this.held, required this.raw});
+  final bool ok;
+  final String status;
+  final bool interrupted;
+  final bool held;
+  final Map<String, dynamic> raw;
+
+  SwapJob.dead()
+      : ok = false,
+        status = '',
+        interrupted = true,
+        held = false,
+        raw = const {};
+
+  /// The maker's pay-by-hash is still being driven (so no re-issue is needed).
+  bool get alive => ok && status != 'failed' && status != 'interrupted' && !interrupted;
+
+  static SwapJob fromJson(Map<String, dynamic> j) => SwapJob(
+        ok: j['ok'] != false,
+        status: '${j['status'] ?? ''}',
+        interrupted: j['interrupted'] == true,
+        held: j['held'] == true,
+        raw: j,
+      );
+}
+
+/// The BTC HTLC terms the LSP returns on a sub-asset SELL settle (`btc_htlc`): the on-chain output
+/// the taker CLAIMS with the maker-revealed preimage. The taker rebuilds this from H + its own claim
+/// key + the maker refund key and byte-compares before trusting it (never on the LSP's word).
+class SubBtcHtlc {
+  SubBtcHtlc({
+    required this.txid,
+    required this.vout,
+    required this.amount,
+    required this.redeemScript,
+    required this.takerClaimPubkey,
+    required this.makerRefundPubkey,
+    required this.tBtc,
+    required this.raw,
+  });
+  final String txid;
+  final int vout;
+  final BigInt amount;
+  final String redeemScript;
+  final String takerClaimPubkey;
+  final String makerRefundPubkey;
+  final int tBtc;
+  final Map<String, dynamic> raw;
+
+  Map<String, dynamic> toJson() => raw;
+
+  static SubBtcHtlc fromJson(Map m) => SubBtcHtlc(
+        txid: '${m['txid'] ?? ''}',
+        vout: _asInt(m['vout']) ?? -1,
+        amount: BigInt.tryParse('${m['amount'] ?? 0}') ?? BigInt.zero,
+        redeemScript: '${m['redeem_script'] ?? m['redeemScript'] ?? ''}',
+        takerClaimPubkey: '${m['taker_claim_pubkey'] ?? m['takerClaimPubkey'] ?? ''}',
+        makerRefundPubkey: '${m['maker_refund_pubkey'] ?? m['makerRefundPubkey'] ?? ''}',
+        tBtc: _asInt(m['t_btc'] ?? m['tBtc']) ?? 0,
+        raw: Map<String, dynamic>.from(m),
+      );
+}
+
+/// The 202 job handle returned when a sub-asset BUY is issued (`{ job_id, poll, held }`). The device
+/// drives its OWN settle; [poll] is the advisory [jobStatus] path to reconcile a dropped job.
+class SubSwapJob {
+  SubSwapJob({required this.jobId, required this.poll, required this.held});
+  final String? jobId;
+  final String? poll;
+  final bool held;
+  static SubSwapJob fromJson(Map<String, dynamic> j) => SubSwapJob(
+        jobId: (j['job_id'] ?? j['jobId'])?.toString(),
+        poll: j['poll']?.toString(),
+        held: j['held'] == true,
+      );
+}
+
+/// The settle returned by a sub-asset SELL (`{ settled, preimage, hash_h, btc_htlc }`): the maker
+/// revealed the preimage over Lightning, so the taker now claims [btcHtlc] on-chain with it.
+class SubSwapSettle {
+  SubSwapSettle({required this.settled, required this.preimage, required this.hashHex, required this.btcHtlc});
+  final bool settled;
+  final String preimage;
+  final String hashHex;
+  final SubBtcHtlc? btcHtlc;
+  static SubSwapSettle fromJson(Map<String, dynamic> j) {
+    final h = j['btc_htlc'] ?? j['btcHtlc'];
+    return SubSwapSettle(
+      settled: j['settled'] == true,
+      preimage: '${j['preimage'] ?? ''}',
+      hashHex: '${j['hash_h'] ?? j['hashHex'] ?? ''}',
+      btcHtlc: h is Map ? SubBtcHtlc.fromJson(h) : null,
+    );
+  }
+}
+
+/// The parsed UNION of a sub-asset [swapSub] response: [job] for a BUY (202), [settle] for a SELL.
+/// Both are always constructed from the raw body (empty / default when that shape is absent); each
+/// caller reads the one for its side.
+class SubSwapResult {
+  SubSwapResult({required this.job, required this.settle, required this.raw});
+  final SubSwapJob job;
+  final SubSwapSettle settle;
+  final Map<String, dynamic> raw;
+  static SubSwapResult fromJson(Map<String, dynamic> j) =>
+      SubSwapResult(job: SubSwapJob.fromJson(j), settle: SubSwapSettle.fromJson(j), raw: j);
+}
+
+/// One resting sub-asset offer from the book. Only the fields the taker needs to build its leg are
+/// surfaced: the maker's on-chain CLAIM key + CLTV (the BUY builds a BTC HTLC the maker claims with
+/// the preimage), the offer size (`assetAmount` / `btcSats`, BigInt for exact partial-fill math),
+/// and the ids to attach to the swap.
+class SubOffer {
+  SubOffer({
+    required this.offerId,
+    required this.makerPubkey,
+    required this.makerClaimPub,
+    required this.assetAmount,
+    required this.btcSats,
+    required this.onchainCltv,
+    required this.raw,
+  });
+  final String offerId;
+  final String makerPubkey;
+  final String makerClaimPub;
+  final BigInt assetAmount;
+  final BigInt btcSats;
+  final int onchainCltv;
+  final Map<String, dynamic> raw;
+
+  static SubOffer fromJson(Map m) => SubOffer(
+        offerId: '${m['offer_id'] ?? m['offerId'] ?? ''}',
+        makerPubkey: '${m['maker_pubkey'] ?? m['makerPubkey'] ?? ''}',
+        makerClaimPub: '${m['maker_claim_pub'] ?? m['maker_claim_pubkey'] ?? m['makerClaimPub'] ?? ''}',
+        assetAmount: BigInt.tryParse('${m['asset_amount'] ?? m['assetAmount'] ?? 0}') ?? BigInt.zero,
+        btcSats: BigInt.tryParse('${m['btc_sats'] ?? m['btcSats'] ?? 0}') ?? BigInt.zero,
+        onchainCltv: _asInt(m['onchain_cltv'] ?? m['onchainCltv']) ?? 0,
+        raw: Map<String, dynamic>.from(m),
+      );
+}
+
+/// The sub-asset order book for one asset (`GET /book?asset=`): rail availability + the resting
+/// offers on each side. `buyAvailable` lights the sub-asset BUY rail (a resting asset-over-LN SELLER
+/// exists to take); `sellAvailable` lights the SELL rail (a resting BTC-on-chain BUYER exists).
+class SubassetBook {
+  SubassetBook({
+    required this.sellAvailable,
+    required this.buyAvailable,
+    required this.sellOffers,
+    required this.buyOffers,
+    required this.raw,
+  });
+  final bool sellAvailable;
+  final bool buyAvailable;
+  final List<SubOffer> sellOffers;
+  final List<SubOffer> buyOffers;
+  final Map<String, dynamic> raw;
+
+  static SubassetBook fromJson(Map<String, dynamic> j) => SubassetBook(
+        sellAvailable: j['sell_available'] == true || j['sellAvailable'] == true,
+        buyAvailable: j['buy_available'] == true || j['buyAvailable'] == true,
+        sellOffers: (((j['sell_offers'] ?? j['sellOffers']) as List?) ?? const [])
+            .whereType<Map>()
+            .map(SubOffer.fromJson)
+            .toList(),
+        buyOffers: (((j['buy_offers'] ?? j['buyOffers']) as List?) ?? const [])
+            .whereType<Map>()
+            .map(SubOffer.fromJson)
+            .toList(),
         raw: j,
       );
 }
