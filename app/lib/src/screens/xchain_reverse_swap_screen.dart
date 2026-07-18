@@ -395,7 +395,7 @@ class _XchainReverseSwapScreenState extends State<XchainReverseSwapScreen> {
           const SectionLabel('Safety check'),
           const SizedBox(height: 8),
           const Text(
-            'The maker locked the Bitcoin first, into an HTLC only your secret-claim key can '
+            'The maker locked the Bitcoin first, into an on-chain lock only your secret-claim key can '
             'take. We rebuilt and matched its script before continuing, and wait for it to '
             'confirm so your asset lock anchors at or above it. You commit nothing until then.',
             style: AmbraText.sub,

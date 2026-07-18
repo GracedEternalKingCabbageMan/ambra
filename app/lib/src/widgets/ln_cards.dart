@@ -341,8 +341,7 @@ class _LnPayCardState extends State<LnPayCard> {
       if (mounted) {
         setState(() {
           _bolt11.clear();
-          final pre = r.preimage;
-          _status = pre != null && pre.length >= 16 ? 'Paid · preimage ${pre.substring(0, 16)}…' : 'Paid';
+          _status = 'Paid';
         });
       }
     } catch (e) {
