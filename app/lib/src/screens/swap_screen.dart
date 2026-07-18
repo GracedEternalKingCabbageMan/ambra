@@ -241,7 +241,9 @@ class _SwapTabState extends State<SwapTab> {
   }
 
   BigInt _rateFor(String hex) {
-    if (hex == SeqAssets.policy) return _kScale;
+    // Read tSEQ's rate from the /feerates feed like every other asset — no SEQ=1 privilege (principle 3).
+    // The numeraire is a sovereign per-producer config; fall back to the reference scale ONLY when the
+    // feed doesn't price tSEQ (i.e. when tSEQ IS the reference), never as a hardcoded assumption.
     final t = SeqAssets.labelFor(hex).ticker;
     return _feeRates[t] ?? _feeRates[hex] ?? _kScale;
   }
