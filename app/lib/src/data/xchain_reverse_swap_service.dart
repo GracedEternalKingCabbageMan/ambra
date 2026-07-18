@@ -456,7 +456,8 @@ class XchainReverseSwapService {
   }
 
   static BigInt _rateFor(String assetHex, Map<String, BigInt> feeRates) {
-    if (assetHex == SeqAssets.policy) return _kScale;
+    // tSEQ is priced from the /feerates feed like any asset — no SEQ=1 privilege (principle 3). Fall back
+    // to the reference scale only when the feed omits tSEQ (tSEQ is then the reference itself).
     final ticker = SeqAssets.labelFor(assetHex).ticker;
     return feeRates[ticker] ?? feeRates[assetHex] ?? _kScale;
   }
