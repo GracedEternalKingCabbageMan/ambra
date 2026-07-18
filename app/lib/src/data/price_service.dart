@@ -39,21 +39,24 @@ class PriceService extends ChangeNotifier {
   }
 
   List<String> refOptions() {
-    final tickers = _prices.keys.where((t) => t != 'WBTC').toList()..sort();
+    // 'BTC' is offered explicitly below; drop the feed's own tBTC key so Bitcoin
+    // isn't listed twice.
+    final tickers = _prices.keys.where((t) => t != 'TBTC' && t != 'WBTC').toList()..sort();
     return ['USD', 'BTC', ...tickers];
   }
 
   double? _priceUsd(String ticker) {
     final t = ticker.toUpperCase();
     if (t == 'TSEQ' || t == 'SEQ') return _prices['SEQ'];
-    // Parent-chain Bitcoin is priced under WBTC (Wrapped Bitcoin) on /prices.
-    if (t == 'BTC' || t == 'WBTC') return _prices['BTC'];
+    // Parent-chain Bitcoin is priced under tBTC (testnet Bitcoin) on /prices
+    // (the key is uppercased to TBTC on load). Accept every Bitcoin alias.
+    if (t == 'BTC' || t == 'WBTC' || t == 'TBTC') return _prices['TBTC'];
     return _prices[t];
   }
 
   double? _refPriceUsd() {
     if (_ref == 'USD') return 1.0;
-    if (_ref == 'BTC') return _prices['BTC'];
+    if (_ref == 'BTC') return _prices['TBTC'];
     return _priceUsd(_ref);
   }
 
