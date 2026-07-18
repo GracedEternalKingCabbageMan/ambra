@@ -30,7 +30,7 @@ class _SendTabState extends State<SendTab> {
   List<core.AssetBalance> _balances = [];
   core.BtcBalance? _btc; // parent-chain (testnet4) balance, sendable like any asset
   Map<String, BigInt> _feeRates = {};
-  String _assetId = SeqAssets.policy;
+  String _assetId = _btcId; // BTC is the first-class default pick (principle 2), not tSEQ
   String? _feeAsset; // null = pay the fee in tSEQ (the builder's default)
   bool _feeManual = false; // true once the user explicitly picks a fee asset
   bool _loading = true;
@@ -58,7 +58,7 @@ class _SendTabState extends State<SendTab> {
       _balances = [...b, ...OpenAmpService.instance.balances];
       final sendable = _sendableIds();
       if (!sendable.contains(_assetId)) {
-        _assetId = sendable.isNotEmpty ? sendable.first : SeqAssets.policy;
+        _assetId = sendable.isNotEmpty ? sendable.first : _btcId; // BTC-first (principle 2), never tSEQ by default
       }
       if (!_feeManual) _feeAsset = _defaultFeeFor(_assetId);
       _loading = false;
@@ -129,7 +129,7 @@ class _SendTabState extends State<SendTab> {
         // still funded). Never default to tSEQ when its balance is 0.
         final held = _sendableIds();
         if (!held.contains(_assetId)) {
-          _assetId = held.isNotEmpty ? held.first : SeqAssets.policy;
+          _assetId = held.isNotEmpty ? held.first : _btcId; // BTC-first (principle 2), never tSEQ by default
         }
         // Default the fee to the asset being sent (asset-agnostic). Keep the
         // user's manual fee choice while they still hold it; otherwise re-apply
