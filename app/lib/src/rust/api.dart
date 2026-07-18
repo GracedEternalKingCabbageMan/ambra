@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `btc_params`, `clear_scan_marks`, `ct_str`, `ct_u64`, `derive_maker_payout`, `enclave_prevout_to_txout`, `enclave_prevouts_to_txouts`, `enclave_sighash_inner`, `err`, `esplora_client`, `fetch_utxo`, `hexbytes`, `last_scan`, `maker_identity_priv`, `mark_scanned`, `openamp_keypair`, `order_from_terms`, `parse_openamp_tx`, `rerr`, `scan_into`, `scanned_recently`, `select_taker_inputs`, `seq_addr_params`, `tohex`, `with_synced_wollet`, `wollet_cache`
+// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `btc_params`, `clear_scan_marks`, `ct_str`, `ct_u64`, `derive_maker_payout`, `derive_maker_secret`, `enclave_prevout_to_txout`, `enclave_prevouts_to_txouts`, `enclave_sighash_inner`, `err`, `esplora_client`, `fetch_utxo`, `hexbytes`, `last_scan`, `maker_identity_priv`, `mark_scanned`, `openamp_keypair`, `order_from_terms`, `parse_openamp_tx`, `rerr`, `scan_into`, `scanned_recently`, `select_taker_inputs`, `seq_addr_params`, `tohex`, `with_synced_wollet`, `wollet_cache`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
 String networkName() => RustLib.instance.api.crateApiNetworkName();
@@ -238,6 +238,41 @@ Future<BuiltRawTx> covenantBuildFillTx({
   esploraUrl: esploraUrl,
   covenantTermsJson: covenantTermsJson,
   takeAtoms: takeAtoms,
+  feeAsset: feeAsset,
+  feeAtoms: feeAtoms,
+);
+
+/// Assemble + sign the covenant REFUND (cancel/reclaim) transaction: spend a resting
+/// covenant order back to the maker via the CLTV REFUND leaf, once it has matured
+/// (chain tip >= expiry_locktime). `prepared_json` is the recipe the wallet stored
+/// when it posted the order (`PlacedCovenant.preparedJson`), carrying the params the
+/// taptree derives from. The funded covenant UTXO is fetched on-chain for its REAL
+/// locked value + scriptPubKey (so a partially-filled remainder reclaims its ACTUAL
+/// value, and an already-spent covenant errors cleanly), the taptree is re-derived
+/// (REFUND leaf + control block) and checked against that spk, and the maker key at
+/// `maker_index` signs the tapscript-path Schnorr signature. The fee is paid in
+/// `fee_asset`: if it equals the covenant asset it is taken from the reclaimed value
+/// (no wallet inputs); otherwise it is funded from the wallet's own coins with change
+/// returned. The reclaimed asset A is sent to the wallet's own address. Returns the
+/// raw Elements tx to broadcast via [`xchain_seq_broadcast`]. NOTE: the tx sets
+/// nLockTime = expiry, so a node accepts it only once the tip reaches that height —
+/// call after the order has matured.
+Future<BuiltRawTx> covenantBuildRefundTx({
+  required String mnemonic,
+  required String esploraUrl,
+  required String preparedJson,
+  required String covenantTxid,
+  required int covenantVout,
+  required int makerIndex,
+  required String feeAsset,
+  required BigInt feeAtoms,
+}) => RustLib.instance.api.crateApiCovenantBuildRefundTx(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  preparedJson: preparedJson,
+  covenantTxid: covenantTxid,
+  covenantVout: covenantVout,
+  makerIndex: makerIndex,
   feeAsset: feeAsset,
   feeAtoms: feeAtoms,
 );

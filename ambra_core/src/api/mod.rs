@@ -23,8 +23,9 @@ use lwk_wollet::elements::{Address, AssetId, Txid};
 use lwk_wollet::secp256k1::PublicKey;
 use lwk_wollet::TxBuilder;
 use lwk_wollet::{
-    build_covenant_fill_tx, covenant_secret_from_hex, maker_payout_program, Chain, CovenantFillPlan,
-    CovenantInput, FillCredit, FillRemainder, TakerFundingInput,
+    build_covenant_fill_tx, build_covenant_refund_tx, covenant_secret_from_hex, maker_payout_program,
+    Chain, CovenantFillPlan, CovenantInput, CovenantRefundInput, CovenantRefundPlan, FillCredit,
+    FillRemainder, TakerFundingInput,
 };
 
 use crate::seqob_covenant_derive as covd;
@@ -654,6 +655,128 @@ pub fn covenant_build_fill_tx(
     })
 }
 
+/// Derive the maker payout SECRET key for a maker index — the key the covenant
+/// REFUND leaf commits to via `maker_x`. Same BIP86 path as [`derive_maker_payout`]'s
+/// public key (`m/86'/coin'/0'/0/index`); the refund builder re-checks the signature
+/// verifies against the leaf's committed key.
+fn derive_maker_secret(
+    mnemonic: &str,
+    index: u32,
+) -> Result<lwk_wollet::bitcoin::secp256k1::SecretKey> {
+    let signer = SwSigner::new(mnemonic, false).map_err(rerr)?;
+    let path = DerivationPath::from(vec![
+        ChildNumber::Hardened { index: 86 },
+        ChildNumber::Hardened { index: SEQ_COIN_TYPE },
+        ChildNumber::Hardened { index: 0 },
+        ChildNumber::Normal { index: 0 },
+        ChildNumber::Normal { index },
+    ]);
+    let xprv = signer.derive_xprv(&path).map_err(rerr)?;
+    Ok(xprv.private_key)
+}
+
+/// Assemble + sign the covenant REFUND (cancel/reclaim) transaction: spend a resting
+/// covenant order back to the maker via the CLTV REFUND leaf, once it has matured
+/// (chain tip >= expiry_locktime). `prepared_json` is the recipe the wallet stored
+/// when it posted the order (`PlacedCovenant.preparedJson`), carrying the params the
+/// taptree derives from. The funded covenant UTXO is fetched on-chain for its REAL
+/// locked value + scriptPubKey (so a partially-filled remainder reclaims its ACTUAL
+/// value, and an already-spent covenant errors cleanly), the taptree is re-derived
+/// (REFUND leaf + control block) and checked against that spk, and the maker key at
+/// `maker_index` signs the tapscript-path Schnorr signature. The fee is paid in
+/// `fee_asset`: if it equals the covenant asset it is taken from the reclaimed value
+/// (no wallet inputs); otherwise it is funded from the wallet's own coins with change
+/// returned. The reclaimed asset A is sent to the wallet's own address. Returns the
+/// raw Elements tx to broadcast via [`xchain_seq_broadcast`]. NOTE: the tx sets
+/// nLockTime = expiry, so a node accepts it only once the tip reaches that height —
+/// call after the order has matured.
+#[allow(clippy::too_many_arguments)]
+pub fn covenant_build_refund_tx(
+    mnemonic: String,
+    esplora_url: String,
+    prepared_json: String,
+    covenant_txid: String,
+    covenant_vout: u32,
+    maker_index: u32,
+    fee_asset: String,
+    fee_atoms: u64,
+) -> Result<BuiltRawTx> {
+    let pj: serde_json::Value = serde_json::from_str(&prepared_json)
+        .map_err(|e| err(format!("bad prepared json: {e}")))?;
+    let order = order_from_terms(&pj)?;
+    if order.asset_a.is_empty() {
+        return Err(err("prepared json missing the covenant sold asset".into()));
+    }
+    if covenant_txid.is_empty() {
+        return Err(err("covenant txid required".into()));
+    }
+
+    // The funded covenant UTXO on-chain: its REAL locked value + spk (a partial-fill
+    // remainder differs from the original), which also proves it is still unspent.
+    let (onchain_spk, locked, onchain_asset) =
+        fetch_utxo(&esplora_url, &covenant_txid, covenant_vout)
+            .map_err(|e| err(format!("covenant output not found or already spent: {e}")))?;
+    let onchain_spk_bytes = hexbytes(&onchain_spk)?;
+    let tap = covd::verify_against_spk(&order, &onchain_spk_bytes, false).map_err(err)?;
+    if onchain_asset != order.asset_a {
+        return Err(err(format!(
+            "funded covenant asset {onchain_asset} != prepared asset_a {}",
+            order.asset_a
+        )));
+    }
+
+    let a_asset = AssetId::from_str(&order.asset_a).map_err(rerr)?;
+    let fee_asset_id = AssetId::from_str(&fee_asset).map_err(rerr)?;
+    let genesis_hash = crate::sequentia_testnet().genesis_hash();
+    let maker_secret = derive_maker_secret(&mnemonic, maker_index)?;
+
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let signer = SwSigner::new(&mnemonic, false).map_err(rerr)?;
+        let reclaim_addr = wollet
+            .address(None)
+            .map_err(rerr)?
+            .address()
+            .to_unconfidential();
+
+        // Fee funding: in the covenant asset it comes out of the reclaimed value (no
+        // inputs); otherwise from the wallet's own coins (asset A is never funded here).
+        let fee_inputs = if fee_asset_id == a_asset {
+            Vec::new()
+        } else {
+            let mut need: std::collections::BTreeMap<AssetId, u64> =
+                std::collections::BTreeMap::new();
+            *need.entry(fee_asset_id).or_insert(0) += fee_atoms;
+            select_taker_inputs(wollet, &signer, &need, a_asset)?
+        };
+
+        let plan = CovenantRefundPlan {
+            covenant: CovenantRefundInput {
+                txid: covenant_txid.clone(),
+                vout: covenant_vout,
+                asset: a_asset,
+                locked,
+                spk: tap.script_pubkey.clone(),
+                refund_leaf: tap.refund_leaf.clone(),
+                control_block: tap.refund_control_block.clone(),
+                maker_secret,
+            },
+            expiry_locktime: order.expiry_locktime,
+            reclaim_addr: reclaim_addr.clone(),
+            fee_atoms,
+            fee_asset: fee_asset_id,
+            fee_inputs,
+            change_addr: reclaim_addr,
+            genesis_hash,
+        };
+
+        let (raw_hex, txid) = build_covenant_refund_tx(&plan).map_err(rerr)?;
+        Ok(BuiltRawTx {
+            raw_hex,
+            txid: txid.to_string(),
+        })
+    })
+}
+
 /// Parse a relay `CovenantTerms` object into the pure derive order.
 fn order_from_terms(ct: &serde_json::Value) -> Result<covd::DeriveOrder> {
     let internal_key = {
@@ -665,8 +788,11 @@ fn order_from_terms(ct: &serde_json::Value) -> Result<covd::DeriveOrder> {
         }
     };
     Ok(covd::DeriveOrder {
-        asset_a: ct_str(ct, &["asset_a", "assetA"]),
-        asset_b: ct_str(ct, &["asset_b", "assetB"]),
+        // Accept both the relay CovenantTerms names (asset_a/asset_b) and the wallet's
+        // stored prepared_json names (sell_asset/buy_asset) so the covenant REFUND path
+        // can rebuild the order from the recipe it persisted when posting the offer.
+        asset_a: ct_str(ct, &["asset_a", "assetA", "sell_asset", "sellAsset"]),
+        asset_b: ct_str(ct, &["asset_b", "assetB", "buy_asset", "buyAsset"]),
         rate_num: ct_u64(ct, &["rate_num", "rateNum"]),
         rate_den: ct_u64(ct, &["rate_den", "rateDen"]),
         min_lot: ct_u64(ct, &["min_lot", "minLot"]),
