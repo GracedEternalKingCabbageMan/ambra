@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import '../data/api_client.dart';
 import '../data/config.dart';
 import '../data/format.dart';
+import '../data/trade_receipts.dart';
 import '../data/xchain_client.dart';
 import '../data/xchain_reverse_swap_service.dart';
 import '../theme/theme.dart';
@@ -186,6 +187,12 @@ class _XchainReverseSwapScreenState extends State<XchainReverseSwapScreen> {
   Future<void> _autoClaim() => _run('Claiming your Bitcoin…', () async {
         final rec = await XchainReverseSwapService.claimBtc(_rec!);
         if (mounted) setState(() => _rec = rec);
+        TradeReceipts.log(
+          id: 'sell:${rec.quoteId}',
+          title: 'Sold ${SeqAssets.labelFor(rec.seqAsset).ticker} for BTC',
+          status: 'BTC claimed',
+          txid: rec.btcClaimTxid,
+        ).ignore();
       });
 
   Future<void> _refreshRefundReady() async {
@@ -203,6 +210,12 @@ class _XchainReverseSwapScreenState extends State<XchainReverseSwapScreen> {
         }
         final rec = await XchainReverseSwapService.refundSeq(_rec!, _feeRates);
         if (mounted) setState(() => _rec = rec);
+        TradeReceipts.log(
+          id: 'sell:${rec.quoteId}',
+          title: '${SeqAssets.labelFor(rec.seqAsset).ticker} sale refunded',
+          status: 'Asset refunded',
+          txid: rec.seqRefundTxid,
+        ).ignore();
       });
 
   Future<void> _reset() async {

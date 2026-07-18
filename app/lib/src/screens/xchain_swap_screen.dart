@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import '../data/btc_state.dart';
 import '../data/config.dart';
 import '../data/format.dart';
+import '../data/trade_receipts.dart';
 import '../data/xchain_client.dart';
 import '../data/xchain_swap_service.dart';
 import '../rust/api.dart' as core;
@@ -150,6 +151,12 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
         try {
           final rec = await XchainSwapService.fundBtc(_rec!);
           if (mounted) setState(() => _rec = rec);
+          TradeReceipts.log(
+            id: 'buy:${rec.quoteId}',
+            title: 'Buying ${SeqAssets.labelFor(rec.seqAsset).ticker} with BTC',
+            status: 'BTC locked',
+            txid: rec.btcFundingTxid,
+          ).ignore();
         } catch (_) {
           // FUND-SAFETY: fundBtc persists the record (with the funding txid) at btcFunding BEFORE it
           // broadcasts. If the broadcast throws, reload the PERSISTED record so the in-memory _rec
@@ -198,6 +205,12 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
   Future<void> _claim() => _run('Revealing + claiming the asset…', () async {
         final rec = await XchainSwapService.claimSeq(_rec!);
         if (mounted) setState(() => _rec = rec);
+        TradeReceipts.log(
+          id: 'buy:${rec.quoteId}',
+          title: 'Bought ${SeqAssets.labelFor(rec.seqAsset).ticker} with BTC',
+          status: 'Asset received',
+          txid: rec.seqClaimTxid,
+        ).ignore();
         await _pollSettle();
       });
 
@@ -219,6 +232,12 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
   Future<void> _refund() => _run('Refunding BTC…', () async {
         final rec = await XchainSwapService.refundBtc(_rec!);
         if (mounted) setState(() => _rec = rec);
+        TradeReceipts.log(
+          id: 'buy:${rec.quoteId}',
+          title: '${SeqAssets.labelFor(rec.seqAsset).ticker} buy refunded',
+          status: 'BTC refunded',
+          txid: rec.btcRefundTxid,
+        ).ignore();
       });
 
   Future<void> _reset() async {
