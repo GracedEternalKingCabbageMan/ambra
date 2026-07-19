@@ -84,6 +84,7 @@ class CrossOffer {
     required this.assetAtoms,
     required this.btcSats,
     required this.makerPubkey,
+    this.verified = false,
   });
   final String offerId;
   final String seqAsset;
@@ -91,6 +92,7 @@ class CrossOffer {
   final BigInt assetAtoms;
   final BigInt btcSats;
   final String makerPubkey;
+  final bool verified; // maker signature checked in Rust; crossBook only returns verified offers
 
   /// BTC sats per 1 asset atom (the price). Lower = cheaper asset.
   double get btcPerAssetAtom => assetAtoms > BigInt.zero ? btcSats.toDouble() / assetAtoms.toDouble() : 0;
@@ -250,6 +252,16 @@ class SeqObClient {
           final btcSats =
               makerSells ? _big(pick(o, ['want_amount', 'wantAmount'])) : _big(pick(o, ['offer_amount', 'offerAmount']));
           if (assetAtoms <= BigInt.zero || btcSats <= BigInt.zero) continue;
+          // Verify the maker signature (the relay is untrusted). An unverified cross offer could let a
+          // malicious relay MITM the courier by substituting its own maker_pubkey, so DROP it — mirroring
+          // same-chain _parseOffer. The courier session keys off maker_pubkey, so a verified sig binds it.
+          bool verified;
+          try {
+            verified = await core.seqobVerifyOffer(offerJson: jsonEncode(o));
+          } catch (_) {
+            verified = false;
+          }
+          if (!verified) continue;
           out.add(CrossOffer(
             offerId: '${pick(o, ['offer_id', 'offerId']) ?? ''}',
             seqAsset: seqAsset,
@@ -257,6 +269,7 @@ class SeqObClient {
             assetAtoms: assetAtoms,
             btcSats: btcSats,
             makerPubkey: '${pick(o, ['maker_pubkey', 'makerPubkey']) ?? ''}',
+            verified: true,
           ));
         }
       } catch (_) {/* best-effort per orientation */}
