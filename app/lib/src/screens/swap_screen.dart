@@ -394,7 +394,10 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         final rates = await ApiClient.feeRates();
         if (mounted && rates.isNotEmpty) _feeRates = rates;
       } catch (_) {/* default fee still works */}
-      final markets = await SeqdexClient.markets();
+      // The composer settles on the seqob covenant book, so the pickers MUST come
+      // from the seqob markets (resolvable registry ids), not the /dex daemon (whose
+      // reissued ids resolve to neither built-in nor registry -> hex placeholders).
+      final markets = await SeqObClient.markets();
       final s = await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
       if (!mounted) return;
       setState(() {
@@ -499,11 +502,18 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     return set;
   }
 
-  /// Held assets that trade in some market — the candidates you can pay with.
-  List<String> _payableAssets() => _counterparts(null).where(_holds).toList();
+  /// Assets you can pay with: every asset the book trades, named (resolvable) or
+  /// held. NOT filtered to holdings — like the web wallet you may select any asset
+  /// and the review/balance check gates the actual trade, so an empty wallet still
+  /// sees the full market (fixes "pay only shows tSEQ"). Unnameable dust you don't
+  /// hold is dropped so no hex placeholders surface.
+  List<String> _payableAssets() =>
+      _counterparts(null).where((h) => SeqAssets.resolved(h) || _holds(h)).toList();
 
-  /// Assets that trade against the chosen pay asset.
-  List<String> _receivableAssets() => _counterparts(_payAsset).where((h) => h != _payAsset).toList();
+  /// Assets that trade against the chosen pay asset (named or held).
+  List<String> _receivableAssets() => _counterparts(_payAsset)
+      .where((h) => h != _payAsset && (SeqAssets.resolved(h) || _holds(h)))
+      .toList();
 
   void _reconcileReceive() {
     final recv = _receivableAssets();
