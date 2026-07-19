@@ -39,15 +39,37 @@ void main() {
     expect(r.seqAsset, seqA);
   });
 
-  test('one leg Lightning, one on-chain -> mixed (submarine) route', () {
-    // BUY: pay BTC on-chain, receive asset over Lightning.
+  test('asset leg on Lightning + BTC on-chain -> mixed (sub-asset) route', () {
+    // BUY: pay BTC on-chain, receive the asset over Lightning (sub-asset buy).
     final buy = route(btc, seqA, payRailLn: false, recvRailLn: true, lnAvailable: true);
     expect(buy.kind, SwapRouteKind.mixed);
     expect(buy.payIsBtc, isTrue);
-    // SELL: pay asset over Lightning, receive BTC on-chain.
+    expect(buy.payRail, 'chain'); // BTC leg on-chain
+    expect(buy.recvRail, 'ln'); // asset leg over Lightning
+    // SELL: pay the asset over Lightning, receive BTC on-chain (sub-asset sell).
     final sell = route(seqA, btc, payRailLn: true, recvRailLn: false, lnAvailable: true);
     expect(sell.kind, SwapRouteKind.mixed);
     expect(sell.payIsBtc, isFalse);
+    expect(sell.payRail, 'ln'); // asset leg over Lightning
+    expect(sell.recvRail, 'chain'); // BTC leg on-chain
+  });
+
+  test('BTC leg on Lightning + asset on-chain (submarine) is unbuilt -> degrades to cross', () {
+    // Submarine BUY: pay BTC over Lightning, receive the asset on-chain. Not yet built on mobile, so
+    // it must fall back to the proven on-chain cross rail — NEVER misroute to a sub-asset screen.
+    final buy = route(btc, seqA, payRailLn: true, recvRailLn: false, lnAvailable: true);
+    expect(buy.kind, SwapRouteKind.cross);
+    expect(buy.payRail, 'chain');
+    expect(buy.recvRail, 'chain');
+    // Submarine SELL: pay the asset on-chain, receive BTC over Lightning. Same degradation.
+    final sell = route(seqA, btc, payRailLn: false, recvRailLn: true, lnAvailable: true);
+    expect(sell.kind, SwapRouteKind.cross);
+  });
+
+  test('pure-LN route carries ln on both legs', () {
+    final r = route(btc, seqA, payRailLn: true, recvRailLn: true, lnAvailable: true);
+    expect(r.payRail, 'ln');
+    expect(r.recvRail, 'ln');
   });
 
   test('BTC<->BTC, same asset, and empty legs are invalid', () {

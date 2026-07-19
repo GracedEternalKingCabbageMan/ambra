@@ -541,6 +541,54 @@ pub fn seqob_sign_cancel(mnemonic: String, offer_id: String, nonce: u64) -> Resu
     Ok(cancel.to_string())
 }
 
+/// A fresh ephemeral secp256k1 keypair for a cross-lift courier session (forward secrecy — one per lift).
+/// The taker seals its XcMsgs with [priv_hex]; [pub_hex] (compressed) goes in the StartLift as the
+/// taker_session_pubkey so the maker can derive the same ECDH key.
+pub struct SeqobKeypair {
+    pub priv_hex: String,
+    pub pub_hex: String,
+}
+
+pub fn seqob_ephemeral_key() -> Result<SeqobKeypair> {
+    use lwk_wollet::secp256k1::{PublicKey, Secp256k1, SecretKey};
+    let secp = Secp256k1::new();
+    for _ in 0..64 {
+        let mut b = [0u8; 32];
+        getrandom::getrandom(&mut b).map_err(|e| anyhow::anyhow!("rng: {e}"))?;
+        if let Ok(sk) = SecretKey::from_slice(&b) {
+            let pk = PublicKey::from_secret_key(&secp, &sk);
+            return Ok(SeqobKeypair { priv_hex: tohex(&b), pub_hex: tohex(&pk.serialize()) });
+        }
+    }
+    anyhow::bail!("could not sample a session key")
+}
+
+fn priv32(hex: &str) -> Result<[u8; 32]> {
+    let pb = hexbytes(hex)?;
+    if pb.len() != 32 {
+        anyhow::bail!("private key must be 32 bytes");
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&pb);
+    Ok(k)
+}
+
+/// Seal a plaintext XcMsg for the maker over the cross courier: nonce(12) || AES-256-GCM. [my_priv_hex]
+/// is the taker's ephemeral session key, [peer_pub_hex] the maker's identity pubkey. Byte-matches the Go
+/// relay + web wallet Crypter (key = sha256(secp256k1 ECDH raw-X)).
+pub fn seqob_e2e_seal(my_priv_hex: String, peer_pub_hex: String, plaintext: Vec<u8>) -> Result<Vec<u8>> {
+    let key = priv32(&my_priv_hex)?;
+    let peer = hexbytes(&peer_pub_hex)?;
+    crate::seqob_courier::seal(&key, &peer, &plaintext).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Open a sealed XcMsg from the maker over the cross courier. Errors on tampering (GCM tag mismatch).
+pub fn seqob_e2e_open(my_priv_hex: String, peer_pub_hex: String, sealed: Vec<u8>) -> Result<Vec<u8>> {
+    let key = priv32(&my_priv_hex)?;
+    let peer = hexbytes(&peer_pub_hex)?;
+    crate::seqob_courier::open(&key, &peer, &sealed).map_err(|e| anyhow::anyhow!(e))
+}
+
 /// The built raw FILL/lift transaction: Elements hex + its txid.
 pub struct BuiltRawTx {
     pub raw_hex: String,

@@ -37,6 +37,8 @@ class SwapRoute {
     this.recv,
     this.seqAsset,
     this.payIsBtc = false,
+    this.payRail = 'chain',
+    this.recvRail = 'chain',
   });
 
   final SwapRouteKind kind;
@@ -49,6 +51,12 @@ class SwapRoute {
   /// True when the PAY leg is BTC (a BUY of [seqAsset] with Bitcoin); false when
   /// the pay leg is the asset (a SELL of [seqAsset] for Bitcoin).
   final bool payIsBtc;
+
+  /// The RESOLVED settlement rail for each leg: 'ln' or 'chain'. Carried on the route (like the web
+  /// wallet's route.payRail/recvRail) so dispatch reads the actual per-leg decision — the one bit that
+  /// distinguishes a sub-asset swap (asset leg on Lightning) from a submarine (BTC leg on Lightning).
+  final String payRail;
+  final String recvRail;
 
   bool get isValid => kind != SwapRouteKind.invalid;
 
@@ -112,15 +120,28 @@ SwapRoute route(
   // HONEST gating: a leg may sit on 'ln' only while Lightning is available. Any 'ln'
   // preference is downgraded to 'chain' here, so stale rail state can never route
   // into a dead Lightning path — the proven cross rail is the fallback.
-  final p = lnAvailable && payRailLn ? 'ln' : 'chain';
-  final r = lnAvailable && recvRailLn ? 'ln' : 'chain';
+  var p = lnAvailable && payRailLn ? 'ln' : 'chain';
+  var r = lnAvailable && recvRailLn ? 'ln' : 'chain';
+  // Ambra serves three BTC<->asset shapes: pure-LN (both legs on Lightning), sub-asset (the ASSET leg
+  // on Lightning + the BTC leg on-chain), and cross (both on-chain). The fourth shape — SUBMARINE, the
+  // BTC leg on Lightning + the ASSET leg on-chain — is not yet built on mobile, so degrade its
+  // Lightning leg to on-chain here: the pair falls back to the proven on-chain cross rail (honest — the
+  // user still gets a working swap) rather than misrouting to a sub-asset screen that does the inverse.
+  // The asset leg is the RECEIVE leg on a BUY (pay BTC), the PAY leg on a SELL (pay the asset).
+  final btcRail = payIsBtc ? p : r;
+  final assetRail = payIsBtc ? r : p;
+  if (btcRail == 'ln' && assetRail == 'chain') {
+    p = 'chain';
+    r = 'chain';
+  }
   final SwapRouteKind kind;
   if (p == 'ln' && r == 'ln') {
     kind = SwapRouteKind.ln; // both legs on Lightning -> pure-LN
   } else if (p == 'chain' && r == 'chain') {
     kind = SwapRouteKind.cross; // both legs on-chain -> cross-chain HTLC
   } else {
-    kind = SwapRouteKind.mixed; // one leg each -> submarine swap
+    kind = SwapRouteKind.mixed; // asset leg on Lightning + BTC on-chain -> sub-asset submarine swap
   }
-  return SwapRoute(kind: kind, pay: pay, recv: recv, seqAsset: seqAsset, payIsBtc: payIsBtc);
+  return SwapRoute(
+      kind: kind, pay: pay, recv: recv, seqAsset: seqAsset, payIsBtc: payIsBtc, payRail: p, recvRail: r);
 }

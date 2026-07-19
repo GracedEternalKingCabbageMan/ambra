@@ -5,6 +5,8 @@ import 'package:http/http.dart' as http;
 
 import '../rust/api.dart' as core;
 import 'config.dart';
+import 'cross_terms.dart';
+import 'seqob_client.dart' show CrossOffer;
 import 'wallet_repository.dart';
 import 'xchain_client.dart';
 
@@ -222,6 +224,59 @@ class XchainSwapService {
     return rec;
   }
 
+  /// Begin a cross lift from a COURIER-validated quote (the relay order-book path, NOT the retired /dex
+  /// RFQ): generate the secret + HTLC keys, build the BTC HTLC from the maker's validated [terms], and
+  /// persist — all before any money moves. Mirrors [begin] but takes the maker's Terms + [offer] instead
+  /// of a /dex quote. The caller MUST have already run validateCrossTerms(offer, terms).
+  static Future<XchainSwapRecord> beginFromCourierTerms(CrossOffer offer, CrossTerms terms) async {
+    final m = await _mnemonic();
+    if (!(terms.btcLocktime > terms.seqLocktime)) {
+      throw Exception('terms rejected: the BTC timeout must exceed the Sequentia timeout');
+    }
+    final secret = await core.xchainNewSecret();
+    final seqClaimPub = await core.xchainSeqClaimPubkey(mnemonic: m);
+    final btcRefundPub = await core.xchainBtcRefundPubkey(mnemonic: m);
+    final htlc = await core.xchainBtcHtlc(
+      hashHex: secret.hashHex,
+      claimPubHex: terms.makerBtcClaimPub, // BTC leg: maker claims with the secret
+      refundPubHex: btcRefundPub, // Alice refunds via CLTV
+      locktime: terms.btcLocktime,
+    );
+    final rec = XchainSwapRecord(
+      step: XStep.secretReady,
+      seqAsset: offer.seqAsset,
+      seqAmount: terms.assetAtoms,
+      btcAmount: terms.btcSats,
+      feeBtc: terms.feeBtcSats,
+      secretHex: secret.secretHex,
+      hashHex: secret.hashHex,
+      seqClaimPub: seqClaimPub,
+      btcRefundPub: btcRefundPub,
+      makerBtcClaimPub: terms.makerBtcClaimPub,
+      makerSeqRefundPub: terms.makerSeqRefundPub,
+      btcLocktime: terms.btcLocktime,
+      seqLocktime: terms.seqLocktime,
+      quoteId: 'courier:${offer.offerId}',
+      btcRedeemScript: htlc.redeemScriptHex,
+      btcP2shAddress: htlc.p2ShAddress,
+      btcP2shSpkHex: htlc.p2ShSpkHex,
+    );
+    await XchainStore.save(rec);
+    return rec;
+  }
+
+  /// Record the maker's Sequentia HTLC leg delivered over the courier (the SeqLegLocked XcMsg). Sets
+  /// seqLeg + advances to [XStep.seqLocked] so the SAME reused gates — verifyLeg (value + script byte
+  /// match), checkAnchor, seqRefundRaceSafe, claimSeq — proceed exactly as on the /dex path. The leg is
+  /// NOT trusted until verifyLeg re-derives + byte-checks it against the agreed terms.
+  static Future<XchainSwapRecord> setCourierSeqLeg(XchainSwapRecord r, Map<String, dynamic> legJson) async {
+    r
+      ..seqLeg = XSeqLeg.fromJson(legJson)
+      ..step = XStep.seqLocked;
+    await XchainStore.save(r);
+    return r;
+  }
+
   /// Lock the BTC: fund the HTLC P2SH (reusing the ordinary BTC send path).
   static Future<XchainSwapRecord> fundBtc(XchainSwapRecord r, {double feeRate = 0}) async {
     // Locking spends real (testnet4) Bitcoin into the HTLC. Require payment auth
@@ -334,6 +389,29 @@ class XchainSwapService {
     }
   }
 
+  /// SEQ-refund race margin (Sequentia blocks). Revealing the preimage on the SEQ leg once the
+  /// Sequentia tip is within this many blocks of the maker's SEQ-refund height ([XchainSwapRecord.
+  /// seqLocktime]) risks the maker's refund confirming FIRST — which would orphan the taker's claim and
+  /// let the maker sweep the taker's BTC with the now-public secret. Mirrors the web wallet's
+  /// SEQ_REFUND_MARGIN (xswap.js). Never reveal inside this window; bail to the BTC refund instead.
+  static const kSeqRefundMargin = 3;
+
+  /// The live Sequentia chain-tip height, from Alice's OWN esplora (never the maker's word).
+  static Future<int> _seqTipHeight() async {
+    final resp =
+        await http.get(Uri.parse('${Backend.esplora}/blocks/tip/height')).timeout(const Duration(seconds: 20));
+    return int.tryParse(resp.body.trim()) ?? -1;
+  }
+
+  /// True while it is still safe to reveal the preimage on the SEQ leg: the Sequentia tip sits
+  /// comfortably below the maker's SEQ-refund height ([kSeqRefundMargin] blocks of headroom). Once this
+  /// is false the taker must NOT claim — the swap should be unwound via the BTC refund. Fails CLOSED
+  /// (returns false) if the tip can't be read.
+  static Future<bool> seqRefundRaceSafe(XchainSwapRecord r) async {
+    final tip = await _seqTipHeight();
+    return tip >= 0 && tip < r.seqLocktime - kSeqRefundMargin;
+  }
+
   /// THE REVEAL GATE. Returns the live anchor evidence; `ok==true` means safe to
   /// claim. Computed in the core from Alice's own nodes (never the maker).
   static Future<core.AnchorEvidence> checkAnchor(XchainSwapRecord r) async {
@@ -354,6 +432,14 @@ class XchainSwapService {
     await verifyLeg(r); // re-bind right before reveal
     final ev = await checkAnchor(r);
     if (!ev.ok) throw Exception('Sequentia leg is not anchor-safe yet; not revealing the secret');
+    // Refuse to reveal inside the maker's SEQ-refund window (defense-in-depth, at the point of no
+    // return): if the Sequentia tip has reached seqLocktime - margin, the maker's refund could confirm
+    // before our claim — orphaning it and exposing the secret so the maker sweeps our BTC. Bail to the
+    // BTC refund instead. Fails CLOSED if the tip can't be read.
+    if (!await seqRefundRaceSafe(r)) {
+      throw Exception(
+          'Too close to the counterparty\'s Sequentia refund window to claim safely; refund your Bitcoin instead.');
+    }
     final m = await _mnemonic();
     final dest = await core.receiveAddress(mnemonic: m); // Alice's own tb1 (valid SEQ addr)
     final claimHex = await core.xchainSeqClaim(

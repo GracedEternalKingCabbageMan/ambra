@@ -1,5 +1,5 @@
 /// App version shown in the More footer. Bump alongside pubspec on release.
-const kAppVersion = '0.13.1';
+const kAppVersion = '0.13.3';
 
 /// Backend node the wallet talks to. Defaults to the public Sequentia testnet
 /// node; users can point Ambra at their own (persisted via [NodeConfig]). Every
@@ -58,23 +58,39 @@ class Backend {
   /// unavailable (the device must authenticate the host it co-signs for).
   static String lnHostPubkey = _defaultLnHostPubkey;
 
+  /// wss front of the hosted BTC hub node's Noise responder (the web wallet's
+  /// SEQ_LSP_WS_BTC). The pure-LN cross-chain rail is TWO keyless hub nodes co-signed
+  /// by ONE wallet: this is the BTC leg. The device is its sole signer, so the rail is
+  /// non-custodial. Absent => the pure-LN BTC leg cannot come online (the rail hides).
+  static String lnWsUrlBtc = _defaultLnWsUrlBtc;
+
+  /// The hosted BTC hub node's pinned transport pubkey (the web wallet's
+  /// SEQ_LSP_HOST_PUBKEY_BTC). Absent => the BTC leg's signer cannot authenticate its host.
+  static String lnHostPubkeyBtc = _defaultLnHostPubkeyBtc;
+
   /// Optional bearer token for the LSP HTTP API. When empty the LSP calls reuse
   /// the node [authHeaders] plumbing (same as /dex, /feerates).
   static String lnToken = _defaultLnToken;
 
   // The public testnet Lightning config (mirrors the web wallet's SEQ_LSP_* on
-  // sequentiatestnet.com). The asset node co-signs Sequentia-asset channels; it
-  // covers Instant pure-LN + the sub-asset rails (whose BTC leg stays on-chain).
+  // sequentiatestnet.com). Pure-LN cross-chain is two keyless hub nodes: the asset node
+  // co-signs Sequentia-asset channels, the BTC node co-signs the testnet4 BTC leg. The
+  // asset node alone also covers the sub-asset rails (whose BTC leg stays on-chain).
   static const _defaultLnWsUrl = 'wss://sequentiatestnet.com/lsp-ws-asset';
   static const _defaultLnHostPubkey = '0295374d947dc7e27382a83b2034a10b3d51b6f2fdf7e7da490893e3995141523b';
+  static const _defaultLnWsUrlBtc = 'wss://sequentiatestnet.com/lsp-ws-btc';
+  static const _defaultLnHostPubkeyBtc = '020a749af93e2a5a4d67ad28585cec31b55a146969eb77ca3d076eb59ff111ed51';
   static const _defaultLnToken = 'b5b1-d848ec96d29c01d2ff1db6cf';
 
   /// Point Lightning at the default LSP only when the wallet talks to the default
-  /// public node; a custom node has no hosted LSP, so LN goes dark there.
+  /// public node; a custom node has no hosted LSP, so LN goes dark there. Both hub
+  /// nodes (asset + BTC) follow the origin together.
   static void applyLnForOrigin() {
     final on = isDefault;
     lnWsUrl = on ? _defaultLnWsUrl : '';
     lnHostPubkey = on ? _defaultLnHostPubkey : '';
+    lnWsUrlBtc = on ? _defaultLnWsUrlBtc : '';
+    lnHostPubkeyBtc = on ? _defaultLnHostPubkeyBtc : '';
     lnToken = on ? _defaultLnToken : '';
   }
 
@@ -83,8 +99,12 @@ class Backend {
   /// derive deterministically from the wallet seed (m/1017'/0'/0').
   static String lnDeviceKeyOverride = '';
 
-  /// Device signer validating policy: 'permissive' or 'enforce'.
-  static String lnPolicy = 'permissive';
+  /// Device signer validating policy: 'permissive' or 'enforce'. Defaults to 'enforce'
+  /// to match the web wallet (seqln.js): the on-device signer REFUSES theft-shaped
+  /// commitments (the Specula non-custody invariant), so a malicious/compromised LSP can
+  /// never get the device to co-sign a fund-moving commitment. 'permissive' (always-sign)
+  /// is the kill-switch, not the default.
+  static String lnPolicy = 'enforce';
 
   /// Optional `Authorization` header for a node behind HTTP auth. Set by
   /// [NodeConfig]; applied to the sidecar HTTP calls (and, via the core, to
@@ -179,6 +199,11 @@ class SeqAssets {
   /// unnameable dust ids (that you don't hold) out of the swap pickers.
   static bool resolved(String assetId) =>
       _builtin.containsKey(assetId) || _openamp.containsKey(assetId) || _registry.containsKey(assetId);
+
+  /// Every asset id we can NAME (built-in demo set + OpenAMP + the public registry). The composer's
+  /// pickers include these so ANY registered asset is startable — you can post a covenant offer to open
+  /// a market for it even before one exists (mirrors the web's startableAssets over registryAssets()).
+  static Iterable<String> get resolvedIds => <String>{..._builtin.keys, ..._openamp.keys, ..._registry.keys};
 
   static AssetLabel labelFor(String assetId) {
     // Curated demo assets are authoritative (correct even offline).

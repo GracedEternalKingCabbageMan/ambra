@@ -39,7 +39,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -343306948;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1827527174;
 
 // Section: executor
 
@@ -2115,6 +2115,122 @@ fn wire__crate__api__signer__seqln_device_transport_privkey_impl(
         },
     )
 }
+fn wire__crate__api__seqob_e2e_open_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "seqob_e2e_open",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_my_priv_hex = <String>::sse_decode(&mut deserializer);
+            let api_peer_pub_hex = <String>::sse_decode(&mut deserializer);
+            let api_sealed = <Vec<u8>>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let output_ok = crate::api::seqob_e2e_open(
+                            api_my_priv_hex,
+                            api_peer_pub_hex,
+                            api_sealed,
+                        )?;
+                        Ok(output_ok)
+                    })(),
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__seqob_e2e_seal_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "seqob_e2e_seal",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_my_priv_hex = <String>::sse_decode(&mut deserializer);
+            let api_peer_pub_hex = <String>::sse_decode(&mut deserializer);
+            let api_plaintext = <Vec<u8>>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let output_ok = crate::api::seqob_e2e_seal(
+                            api_my_priv_hex,
+                            api_peer_pub_hex,
+                            api_plaintext,
+                        )?;
+                        Ok(output_ok)
+                    })(),
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__seqob_ephemeral_key_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "seqob_ephemeral_key",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let output_ok = crate::api::seqob_ephemeral_key()?;
+                        Ok(output_ok)
+                    })(),
+                )
+            }
+        },
+    )
+}
 fn wire__crate__api__seqob_maker_pubkey_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -3813,6 +3929,18 @@ impl SseDecode for crate::api::SeqdexSwapRequestOut {
     }
 }
 
+impl SseDecode for crate::api::SeqobKeypair {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_privHex = <String>::sse_decode(deserializer);
+        let mut var_pubHex = <String>::sse_decode(deserializer);
+        return crate::api::SeqobKeypair {
+            priv_hex: var_privHex,
+            pub_hex: var_pubHex,
+        };
+    }
+}
+
 impl SseDecode for crate::api::TxRow {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -3947,31 +4075,34 @@ fn pde_ffi_dispatcher_primary_impl(
         45 => wire__crate__api__receive_address_at_impl(port, ptr, rust_vec_len, data_len),
         46 => wire__crate__api__seqdex_build_swap_request_impl(port, ptr, rust_vec_len, data_len),
         47 => wire__crate__api__seqdex_sign_accept_impl(port, ptr, rust_vec_len, data_len),
-        51 => wire__crate__api__seqob_maker_pubkey_impl(port, ptr, rust_vec_len, data_len),
-        52 => wire__crate__api__seqob_sign_cancel_impl(port, ptr, rust_vec_len, data_len),
-        53 => wire__crate__api__seqob_sign_offer_impl(port, ptr, rust_vec_len, data_len),
-        54 => wire__crate__api__seqob_verify_offer_impl(port, ptr, rust_vec_len, data_len),
-        58 => wire__crate__api__sign_pset_impl(port, ptr, rust_vec_len, data_len),
-        59 => wire__crate__api__staker_public_key_impl(port, ptr, rust_vec_len, data_len),
-        60 => wire__crate__api__sync_wallet_impl(port, ptr, rust_vec_len, data_len),
-        61 => wire__crate__api__validate_address_impl(port, ptr, rust_vec_len, data_len),
-        62 => wire__crate__api__validate_mnemonic_impl(port, ptr, rust_vec_len, data_len),
-        63 => wire__crate__api__wallet_transactions_impl(port, ptr, rust_vec_len, data_len),
-        64 => wire__crate__api__xchain_btc_claim_impl(port, ptr, rust_vec_len, data_len),
-        65 => wire__crate__api__xchain_btc_claim_pubkey_impl(port, ptr, rust_vec_len, data_len),
-        66 => wire__crate__api__xchain_btc_htlc_impl(port, ptr, rust_vec_len, data_len),
-        67 => wire__crate__api__xchain_btc_refund_impl(port, ptr, rust_vec_len, data_len),
-        68 => wire__crate__api__xchain_btc_refund_pubkey_impl(port, ptr, rust_vec_len, data_len),
-        69 => wire__crate__api__xchain_find_btc_funding_impl(port, ptr, rust_vec_len, data_len),
-        70 => wire__crate__api__xchain_new_secret_impl(port, ptr, rust_vec_len, data_len),
-        71 => wire__crate__api__xchain_read_seq_preimage_impl(port, ptr, rust_vec_len, data_len),
-        72 => wire__crate__api__xchain_seq_broadcast_impl(port, ptr, rust_vec_len, data_len),
-        73 => wire__crate__api__xchain_seq_claim_impl(port, ptr, rust_vec_len, data_len),
-        74 => wire__crate__api__xchain_seq_claim_pubkey_impl(port, ptr, rust_vec_len, data_len),
-        75 => wire__crate__api__xchain_seq_htlc_reverse_impl(port, ptr, rust_vec_len, data_len),
-        76 => wire__crate__api__xchain_seq_redeem_script_impl(port, ptr, rust_vec_len, data_len),
-        77 => wire__crate__api__xchain_seq_refund_impl(port, ptr, rust_vec_len, data_len),
-        78 => wire__crate__api__xchain_verify_seq_leg_safe_impl(port, ptr, rust_vec_len, data_len),
+        51 => wire__crate__api__seqob_e2e_open_impl(port, ptr, rust_vec_len, data_len),
+        52 => wire__crate__api__seqob_e2e_seal_impl(port, ptr, rust_vec_len, data_len),
+        53 => wire__crate__api__seqob_ephemeral_key_impl(port, ptr, rust_vec_len, data_len),
+        54 => wire__crate__api__seqob_maker_pubkey_impl(port, ptr, rust_vec_len, data_len),
+        55 => wire__crate__api__seqob_sign_cancel_impl(port, ptr, rust_vec_len, data_len),
+        56 => wire__crate__api__seqob_sign_offer_impl(port, ptr, rust_vec_len, data_len),
+        57 => wire__crate__api__seqob_verify_offer_impl(port, ptr, rust_vec_len, data_len),
+        61 => wire__crate__api__sign_pset_impl(port, ptr, rust_vec_len, data_len),
+        62 => wire__crate__api__staker_public_key_impl(port, ptr, rust_vec_len, data_len),
+        63 => wire__crate__api__sync_wallet_impl(port, ptr, rust_vec_len, data_len),
+        64 => wire__crate__api__validate_address_impl(port, ptr, rust_vec_len, data_len),
+        65 => wire__crate__api__validate_mnemonic_impl(port, ptr, rust_vec_len, data_len),
+        66 => wire__crate__api__wallet_transactions_impl(port, ptr, rust_vec_len, data_len),
+        67 => wire__crate__api__xchain_btc_claim_impl(port, ptr, rust_vec_len, data_len),
+        68 => wire__crate__api__xchain_btc_claim_pubkey_impl(port, ptr, rust_vec_len, data_len),
+        69 => wire__crate__api__xchain_btc_htlc_impl(port, ptr, rust_vec_len, data_len),
+        70 => wire__crate__api__xchain_btc_refund_impl(port, ptr, rust_vec_len, data_len),
+        71 => wire__crate__api__xchain_btc_refund_pubkey_impl(port, ptr, rust_vec_len, data_len),
+        72 => wire__crate__api__xchain_find_btc_funding_impl(port, ptr, rust_vec_len, data_len),
+        73 => wire__crate__api__xchain_new_secret_impl(port, ptr, rust_vec_len, data_len),
+        74 => wire__crate__api__xchain_read_seq_preimage_impl(port, ptr, rust_vec_len, data_len),
+        75 => wire__crate__api__xchain_seq_broadcast_impl(port, ptr, rust_vec_len, data_len),
+        76 => wire__crate__api__xchain_seq_claim_impl(port, ptr, rust_vec_len, data_len),
+        77 => wire__crate__api__xchain_seq_claim_pubkey_impl(port, ptr, rust_vec_len, data_len),
+        78 => wire__crate__api__xchain_seq_htlc_reverse_impl(port, ptr, rust_vec_len, data_len),
+        79 => wire__crate__api__xchain_seq_redeem_script_impl(port, ptr, rust_vec_len, data_len),
+        80 => wire__crate__api__xchain_seq_refund_impl(port, ptr, rust_vec_len, data_len),
+        81 => wire__crate__api__xchain_verify_seq_leg_safe_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -4014,9 +4145,9 @@ fn pde_ffi_dispatcher_sync_impl(
             rust_vec_len,
             data_len,
         ),
-        55 => wire__crate__api__sequentia_genesis_hash_impl(ptr, rust_vec_len, data_len),
-        56 => wire__crate__api__set_auth_header_impl(ptr, rust_vec_len, data_len),
-        57 => wire__crate__api__set_data_dir_impl(ptr, rust_vec_len, data_len),
+        58 => wire__crate__api__sequentia_genesis_hash_impl(ptr, rust_vec_len, data_len),
+        59 => wire__crate__api__set_auth_header_impl(ptr, rust_vec_len, data_len),
+        60 => wire__crate__api__set_data_dir_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -4473,6 +4604,22 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::SeqdexSwapRequestOut>
     for crate::api::SeqdexSwapRequestOut
 {
     fn into_into_dart(self) -> crate::api::SeqdexSwapRequestOut {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::SeqobKeypair {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.priv_hex.into_into_dart().into_dart(),
+            self.pub_hex.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::SeqobKeypair {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::SeqobKeypair> for crate::api::SeqobKeypair {
+    fn into_into_dart(self) -> crate::api::SeqobKeypair {
         self
     }
 }
@@ -4967,6 +5114,14 @@ impl SseEncode for crate::api::SeqdexSwapRequestOut {
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <String>::sse_encode(self.id, serializer);
         <String>::sse_encode(self.swap_request_json, serializer);
+    }
+}
+
+impl SseEncode for crate::api::SeqobKeypair {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.priv_hex, serializer);
+        <String>::sse_encode(self.pub_hex, serializer);
     }
 }
 

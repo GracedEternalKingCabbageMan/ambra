@@ -701,13 +701,22 @@ class _MoveSheetState extends State<_MoveSheet> {
       await _sendChannelDeposit(m, leg, atoms, addr);
       _say('Opening the Lightning channel (your device is co-signing)…');
       var job = await LspClient.channelOpen(chain: leg.chain, amount: atoms.toInt(), asset: leg.asset, node: nodeKey);
+      var pollErrs = 0;
       for (var i = 0; i < 120 && !job.isActive && !job.isFailed; i++) {
         await Future<void>.delayed(const Duration(seconds: 2));
         final poll = job.poll ?? job.jobId;
         if (poll == null) break;
-        job = await LspClient.channelOpenPoll(poll);
-        final copy = _movePhaseCopy[job.status];
-        if (copy != null) _say(copy);
+        try {
+          job = await LspClient.channelOpenPoll(poll);
+          pollErrs = 0; // a good poll clears the transient-error streak
+          final copy = _movePhaseCopy[job.status];
+          if (copy != null) _say(copy);
+        } catch (e) {
+          // The on-chain deposit already landed; a transient poll blip must NOT fail the whole move
+          // (the channel keeps opening server-side). Tolerate a bounded streak — mirrors the web's
+          // fundChannel maxPollErrors=24 — then surface the error so the user can retry/resume.
+          if (++pollErrs > 24) rethrow;
+        }
       }
       if (job.isFailed) throw Exception(job.error ?? 'the channel could not be opened');
       if (!job.isActive) throw Exception('the channel is still opening; check back shortly');
