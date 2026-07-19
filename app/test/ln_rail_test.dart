@@ -15,10 +15,12 @@ final goldT = RailTarget.asset(hex: gold, ticker: 'GOLD');
 final usdxT = RailTarget.asset(hex: usdx, ticker: 'USDX');
 
 // A live BTC channel (both-sided), a live GOLD channel that is RECEIVE-only, a USDX channel OPENING.
+// Each carries a node_key: they are the wallet's OWN device-provisioned channels (the only ones that
+// count for rail liquidity — see the node_key filter in legLiquidity / ln-rail.js:58).
 final channels = <Map>[
-  {'peer_id': 'ln-btc', 'asset_label': 'BTC', 'spendable_units': 1000000, 'receivable_units': 500000, 'state': 'CHANNELD_NORMAL'},
-  {'peer_id': 'ln-gold', 'asset_label': 'GOLD', 'asset': gold, 'spendable_units': 0, 'receivable_units': 2000000, 'state': 'CHANNELD_NORMAL'},
-  {'peer_id': 'ln-usdx', 'asset_label': 'USDX', 'asset': usdx, 'spendable_units': 9000, 'receivable_units': 9000, 'state': 'OPENINGD'},
+  {'peer_id': 'ln-btc', 'node_key': 'btc:pub', 'asset_label': 'BTC', 'spendable_units': 1000000, 'receivable_units': 500000, 'state': 'CHANNELD_NORMAL'},
+  {'peer_id': 'ln-gold', 'node_key': 'seq:gold:pub', 'asset_label': 'GOLD', 'asset': gold, 'spendable_units': 0, 'receivable_units': 2000000, 'state': 'CHANNELD_NORMAL'},
+  {'peer_id': 'ln-usdx', 'node_key': 'seq:usdx:pub', 'asset_label': 'USDX', 'asset': usdx, 'spendable_units': 9000, 'receivable_units': 9000, 'state': 'OPENINGD'},
 ];
 
 void main() {
@@ -38,6 +40,17 @@ void main() {
     final goldL = legLiquidity(channels, goldT);
     expect([goldL.active, goldL.spendable, goldL.receivable], [true, BigInt.zero, BigInt.from(2000000)]);
     expect(legLiquidity(channels, usdxT).active, isFalse, reason: 'a still-OPENING channel is NOT usable liquidity');
+  });
+
+  test('shared/demo channels (no node_key) are excluded from rail liquidity', () {
+    // A shared-topology channel the LSP /status also returns, but that this wallet does NOT control
+    // (no node_key). It must NEVER count as usable liquidity, or the composer would flash the LN rail
+    // off the demo node's channels for a wallet that has moved nothing in.
+    final shared = <Map>[
+      {'peer_id': 'demo-gold', 'asset_label': 'GOLD', 'asset': gold, 'spendable_units': 5000000, 'receivable_units': 5000000, 'state': 'CHANNELD_NORMAL'},
+    ];
+    expect(legLiquidity(shared, goldT).active, isFalse, reason: 'no node_key -> not the wallet\'s own channel');
+    expect(canPayFrom(shared, goldT), isFalse);
   });
 
   test('pay-from needs spendable, receive-to needs receivable, opening channels excluded', () {

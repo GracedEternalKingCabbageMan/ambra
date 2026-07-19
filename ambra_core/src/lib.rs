@@ -27,6 +27,7 @@ pub mod seqob_covenant_derive;
 /// SeqOB relay WIRE (port of seqob.js: deterministic Offer codec + ECDSA
 /// sign/verify + cancel + maker identity key) — byte-matched to the Go relay.
 pub mod seqob_wire;
+pub mod seqob_courier;
 // The cross-chain (BTC<->SEQ asset) swap glue now lives in the kit
 // (lwk_wollet::btc::xchain); api/mod.rs's xchain_* shims call into it.
 mod frb_generated;

@@ -73,6 +73,29 @@ class OrderBook {
   BigInt get depthBaseAtoms => offers.fold(BigInt.zero, (a, o) => a + o.baseAtoms);
 }
 
+/// A resting CROSS (BTC<->asset) offer on the relay order book. [makerSellsAsset] true = the maker gives
+/// the asset for BTC (a taker BUYS the asset with Bitcoin); false = the maker gives BTC (a taker SELLS
+/// the asset for Bitcoin). Lifted interactively via the courier; now rests durably on the relay.
+class CrossOffer {
+  CrossOffer({
+    required this.offerId,
+    required this.seqAsset,
+    required this.makerSellsAsset,
+    required this.assetAtoms,
+    required this.btcSats,
+    required this.makerPubkey,
+  });
+  final String offerId;
+  final String seqAsset;
+  final bool makerSellsAsset;
+  final BigInt assetAtoms;
+  final BigInt btcSats;
+  final String makerPubkey;
+
+  /// BTC sats per 1 asset atom (the price). Lower = cheaper asset.
+  double get btcPerAssetAtom => assetAtoms > BigInt.zero ? btcSats.toDouble() / assetAtoms.toDouble() : 0;
+}
+
 /// One executed trade from the relay's `/trades` feed (a completed same-chain
 /// fill). `price` is quote-per-base atoms as the relay recorded it; `size` is in
 /// base atoms; `ts` is unix seconds. The frame (which asset is base) is the pair
@@ -147,9 +170,14 @@ class SeqObClient {
     final j = await _get('/v1/market/$baseAsset/$quoteAsset/orderbook$q');
     final list = (j['offers'] as List?) ?? (j['Offers'] as List?) ?? const [];
     final offers = <SeqObOffer>[];
+    final nowUnix = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     for (final e in list) {
       if (e is! Map) continue;
       final o = Map<String, dynamic>.from(e);
+      // Drop offers past their relay TTL (mirrors the web's applyOffersToBook expiry filter) — an
+      // expired offer can't be settled, so it must never appear in the book or be takeable.
+      final exp = _big(pick(o, ['expires_at_unix', 'expiresAtUnix'])).toInt();
+      if (exp > 0 && exp <= nowUnix) continue;
       final offer = await _parseOffer(o);
       if (offer == null || offer.baseAtoms <= BigInt.zero) continue;
       if (confidential) {
@@ -184,6 +212,57 @@ class SeqObClient {
     } catch (_) {
       return const [];
     }
+  }
+
+  /// The Sequentia assets that have a cross-chain (BTC) market on the RELAY order book — the source of
+  /// truth for BTC pairs now that the /dex RFQ daemon is retired. An asset is BTC-tradeable when the
+  /// relay quotes it against BTC in either orientation. Never throws (returns []).
+  static Future<List<String>> crossMarketAssets() async {
+    final set = <String>{};
+    for (final m in await markets()) {
+      if (m.quoteAsset == 'BTC' && m.baseAsset.isNotEmpty && m.baseAsset != 'BTC') set.add(m.baseAsset);
+      if (m.baseAsset == 'BTC' && m.quoteAsset.isNotEmpty && m.quoteAsset != 'BTC') set.add(m.quoteAsset);
+    }
+    return set.toList();
+  }
+
+  /// The resting CROSS (BTC<->asset) offers for [seqAsset] on the relay order book — both orientations
+  /// (asset/BTC and BTC/asset). These carry CrossChainTerms and are lifted via the interactive courier,
+  /// but they now REST DURABLY (survive the maker's WS blips), so the book shows real cross depth.
+  /// Sorted cheapest-BTC-per-asset first. Never throws (returns []).
+  static Future<List<CrossOffer>> crossBook(String seqAsset) async {
+    final out = <CrossOffer>[];
+    final nowUnix = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    for (final path in ['/v1/market/$seqAsset/BTC/orderbook', '/v1/market/BTC/$seqAsset/orderbook']) {
+      try {
+        final j = await _get(path);
+        final list = (j['offers'] as List?) ?? (j['Offers'] as List?) ?? const [];
+        for (final e in list) {
+          if (e is! Map) continue;
+          final o = Map<String, dynamic>.from(e);
+          if (o['cross_chain'] == null && o['crossChain'] == null) continue; // cross offers only
+          final exp = _big(pick(o, ['expires_at_unix', 'expiresAtUnix'])).toInt();
+          if (exp > 0 && exp <= nowUnix) continue; // drop expired
+          final offerAsset = '${pick(o, ['offer_asset', 'offerAsset']) ?? ''}';
+          final makerSells = offerAsset != 'BTC'; // maker gives the asset -> taker BUYS it with BTC
+          final assetAtoms =
+              makerSells ? _big(pick(o, ['offer_amount', 'offerAmount'])) : _big(pick(o, ['want_amount', 'wantAmount']));
+          final btcSats =
+              makerSells ? _big(pick(o, ['want_amount', 'wantAmount'])) : _big(pick(o, ['offer_amount', 'offerAmount']));
+          if (assetAtoms <= BigInt.zero || btcSats <= BigInt.zero) continue;
+          out.add(CrossOffer(
+            offerId: '${pick(o, ['offer_id', 'offerId']) ?? ''}',
+            seqAsset: seqAsset,
+            makerSellsAsset: makerSells,
+            assetAtoms: assetAtoms,
+            btcSats: btcSats,
+            makerPubkey: '${pick(o, ['maker_pubkey', 'makerPubkey']) ?? ''}',
+          ));
+        }
+      } catch (_) {/* best-effort per orientation */}
+    }
+    out.sort((a, b) => a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom));
+    return out;
   }
 
   /// Recent executed trades for (base, quote), newest first. Empty (never throws)

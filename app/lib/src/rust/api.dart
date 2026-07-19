@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `btc_params`, `clear_scan_marks`, `ct_str`, `ct_u64`, `derive_maker_payout`, `derive_maker_secret`, `enclave_prevout_to_txout`, `enclave_prevouts_to_txouts`, `enclave_sighash_inner`, `err`, `esplora_client`, `fetch_utxo`, `hexbytes`, `last_scan`, `maker_identity_priv`, `mark_scanned`, `openamp_keypair`, `order_from_terms`, `parse_openamp_tx`, `rerr`, `scan_into`, `scanned_recently`, `select_taker_inputs`, `seq_addr_params`, `tohex`, `with_synced_wollet`, `wollet_cache`
+// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `btc_params`, `clear_scan_marks`, `ct_str`, `ct_u64`, `derive_maker_payout`, `derive_maker_secret`, `enclave_prevout_to_txout`, `enclave_prevouts_to_txouts`, `enclave_sighash_inner`, `err`, `esplora_client`, `fetch_utxo`, `hexbytes`, `last_scan`, `maker_identity_priv`, `mark_scanned`, `openamp_keypair`, `order_from_terms`, `parse_openamp_tx`, `priv32`, `rerr`, `scan_into`, `scanned_recently`, `select_taker_inputs`, `seq_addr_params`, `tohex`, `with_synced_wollet`, `wollet_cache`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
 String networkName() => RustLib.instance.api.crateApiNetworkName();
@@ -216,6 +216,33 @@ Future<String> seqobSignCancel({
   mnemonic: mnemonic,
   offerId: offerId,
   nonce: nonce,
+);
+
+Future<SeqobKeypair> seqobEphemeralKey() =>
+    RustLib.instance.api.crateApiSeqobEphemeralKey();
+
+/// Seal a plaintext XcMsg for the maker over the cross courier: nonce(12) || AES-256-GCM. [my_priv_hex]
+/// is the taker's ephemeral session key, [peer_pub_hex] the maker's identity pubkey. Byte-matches the Go
+/// relay + web wallet Crypter (key = sha256(secp256k1 ECDH raw-X)).
+Future<Uint8List> seqobE2ESeal({
+  required String myPrivHex,
+  required String peerPubHex,
+  required List<int> plaintext,
+}) => RustLib.instance.api.crateApiSeqobE2ESeal(
+  myPrivHex: myPrivHex,
+  peerPubHex: peerPubHex,
+  plaintext: plaintext,
+);
+
+/// Open a sealed XcMsg from the maker over the cross courier. Errors on tampering (GCM tag mismatch).
+Future<Uint8List> seqobE2EOpen({
+  required String myPrivHex,
+  required String peerPubHex,
+  required List<int> sealed,
+}) => RustLib.instance.api.crateApiSeqobE2EOpen(
+  myPrivHex: myPrivHex,
+  peerPubHex: peerPubHex,
+  sealed: sealed,
 );
 
 /// Assemble + sign the permissionless covenant FILL (TAKE/lift) that fills a
@@ -1452,6 +1479,27 @@ class SeqdexSwapRequestOut {
           runtimeType == other.runtimeType &&
           id == other.id &&
           swapRequestJson == other.swapRequestJson;
+}
+
+/// A fresh ephemeral secp256k1 keypair for a cross-lift courier session (forward secrecy — one per lift).
+/// The taker seals its XcMsgs with [priv_hex]; [pub_hex] (compressed) goes in the StartLift as the
+/// taker_session_pubkey so the maker can derive the same ECDH key.
+class SeqobKeypair {
+  final String privHex;
+  final String pubHex;
+
+  const SeqobKeypair({required this.privHex, required this.pubHex});
+
+  @override
+  int get hashCode => privHex.hashCode ^ pubHex.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SeqobKeypair &&
+          runtimeType == other.runtimeType &&
+          privHex == other.privHex &&
+          pubHex == other.pubHex;
 }
 
 /// A wallet transaction history row.

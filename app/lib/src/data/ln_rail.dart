@@ -57,6 +57,11 @@ LegLiquidity legLiquidity(List<Map> channels, RailTarget target) {
   var receivable = BigInt.zero;
   var count = 0;
   for (final c in channels) {
+    // Only the wallet's OWN device-provisioned channels (which carry a node_key) count for rail
+    // liquidity — never the shared/demo-topology channels /status also returns. Keeps the Swap tab
+    // consistent with the Balance tab: a wallet can only pay/receive over Lightning with channels it
+    // actually controls (a fresh wallet has none until it Moves funds in). Mirrors ln-rail.js:58.
+    if ('${c['node_key'] ?? ''}'.isEmpty) continue;
     if (!channelMatches(c, target) || !channelActive(c)) continue;
     active = true;
     count++;

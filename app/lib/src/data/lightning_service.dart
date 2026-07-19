@@ -1,6 +1,5 @@
 import 'package:flutter/foundation.dart';
 
-import '../rust/api/signer.dart' as ffi;
 import 'config.dart';
 import 'lsp_client.dart';
 import 'seqln_keys.dart' as keys;
@@ -26,23 +25,34 @@ class LightningService extends ChangeNotifier {
   LightningService._();
   static final LightningService instance = LightningService._();
 
-  SeqlnSigner? _signer;
+  SeqlnSigner? _signer; // asset hub signer
+  SeqlnSigner? _signerBtc; // BTC hub signer — the pure-LN rail's second leg
 
   /// idle | unconfigured | connecting | handshaking | authenticated | node_id |
-  /// ready | closed | error.
+  /// ready | closed | error. Tracks the ASSET hub signer (the primary).
   String phase = 'idle';
   String detail = '';
-  bool connected = false;
-  String? nodeId;
+  bool connected = false; // asset hub signer serving
+  bool _connectedBtc = false; // BTC hub signer serving
+  String? nodeId; // asset hub node id
+  String? nodeIdBtc; // BTC hub node id
 
-  /// Whether Lightning is deployed for this build (a wss endpoint + a pinned host
-  /// key). Without both, the on-device signer cannot come online.
-  bool get configured => Backend.lnWsUrl.trim().isNotEmpty && Backend.lnHostPubkey.trim().isNotEmpty;
+  bool get _assetConfigured => Backend.lnWsUrl.trim().isNotEmpty && Backend.lnHostPubkey.trim().isNotEmpty;
+  bool get _btcConfigured => Backend.lnWsUrlBtc.trim().isNotEmpty && Backend.lnHostPubkeyBtc.trim().isNotEmpty;
 
-  /// The LN swap rail is offerable only when the on-device signer is actually
-  /// serving the hosted node (so it can sign the swap's commitments). Deliberately
-  /// conservative: no signer, no LN route — the composer falls back to on-chain.
-  bool get available => configured && connected;
+  /// Whether Lightning is deployed for this build (the asset hub's wss endpoint + host
+  /// key). Without it, no on-device signer can come online.
+  bool get configured => _assetConfigured;
+
+  /// The pure-LN cross-chain rail needs BOTH keyless hub signers (asset + BTC) serving so
+  /// the device co-signs BOTH legs (non-custodial). Available only when the asset signer
+  /// serves AND — when the BTC hub is configured (the public default) — the BTC signer
+  /// serves too. Mirrors seqln.js seqlnAvailable (every ENABLED node serving); deliberately
+  /// conservative: a missing leg withholds the rail rather than flashing it then failing.
+  bool get available => connected && (!_btcConfigured || _connectedBtc);
+
+  /// Whether the BTC hub signer is serving (the pure-LN rail's second, BTC leg).
+  bool get btcConnected => _connectedBtc;
 
   /// Pure-LN happy path: genuinely instant + final (nothing on-chain, zero reorg
   /// risk). The one swap state the DEX 0-conf policy lets us call "final".
@@ -68,31 +78,75 @@ class LightningService extends ChangeNotifier {
       _set('unconfigured', 'Lightning not deployed for this node');
       return;
     }
-    if (_signer != null && connected) return; // already serving
-    _set('connecting', 'starting on-device signer');
+    // Bring up BOTH shared hub signers (asset + BTC) so the pure-LN cross-chain rail can co-sign both
+    // legs on-device (non-custodial). Each connect is independent + non-fatal: a slow/failed BTC leg
+    // must not wedge the asset leg (which the sub-asset + Move-to-Lightning flows also use). Mirrors
+    // seqln.js initLightning bringing up every enabled node's device signer.
+    await Future.wait([
+      _startHub('asset', Backend.lnWsUrl.trim(), Backend.lnHostPubkey.trim(), mnemonic),
+      if (_btcConfigured) _startHub('btc', Backend.lnWsUrlBtc.trim(), Backend.lnHostPubkeyBtc.trim(), mnemonic),
+    ]);
+  }
+
+  /// Bring ONE shared hub signer online against its keyless hosted node. The device identity is the
+  /// per-node derived pair ([keys.lnDeriveNode]): [LnNodeKeys.transportPrivkey] authenticates the Noise
+  /// link, and [LnNodeKeys.signingSeed] — NOT the raw mnemonic — determines the node's LN identity
+  /// (node_id + channel keys), so the asset and BTC hubs are DISTINCT nodes and a seed imported into the
+  /// web wallet presents the SAME identity (cross-client recovery). Idempotent per node; non-fatal.
+  Future<void> _startHub(String node, String wsUrl, String hostPubkeyHex, String mnemonic) async {
+    final isBtc = node == 'btc';
+    if (isBtc ? (_signerBtc != null && _connectedBtc) : (_signer != null && connected)) return; // already serving
+    if (!isBtc) _set('connecting', 'starting on-device signer');
     try {
-      final hostPub = _hexBytes(Backend.lnHostPubkey.trim());
-      final devicePriv = _deviceTransportPriv(mnemonic);
-      final signer = SeqlnSigner.fromMnemonic(mnemonic)
+      final id = keys.lnDeriveNode(mnemonic, node);
+      final hostPub = _hexBytes(hostPubkeyHex);
+      // Harness pinning honours [Backend.lnDeviceKeyOverride] for the asset transport (the legacy
+      // single-node hook); every other key is seed-derived.
+      final ov = Backend.lnDeviceKeyOverride.trim();
+      final transportPriv =
+          (!isBtc && RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(ov)) ? _hexBytes(ov) : id.transportPrivkey;
+      final signer = SeqlnSigner.fromMnemonic(id.signingSeed)
         ..setPolicy(Backend.lnPolicy == 'enforce' ? SeqlnPolicy.enforce : SeqlnPolicy.permissive);
       signer.onStatus = (st) {
-        nodeId = st.nodeId ?? nodeId;
-        if (st.state == 'closed' || st.state == 'error') connected = false;
-        _set(st.state, st.detail);
+        if (isBtc) {
+          nodeIdBtc = st.nodeId ?? nodeIdBtc;
+          if (st.state == 'closed' || st.state == 'error') {
+            _connectedBtc = false;
+            _signerBtc = null; // null the dead signer so a later start() rebuilds it
+          }
+          notifyListeners();
+        } else {
+          nodeId = st.nodeId ?? nodeId;
+          if (st.state == 'closed' || st.state == 'error') connected = false;
+          _set(st.state, st.detail);
+        }
       };
-      _signer = signer;
-      await signer.connect(
-        wsUrl: Backend.lnWsUrl.trim(),
-        hostStaticPubkey: hostPub,
-        deviceStaticPrivkey: devicePriv,
-      );
-      nodeId = await signer.whenNodeId(timeout: const Duration(seconds: 30));
-      connected = true;
-      _set('ready', 'signer serving');
+      if (isBtc) {
+        _signerBtc = signer;
+      } else {
+        _signer = signer;
+      }
+      await signer.connect(wsUrl: wsUrl, hostStaticPubkey: hostPub, deviceStaticPrivkey: transportPriv);
+      final nid = await signer.whenNodeId(timeout: const Duration(seconds: 30));
+      if (isBtc) {
+        nodeIdBtc = nid;
+        _connectedBtc = true;
+        notifyListeners();
+      } else {
+        nodeId = nid;
+        connected = true;
+        _set('ready', 'signer serving');
+      }
     } catch (e) {
-      _signer = null;
-      connected = false;
-      _set('error', e.toString().replaceFirst('Exception: ', ''));
+      if (isBtc) {
+        _signerBtc = null;
+        _connectedBtc = false;
+        notifyListeners();
+      } else {
+        _signer = null;
+        connected = false;
+        _set('error', e.toString().replaceFirst('Exception: ', ''));
+      }
     }
   }
 
@@ -101,8 +155,13 @@ class LightningService extends ChangeNotifier {
     try {
       await _signer?.disconnect();
     } catch (_) {}
+    try {
+      await _signerBtc?.disconnect();
+    } catch (_) {}
     _signer = null;
+    _signerBtc = null;
     connected = false;
+    _connectedBtc = false;
     for (final n in _own.values) {
       try {
         await n.signer?.disconnect();
@@ -231,7 +290,10 @@ class LightningService extends ChangeNotifier {
       await LspClient.waitNodeReady(nodeKey);
     } catch (_) {/* the signer connect below surfaces a link error if it truly isn't up */}
     final wsUrl = _wsBaseFor() + wsPath;
-    final signer = SeqlnSigner.fromMnemonic(mnemonic)
+    // The node's LN identity comes from the per-node DERIVED signing seed (id.signingSeed), NOT the raw
+    // mnemonic — so each own node has a distinct node_id and a seed imported into the web wallet presents
+    // the same identity (cross-client recovery). id was derived above for this asset/BTC node.
+    final signer = SeqlnSigner.fromMnemonic(id.signingSeed)
       ..setPolicy(Backend.lnPolicy == 'enforce' ? SeqlnPolicy.enforce : SeqlnPolicy.permissive);
     final own = _own[nodeKey] = _OwnNode();
     signer.onStatus = (st) {
@@ -286,19 +348,6 @@ class LightningService extends ChangeNotifier {
   /// The wss base for a provisioned node's Noise responder: the active node origin, scheme-swapped
   /// http->ws / https->wss (the per-node `public_ws_path` is appended). Mirrors seqln.js provWsUrl.
   String _wsBaseFor() => Backend.origin.replaceFirst(RegExp(r'^http'), 'ws');
-
-  // -- device transport key ---------------------------------------------------
-
-  /// The pinned Noise static privkey the LSP has provisioned for this wallet:
-  /// [Backend.lnDeviceKeyOverride] (harness pinning) when set, else derived
-  /// deterministically from the seed at BIP32 m/1017'/0'/0' — the exact twin of
-  /// the web wallet's `lnDeviceTransportPriv`, so a wallet imported into either
-  /// client presents the same device identity.
-  List<int> _deviceTransportPriv(String mnemonic) {
-    final ov = Backend.lnDeviceKeyOverride.trim();
-    if (RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(ov)) return _hexBytes(ov);
-    return ffi.seqlnDeviceTransportPrivkey(mnemonic: mnemonic);
-  }
 
   static List<int> _hexBytes(String hex) {
     final s = hex.startsWith('0x') ? hex.substring(2) : hex;

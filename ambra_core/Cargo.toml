@@ -28,6 +28,12 @@ lwk_common = { version = "0.18.1" }
 flutter_rust_bridge = "=2.12.0"
 anyhow = "1"
 
+# E2E courier crypter (cross-swap co-sign): byte-matches the Go relay + web wallet — key =
+# sha256(secp256k1 ECDH raw-X), seal = nonce(12) || AES-256-GCM(ct || tag16). getrandom for the nonce
+# (already in the tree via lwk; pin 0.2 so no new version is added).
+aes-gcm = "0.10"
+getrandom = "0.2"
+
 # The SeqLN Tier-2 device signer (the phone-side crypto kernel + validating
 # policy + Noise_XK). Pure, I/O-free, and deliberately pinned to the SAME
 # bitcoin 0.32 / secp256k1 0.29 line ambra_core already resolves, so cargo

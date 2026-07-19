@@ -210,6 +210,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   SeqdexSwapRequestOut dco_decode_seqdex_swap_request_out(dynamic raw);
 
   @protected
+  SeqobKeypair dco_decode_seqob_keypair(dynamic raw);
+
+  @protected
   TxRow dco_decode_tx_row(dynamic raw);
 
   @protected
@@ -432,6 +435,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   SeqdexSwapRequestOut sse_decode_seqdex_swap_request_out(
     SseDeserializer deserializer,
   );
+
+  @protected
+  SeqobKeypair sse_decode_seqob_keypair(SseDeserializer deserializer);
 
   @protected
   TxRow sse_decode_tx_row(SseDeserializer deserializer);
@@ -705,6 +711,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     SeqdexSwapRequestOut self,
     SseSerializer serializer,
   );
+
+  @protected
+  void sse_encode_seqob_keypair(SeqobKeypair self, SseSerializer serializer);
 
   @protected
   void sse_encode_tx_row(TxRow self, SseSerializer serializer);
