@@ -263,10 +263,14 @@ class _BalanceTabState extends State<BalanceTab> {
   Future<void> _refreshLn(String mnemonic, List<core.AssetBalance> balances) async {
     if (!LightningService.instance.configured) return;
     try {
-      final nodes = <String>[
+      // Every registry-known asset, not just assets with an on-chain balance: an asset held ONLY inside
+      // a channel (0 on-chain) still has a node/channel this view must show its Lightning split + close
+      // affordance for. Keying off balances alone hid those channels. Set-dedup; union the balance ids.
+      final nodes = <String>{
         lnkeys.ownNodeKeyForBtc(mnemonic),
+        for (final id in SeqAssets.resolvedIds) lnkeys.ownNodeKeyForAsset(mnemonic, id),
         for (final b in balances) lnkeys.ownNodeKeyForAsset(mnemonic, b.assetId),
-      ];
+      }.toList();
       final st = await LightningService.instance.getStatus(nodes: nodes);
       final own = ((st.raw['channels'] as List?) ?? const [])
           .whereType<Map>()

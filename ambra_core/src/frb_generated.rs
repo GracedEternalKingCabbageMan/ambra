@@ -39,7 +39,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1827527174;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1776756643;
 
 // Section: executor
 
@@ -3142,6 +3142,49 @@ fn wire__crate__api__xchain_seq_claim_pubkey_impl(
         },
     )
 }
+fn wire__crate__api__xchain_seq_htlc_forward_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "xchain_seq_htlc_forward",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_mnemonic = <String>::sse_decode(&mut deserializer);
+            let api_hash_hex = <String>::sse_decode(&mut deserializer);
+            let api_maker_seq_refund_pub_hex = <String>::sse_decode(&mut deserializer);
+            let api_seq_locktime = <u32>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let output_ok = crate::api::xchain_seq_htlc_forward(
+                            api_mnemonic,
+                            api_hash_hex,
+                            api_maker_seq_refund_pub_hex,
+                            api_seq_locktime,
+                        )?;
+                        Ok(output_ok)
+                    })(),
+                )
+            }
+        },
+    )
+}
 fn wire__crate__api__xchain_seq_htlc_reverse_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -4099,10 +4142,11 @@ fn pde_ffi_dispatcher_primary_impl(
         75 => wire__crate__api__xchain_seq_broadcast_impl(port, ptr, rust_vec_len, data_len),
         76 => wire__crate__api__xchain_seq_claim_impl(port, ptr, rust_vec_len, data_len),
         77 => wire__crate__api__xchain_seq_claim_pubkey_impl(port, ptr, rust_vec_len, data_len),
-        78 => wire__crate__api__xchain_seq_htlc_reverse_impl(port, ptr, rust_vec_len, data_len),
-        79 => wire__crate__api__xchain_seq_redeem_script_impl(port, ptr, rust_vec_len, data_len),
-        80 => wire__crate__api__xchain_seq_refund_impl(port, ptr, rust_vec_len, data_len),
-        81 => wire__crate__api__xchain_verify_seq_leg_safe_impl(port, ptr, rust_vec_len, data_len),
+        78 => wire__crate__api__xchain_seq_htlc_forward_impl(port, ptr, rust_vec_len, data_len),
+        79 => wire__crate__api__xchain_seq_htlc_reverse_impl(port, ptr, rust_vec_len, data_len),
+        80 => wire__crate__api__xchain_seq_redeem_script_impl(port, ptr, rust_vec_len, data_len),
+        81 => wire__crate__api__xchain_seq_refund_impl(port, ptr, rust_vec_len, data_len),
+        82 => wire__crate__api__xchain_verify_seq_leg_safe_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }

@@ -438,13 +438,81 @@ class XchainSwapService {
     return tip >= 0 && tip < r.seqLocktime - kSeqRefundMargin;
   }
 
+  /// Fetch a Sequentia tx from Alice's OWN esplora (never the maker's word).
+  static Future<Map<String, dynamic>?> _seqTx(String txid) async {
+    try {
+      final resp = await http
+          .get(Uri.parse('${Backend.esplora}/tx/$txid'), headers: Backend.authHeaders)
+          .timeout(const Duration(seconds: 20));
+      if (resp.statusCode != 200) return null;
+      return jsonDecode(resp.body) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static BigInt _bigOf(dynamic v) =>
+      v is int ? BigInt.from(v) : (v is BigInt ? v : (BigInt.tryParse('${v ?? ''}') ?? BigInt.zero));
+
+  /// Bind the maker's REPORTED SEQ leg to a real, claimable on-chain output BEFORE the secret is ever
+  /// revealed, and return the leg's OWN canonical block hash for the anchor gate. [verifyLeg] only
+  /// checks maker-reported strings: a malicious maker can echo the agreed asset/amount/redeemScript yet
+  /// point at a fabricated txid, or an output paying a P2SH THE MAKER controls (not our HTLC) — the
+  /// taker would reveal the preimage into a claim that can never confirm, and the maker reads it and
+  /// sweeps the taker's BTC. Fetch the leg tx from OUR OWN esplora and require: it exists + is confirmed;
+  /// output[vout] exists; its scriptpubkey == the HTLC P2SH OUR key can claim (derived independently, not
+  /// the maker's word); its asset == the agreed asset; its value >= the agreed amount. Throws on any
+  /// mismatch (fails CLOSED — never reveal). Returns the confirmed block hash from OUR esplora.
+  static Future<String> _bindSeqLegOnChain(XchainSwapRecord r) async {
+    final leg = r.seqLeg;
+    if (leg == null) throw Exception('no Sequentia leg to verify');
+    final m = await _mnemonic();
+    // The HTLC P2SH we can actually claim, derived from OUR inputs — not the maker's reported script.
+    final htlc = await core.xchainSeqHtlcForward(
+      mnemonic: m,
+      hashHex: r.hashHex,
+      makerSeqRefundPubHex: r.makerSeqRefundPub,
+      seqLocktime: r.seqLocktime,
+    );
+    final tx = await _seqTx(leg.txid);
+    if (tx == null) {
+      throw Exception('the maker\'s Sequentia leg (${leg.txid}) is not on your node yet; not revealing the secret');
+    }
+    final status = tx['status'] as Map?;
+    if (status == null || status['confirmed'] != true) {
+      throw Exception('the maker\'s Sequentia leg has not confirmed on your node yet; not revealing the secret');
+    }
+    final vouts = (tx['vout'] as List?) ?? const [];
+    if (leg.vout < 0 || leg.vout >= vouts.length) {
+      throw Exception('the maker\'s Sequentia leg output does not exist on-chain; refusing to reveal the secret');
+    }
+    final o = vouts[leg.vout] as Map?;
+    if ('${o?['scriptpubkey'] ?? ''}'.toLowerCase() != htlc.p2ShSpkHex.toLowerCase()) {
+      throw Exception('the maker\'s Sequentia leg pays a script your key cannot claim; refusing to reveal the secret');
+    }
+    if ('${o?['asset'] ?? ''}'.toLowerCase() != r.seqAsset.toLowerCase()) {
+      throw Exception('the maker\'s Sequentia leg output pays the wrong asset; refusing to reveal the secret');
+    }
+    if (_bigOf(o?['value']) < r.seqAmount) {
+      throw Exception('the maker\'s Sequentia leg output is below the agreed amount; refusing to reveal the secret');
+    }
+    final blockHash = '${status['block_hash'] ?? ''}';
+    if (blockHash.isEmpty) {
+      throw Exception('the maker\'s Sequentia leg block is unknown on your node; not revealing the secret');
+    }
+    return blockHash;
+  }
+
   /// THE REVEAL GATE. Returns the live anchor evidence; `ok==true` means safe to
   /// claim. Computed in the core from Alice's own nodes (never the maker).
   static Future<core.AnchorEvidence> checkAnchor(XchainSwapRecord r) async {
-    final leg = r.seqLeg!;
+    // Bind the leg to a real, claimable on-chain output FIRST, and resolve the anchor from the leg's OWN
+    // canonical block (from our esplora) — never the maker-reported blockHash, which could name a valid
+    // block that does not actually contain the leg.
+    final canonicalBlock = await _bindSeqLegOnChain(r);
     return core.xchainVerifySeqLegSafe(
       seqEsplora: Backend.esplora,
-      seqBlockHash: leg.blockHash,
+      seqBlockHash: canonicalBlock,
       btcLegHeight: r.btcHp,
       t4Api: Backend.testnet4,
       minDepth: kAnchorDepthD,

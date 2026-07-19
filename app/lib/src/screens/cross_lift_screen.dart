@@ -13,8 +13,13 @@ import '../widgets/widgets.dart';
 /// show the exact terms, and only on confirm lock the Bitcoin leg + settle the HTLC. The taker's BTC is
 /// always refundable after the timeout, and the secret reveals only on a verified, anchor-safe asset leg.
 class CrossLiftScreen extends StatefulWidget {
-  const CrossLiftScreen({super.key, required this.offer});
+  const CrossLiftScreen({super.key, required this.offer, this.requestedAtoms});
   final CrossOffer offer;
+
+  /// The asset amount (atoms) the user typed in the composer, if any. The cross rail lifts the chosen
+  /// offer WHOLE (no partial fill), so when the offer's size differs materially from this we say so
+  /// explicitly — otherwise a user who typed "1" could lock the Bitcoin for a 12-unit offer unaware.
+  final BigInt? requestedAtoms;
 
   @override
   State<CrossLiftScreen> createState() => _CrossLiftScreenState();
@@ -30,6 +35,16 @@ class _CrossLiftScreenState extends State<CrossLiftScreen> {
 
   String get _tk => SeqAssets.labelFor(widget.offer.seqAsset).ticker;
   int get _aprec => SeqAssets.labelFor(widget.offer.seqAsset).precision;
+
+  /// The quoted offer's whole size is materially (>2%) larger than what the user typed — worth an
+  /// explicit note so a whole-offer lift is never a silent overshoot.
+  bool get _overshoot {
+    final req = widget.requestedAtoms;
+    final q = _quote;
+    if (req == null || req <= BigInt.zero || q == null) return false;
+    final got = q.terms.assetAtoms;
+    return got > req && (got - req) * BigInt.from(100) > req * BigInt.from(2);
+  }
 
   @override
   void initState() {
@@ -162,6 +177,21 @@ class _CrossLiftScreenState extends State<CrossLiftScreen> {
             _Row('You receive', '${formatAtoms(_quote!.terms.assetAtoms.toString(), _aprec)} $_tk'),
             if (_quote!.terms.feeBtcSats > BigInt.zero)
               _Row('Maker fee', '${formatAtoms(_quote!.terms.feeBtcSats.toString(), 8)} BTC'),
+            if (_overshoot) ...[
+              const SizedBox(height: 8),
+              Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const Icon(Icons.info_outline, size: 15, color: AmbraColors.amber),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'This offer fills in full — ${formatAtoms(_quote!.terms.assetAtoms.toString(), _aprec)} $_tk, '
+                    'more than the ${formatAtoms(widget.requestedAtoms!.toString(), _aprec)} $_tk you entered. '
+                    'Partial fills are not possible on the cross rail.',
+                    style: AmbraText.sub.copyWith(color: AmbraColors.amber),
+                  ),
+                ),
+              ]),
+            ],
             _Row('Settles', 'On-chain HTLC, anchor-bound to Bitcoin (about one block each leg).'),
             _Row('If it stalls', 'Your Bitcoin is refundable after the timeout; your secret stays hidden.'),
           ]),
