@@ -22,6 +22,7 @@ import '../data/swap_route.dart';
 import '../data/trade_receipts.dart';
 import '../data/wallet_repository.dart';
 import '../data/xchain_client.dart';
+import '../data/xchain_swap_service.dart';
 import '../rust/api.dart' as core;
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
@@ -30,7 +31,6 @@ import 'lightning_swap_screen.dart';
 import 'my_orders_screen.dart';
 import 'subasset_buy_screen.dart';
 import 'subasset_sell_screen.dart';
-import 'xchain_reverse_swap_screen.dart';
 import 'xchain_swap_screen.dart';
 
 /// Estimated vByte size of a same-chain settlement tx, used to turn the optional
@@ -98,6 +98,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   bool _payRailLn = false;
   bool _recvRailLn = false;
   bool _railsTouched = false; // the user manually picked a rail -> stop auto-selecting (web S.railsTouched)
+  XchainSwapRecord? _xInFlight; // a persisted cross-swap with locked BTC needing resume/refund (banner)
 
   // This wallet's OWN Lightning channels (node_key present), from a best-effort /status fetch. Feeds
   // ln_rail's railAvailability so the composer offers/auto-selects the Lightning rail for a leg ONLY
@@ -430,6 +431,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     try {
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) return;
+      // Surface any in-flight cross-chain swap with locked BTC so its resume/refund
+      // surface (XchainSwapScreen) is REACHABLE — the courier composer path no longer
+      // opens that screen directly, so without this banner a mid-flight swap (and its
+      // CLTV refund) would be stranded off-screen.
+      try { _xInFlight = await XchainStore.inFlightWithFunds(); } catch (_) { _xInFlight = null; }
       try {
         final rates = await ApiClient.feeRates();
         if (mounted && rates.isNotEmpty) _feeRates = rates;
@@ -1103,6 +1109,10 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           const Text('Trade any Sequentia asset, or Bitcoin, from one composer. The settlement rail is chosen automatically.',
               style: AmbraText.sub),
           const SizedBox(height: 16),
+          if (_xInFlight != null) ...[
+            _inFlightCrossBanner(_xInFlight!),
+            const SizedBox(height: 14),
+          ],
           if (_loading)
             const Padding(padding: EdgeInsets.only(top: 40), child: Center(child: CircularProgressIndicator(color: AmbraColors.amber)))
           else if (_error != null)
@@ -1431,19 +1441,67 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     }
   }
 
+  /// A tappable banner for a persisted cross-chain swap that still holds locked BTC. Opens the
+  /// mature XchainSwapScreen, which resumes the record (find-by-txid, non-broadcasting) and exposes
+  /// the CLTV "Refund BTC" off-ramp — the reachable recovery surface for a courier lift.
+  Widget _inFlightCrossBanner(XchainSwapRecord r) {
+    final tk = SeqAssets.labelFor(r.seqAsset).ticker;
+    return InkWell(
+      borderRadius: BorderRadius.circular(AmbraRadii.card),
+      onTap: () async {
+        await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const XchainSwapScreen()));
+        if (mounted) _load();
+      },
+      child: AmbraCard(
+        child: Row(children: [
+          const Icon(Icons.warning_amber_rounded, color: AmbraColors.amber, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Cross-chain swap in progress · $tk', style: AmbraText.body),
+              const SizedBox(height: 2),
+              const Text('Your Bitcoin is locked. Tap to resume, or refund it after the timeout.', style: AmbraText.sub),
+            ]),
+          ),
+          const Icon(Icons.chevron_right, size: 18, color: AmbraColors.dim),
+        ]),
+      ),
+    );
+  }
+
   Future<void> _dispatchCross(SwapRoute r) async {
     final asset = r.seqAsset;
     if (asset == null || !r.isValid) return;
+
+    // On-chain cross (BTC<->asset) settles over the relay ORDER-BOOK COURIER (the durable book), NOT the
+    // retired /dex RFQ. Review = lift the best resting offer, exactly like tapping it in the book.
+    if (r.kind == SwapRouteKind.cross) {
+      if (r.payIsBtc) {
+        // BUY the asset with Bitcoin -> lift the best (cheapest) resting "buy" offer (maker sells asset).
+        CrossOffer? best;
+        for (final o in _crossOffers) {
+          if (o.makerSellsAsset) {
+            best = o;
+            break; // _crossOffers is sorted cheapest-BTC-per-asset first
+          }
+        }
+        if (best == null) {
+          _snack('No resting Bitcoin offer for ${_tk(asset)} yet — the makers post continuously; check back in a moment.');
+          return;
+        }
+        await _liftCross(best);
+      } else {
+        // SELL the asset for Bitcoin: the reverse courier direction is not live yet (buying is).
+        _snack('Selling ${_tk(asset)} for Bitcoin over the order book is coming; buying it with Bitcoin is live now.');
+      }
+      return;
+    }
+
     // The cross composer's single amount field sits on the Sequentia-asset leg (see _crossComposerChildren).
     final amtText = (_payAsset == asset ? _payAmount : _recvAmount).text.trim();
     final assetAmount = amtText.isEmpty ? null : amtText;
     final Widget? screen = switch (r.kind) {
-      // On-chain cross-chain HTLC: buy the asset with BTC, or sell it for BTC.
-      SwapRouteKind.cross => r.payIsBtc
-          ? XchainSwapScreen(seqAsset: asset, assetAmount: assetAmount)
-          : XchainReverseSwapScreen(seqAsset: asset, assetAmount: assetAmount),
-      // Sub-asset submarine swap. A BUY is denominated in BTC-to-spend (quoted in the wizard), so the
-      // asset amount is not seeded there; a SELL is denominated in the asset, so it is seeded.
+      // Sub-asset submarine swap (asset over LN + BTC on-chain) — LSP-served, not /dex.
       SwapRouteKind.mixed => r.payIsBtc
           ? SubassetBuyScreen(asset: asset)
           : SubassetSellScreen(asset: asset, assetAmount: assetAmount),
@@ -1453,7 +1511,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           initialAsset: asset,
           initialAmount: r.payIsBtc ? null : assetAmount,
         ),
-      SwapRouteKind.same || SwapRouteKind.invalid => null,
+      SwapRouteKind.cross || SwapRouteKind.same || SwapRouteKind.invalid => null,
     };
     if (screen == null) return;
     await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => screen));
