@@ -54,7 +54,12 @@ class CrossLiftService {
       step('Waiting for your Bitcoin lock to confirm (about one block)…');
       var confirmed = false;
       for (var i = 0; i < 240 && !confirmed; i++) {
-        confirmed = await XchainSwapService.pollBtcLock(rec);
+        // Guard each poll: pollBtcLock hits esplora, which throws on a transient network/500 blip.
+        // An unguarded throw here aborted the WHOLE settlement mid-wait even though the BTC is funded
+        // and refundable — swallow the transient and keep polling until the timeout.
+        try {
+          confirmed = await XchainSwapService.pollBtcLock(rec);
+        } catch (_) {/* transient; retry next tick */}
         if (!confirmed) await Future<void>.delayed(const Duration(seconds: 15));
       }
       if (!confirmed) {
