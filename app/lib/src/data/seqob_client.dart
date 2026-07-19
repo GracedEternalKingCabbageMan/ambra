@@ -4,7 +4,7 @@ import 'package:http/http.dart' as http;
 
 import '../rust/api.dart' as core;
 import 'config.dart';
-import 'seqdex_client.dart' show pick;
+import 'seqdex_client.dart' show pick, Market;
 
 /// A resting offer on the SeqOB order-book relay (a covenant SELL of `baseAsset`
 /// for `quoteAsset`). The raw JSON is kept so the covenant terms can be fed
@@ -161,6 +161,29 @@ class SeqObClient {
     }
     offers.sort((a, b) => a.priceAtomsPerBase.compareTo(b.priceAtomsPerBase));
     return OrderBook(baseAsset, quoteAsset, offers);
+  }
+
+  /// The same-chain markets the covenant book quotes. This is the SOURCE OF TRUTH
+  /// for the composer's asset pickers: the relay quotes resolvable registry ids
+  /// (the pickers must match what the book actually trades). GET /v1/markets ->
+  /// `{markets:[{pair:{base_asset,quote_asset}, ...}]}`. Never throws (returns []).
+  static Future<List<Market>> markets() async {
+    try {
+      final j = await _get('/v1/markets');
+      final list = (j['markets'] as List?) ?? (j['Markets'] as List?) ?? const [];
+      final out = <Market>[];
+      for (final e in list) {
+        if (e is! Map) continue;
+        final pr = e['pair'] ?? e['Pair'];
+        final pair = pr is Map ? pr : e;
+        final base = '${pick(pair, ['base_asset', 'baseAsset']) ?? ''}';
+        final quote = '${pick(pair, ['quote_asset', 'quoteAsset']) ?? ''}';
+        if (base.isNotEmpty && quote.isNotEmpty) out.add(Market(base, quote));
+      }
+      return out;
+    } catch (_) {
+      return const [];
+    }
   }
 
   /// Recent executed trades for (base, quote), newest first. Empty (never throws)

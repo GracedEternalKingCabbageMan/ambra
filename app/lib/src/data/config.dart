@@ -13,7 +13,11 @@ class Backend {
 
   static String _origin = defaultOrigin;
   static String get origin => _origin;
-  static set origin(String v) => _origin = _normalize(v);
+  static set origin(String v) {
+    _origin = _normalize(v);
+    applyLnForOrigin(); // Lightning follows the node: on for the default, off for a custom one.
+  }
+
   static bool get isDefault => _origin == defaultOrigin;
 
   static String get esplora => '$_origin/api';
@@ -46,15 +50,33 @@ class Backend {
 
   /// wss front of the hosted node's Noise_XK responder (a WS<->TCP relay). Absent
   /// => the on-device signer cannot come online, so the LN route stays unavailable.
-  static String lnWsUrl = '';
+  /// Defaults to the public asset LSP (the web wallet's SEQ_LSP_WS_ASSET); a custom
+  /// [NodeConfig] origin clears/replaces it (see [applyLnForOrigin]).
+  static String lnWsUrl = _defaultLnWsUrl;
 
   /// The hosted node's pinned 33-byte transport static pubkey (hex). Absent => LN
   /// unavailable (the device must authenticate the host it co-signs for).
-  static String lnHostPubkey = '';
+  static String lnHostPubkey = _defaultLnHostPubkey;
 
   /// Optional bearer token for the LSP HTTP API. When empty the LSP calls reuse
   /// the node [authHeaders] plumbing (same as /dex, /feerates).
-  static String lnToken = '';
+  static String lnToken = _defaultLnToken;
+
+  // The public testnet Lightning config (mirrors the web wallet's SEQ_LSP_* on
+  // sequentiatestnet.com). The asset node co-signs Sequentia-asset channels; it
+  // covers Instant pure-LN + the sub-asset rails (whose BTC leg stays on-chain).
+  static const _defaultLnWsUrl = 'wss://sequentiatestnet.com/lsp-ws-asset';
+  static const _defaultLnHostPubkey = '0295374d947dc7e27382a83b2034a10b3d51b6f2fdf7e7da490893e3995141523b';
+  static const _defaultLnToken = 'b5b1-d848ec96d29c01d2ff1db6cf';
+
+  /// Point Lightning at the default LSP only when the wallet talks to the default
+  /// public node; a custom node has no hosted LSP, so LN goes dark there.
+  static void applyLnForOrigin() {
+    final on = isDefault;
+    lnWsUrl = on ? _defaultLnWsUrl : '';
+    lnHostPubkey = on ? _defaultLnHostPubkey : '';
+    lnToken = on ? _defaultLnToken : '';
+  }
 
   /// Harness pinning: a fixed 64-hex device transport privkey to use instead of
   /// the seed-derived one (the twin of the web wallet's SEQ_LSP_DEV_KEY). Empty =>
@@ -151,6 +173,12 @@ class SeqAssets {
       ..clear()
       ..addAll(m);
   }
+
+  /// True when [assetId] resolves to a real label (built-in, OpenAMP, or registry)
+  /// rather than the truncated-hex placeholder — i.e. we can name it. Used to keep
+  /// unnameable dust ids (that you don't hold) out of the swap pickers.
+  static bool resolved(String assetId) =>
+      _builtin.containsKey(assetId) || _openamp.containsKey(assetId) || _registry.containsKey(assetId);
 
   static AssetLabel labelFor(String assetId) {
     // Curated demo assets are authoritative (correct even offline).
