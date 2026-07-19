@@ -23,7 +23,16 @@ final BigInt _kBtcMinerHeadroomSats = BigInt.from(1000);
 /// The reveal of the preimage is HARD-gated on the anchor check; an in-flight
 /// swap is persisted and resumable, with a BTC refund off-ramp after the timeout.
 class XchainSwapScreen extends StatefulWidget {
-  const XchainSwapScreen({super.key});
+  const XchainSwapScreen({super.key, this.seqAsset, this.assetAmount});
+
+  /// Optional composer seed: preselect the cross-chain market for this Sequentia
+  /// asset id. Falls back to the first market when null or unmatched.
+  final String? seqAsset;
+
+  /// Optional composer seed: prefill the amount of [seqAsset] to buy (a display
+  /// string). Ignored when a swap is already in flight (never clobbers a resume).
+  final String? assetAmount;
+
   @override
   State<XchainSwapScreen> createState() => _XchainSwapScreenState();
 }
@@ -62,10 +71,25 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
       if (rec != null) rec = await XchainSwapService.resumeFunding(rec);
       final markets = await XchainClient.markets();
       if (!mounted) return;
+      // Composer seed: preselect the requested market + prefill the amount, but only
+      // when nothing is in flight (a resumed swap owns the form).
+      var sel = markets.isNotEmpty ? markets.first : null;
+      final seed = widget.seqAsset;
+      if (seed != null && seed.isNotEmpty) {
+        for (final m in markets) {
+          if (m.seqAsset == seed) {
+            sel = m;
+            break;
+          }
+        }
+      }
+      if (rec == null && widget.assetAmount != null && widget.assetAmount!.trim().isNotEmpty) {
+        _amount.text = widget.assetAmount!.trim();
+      }
       setState(() {
         _rec = rec;
         _markets = markets;
-        _market = markets.isNotEmpty ? markets.first : null;
+        _market = sel;
         _loading = false;
       });
       _arm(); // resume polling for the current step
