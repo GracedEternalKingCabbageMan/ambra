@@ -4,6 +4,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
 import '../rust/api.dart' as core;
+import 'api_client.dart';
 import 'config.dart';
 import 'cross_terms.dart';
 import 'seqob_client.dart' show CrossOffer;
@@ -170,6 +171,20 @@ class XchainStore {
 
   static Future<void> save(XchainSwapRecord r) => _storage.write(key: _key, value: jsonEncode(r.toJson()));
   static Future<void> clear() => _storage.delete(key: _key);
+
+  /// A persisted swap that is NOT terminal AND has committed BTC (its HTLC is or may be
+  /// funded) — the single-slot record that a new swap would overwrite, destroying the only
+  /// refund material. Callers guard on this before starting a new lift.
+  static Future<XchainSwapRecord?> inFlightWithFunds() async {
+    final r = await load();
+    if (r == null) return null;
+    // Terminal = the taker already got the asset (seqClaimed), the maker swept the BTC
+    // (btcClaimed), or the BTC was refunded. A `failed` record from btcFunding onward may
+    // still hold locked BTC that needs the CLTV refund, so it is NOT terminal here.
+    final terminal = r.step == XStep.seqClaimed || r.step == XStep.btcClaimed || r.step == XStep.refunded;
+    final committed = r.step.index >= XStep.btcFunding.index;
+    return (!terminal && committed) ? r : null;
+  }
 }
 
 /// Drives the cross-chain swap state machine from LOCAL state, calling the core
@@ -188,6 +203,10 @@ class XchainSwapService {
   /// all before any money moves. Returns the new record (UI then funds BTC).
   static Future<XchainSwapRecord> begin(String seqAsset, BigInt seqAmount) async {
     final m = await _mnemonic();
+    if (await XchainStore.inFlightWithFunds() != null) {
+      throw Exception('You already have a cross-chain swap in progress with locked Bitcoin. '
+          'Finish or refund it first (open it from the Swap tab) before starting another.');
+    }
     final q = await XchainClient.quote(seqAsset, seqAmount);
     if (!(q.btcLocktime > q.seqLocktime)) {
       throw Exception('quote rejected: BTC timeout must exceed the Sequentia timeout');
@@ -230,6 +249,13 @@ class XchainSwapService {
   /// of a /dex quote. The caller MUST have already run validateCrossTerms(offer, terms).
   static Future<XchainSwapRecord> beginFromCourierTerms(CrossOffer offer, CrossTerms terms) async {
     final m = await _mnemonic();
+    // FUND-SAFETY: the store is single-slot, so starting a new lift would OVERWRITE an
+    // in-flight one with locked BTC, destroying its only refund keys. Refuse until the
+    // existing swap is finished or its BTC refunded (reachable from the Swap tab banner).
+    if (await XchainStore.inFlightWithFunds() != null) {
+      throw Exception('You already have a cross-chain swap in progress with locked Bitcoin. '
+          'Finish or refund it first (open it from the Swap tab) before starting another.');
+    }
     if (!(terms.btcLocktime > terms.seqLocktime)) {
       throw Exception('terms rejected: the BTC timeout must exceed the Sequentia timeout');
     }
@@ -442,6 +468,12 @@ class XchainSwapService {
     }
     final m = await _mnemonic();
     final dest = await core.receiveAddress(mnemonic: m); // Alice's own tb1 (valid SEQ addr)
+    // Size the claim fee PER-ASSET from the published rate (abstract numeraire), not a flat
+    // 100000 atoms: the fee is deducted from the claimed asset's output, so a flat atom count
+    // is below the node's min-relay floor for a low-value-per-atom asset (claim rejected) and a
+    // wasteful overpay for a valuable one. Best-effort; falls back to the flat value if the feed
+    // is unreachable. Mirrors the reverse path's _assetRefundFee.
+    final claimFee = await _seqClaimFee(leg.assetId, leg.amount);
     final claimHex = await core.xchainSeqClaim(
       mnemonic: m,
       seqTxid: leg.txid,
@@ -452,7 +484,7 @@ class XchainSwapService {
       hashHex: r.hashHex,
       makerSeqRefundPubHex: r.makerSeqRefundPub,
       seqLocktime: r.seqLocktime,
-      fee: kSeqClaimFee,
+      fee: claimFee,
       preimageHex: r.secretHex,
     );
     final txid = await core.xchainSeqBroadcast(seqEsplora: Backend.esplora, txHex: claimHex);
@@ -461,6 +493,27 @@ class XchainSwapService {
       ..step = XStep.seqClaimed;
     await XchainStore.save(r);
     return r;
+  }
+
+  /// The SEQ-claim fee in atoms of the CLAIMED asset: convert the native policy fee at the
+  /// asset's published rate (atoms per 1e8 native), min 1 atom, capped at half the output.
+  /// Best-effort feed fetch; the flat [kSeqClaimFee] is the fallback when the feed is down.
+  static Future<BigInt> _seqClaimFee(String assetHex, BigInt amount) async {
+    Map<String, BigInt> rates;
+    try {
+      rates = await ApiClient.feeRates();
+    } catch (_) {
+      return kSeqClaimFee;
+    }
+    final ticker = SeqAssets.labelFor(assetHex).ticker;
+    final scale = BigInt.from(100000000);
+    final rate = rates[ticker] ?? rates[assetHex] ?? scale;
+    final native = BigInt.from(400); // ~vbytes * 1 sat/vB, matching the reverse refund sizing
+    var fee = (native * scale + rate - BigInt.one) ~/ rate; // ceil(native * scale / rate)
+    if (fee < BigInt.one) fee = BigInt.one;
+    final half = amount ~/ BigInt.two;
+    if (half >= BigInt.one && fee > half) fee = half;
+    return fee;
   }
 
   /// Observe the maker sweeping the BTC (the swap completing). Tolerates a daemon

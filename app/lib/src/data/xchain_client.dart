@@ -91,7 +91,10 @@ class XSeqLeg {
         anchorHeight: _int(pick(m, ['anchor_height', 'anchorHeight'])),
         redeemScript: _str(pick(m, ['redeem_script', 'redeemScript'])),
         amount: _big(pick(m, ['amount'])),
-        assetId: _str(pick(m, ['asset_id', 'assetId'])),
+        // The courier maker (Go XcLeg) sends the SEQ leg's asset under 'asset';
+        // the /dex daemon used 'asset_id'. Read BOTH, or verifyLeg throws "wrong
+        // asset" on EVERY courier cross lift (assetId would parse empty).
+        assetId: _str(pick(m, ['asset', 'asset_id', 'assetId'])),
       );
   Map<String, dynamic> toJson() => {
         'txid': txid,
