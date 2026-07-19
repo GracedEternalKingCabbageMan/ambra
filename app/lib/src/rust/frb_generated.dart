@@ -65,7 +65,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => 1827527174;
+  int get rustContentHash => 1776756643;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -475,6 +475,13 @@ abstract class RustLibApi extends BaseApi {
   });
 
   Future<String> crateApiXchainSeqClaimPubkey({required String mnemonic});
+
+  Future<SeqHtlcInfo> crateApiXchainSeqHtlcForward({
+    required String mnemonic,
+    required String hashHex,
+    required String makerSeqRefundPubHex,
+    required int seqLocktime,
+  });
 
   Future<SeqHtlcInfo> crateApiXchainSeqHtlcReverse({
     required String mnemonic,
@@ -3379,6 +3386,50 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<SeqHtlcInfo> crateApiXchainSeqHtlcForward({
+    required String mnemonic,
+    required String hashHex,
+    required String makerSeqRefundPubHex,
+    required int seqLocktime,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(mnemonic, serializer);
+          sse_encode_String(hashHex, serializer);
+          sse_encode_String(makerSeqRefundPubHex, serializer);
+          sse_encode_u_32(seqLocktime, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 78,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_seq_htlc_info,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiXchainSeqHtlcForwardConstMeta,
+        argValues: [mnemonic, hashHex, makerSeqRefundPubHex, seqLocktime],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiXchainSeqHtlcForwardConstMeta =>
+      const TaskConstMeta(
+        debugName: "xchain_seq_htlc_forward",
+        argNames: [
+          "mnemonic",
+          "hashHex",
+          "makerSeqRefundPubHex",
+          "seqLocktime",
+        ],
+      );
+
+  @override
   Future<SeqHtlcInfo> crateApiXchainSeqHtlcReverse({
     required String mnemonic,
     required String hashHex,
@@ -3396,7 +3447,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 78,
+            funcId: 79,
             port: port_,
           );
         },
@@ -3435,7 +3486,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 79,
+            funcId: 80,
             port: port_,
           );
         },
@@ -3489,7 +3540,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 80,
+            funcId: 81,
             port: port_,
           );
         },
@@ -3549,7 +3600,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 81,
+            funcId: 82,
             port: port_,
           );
         },

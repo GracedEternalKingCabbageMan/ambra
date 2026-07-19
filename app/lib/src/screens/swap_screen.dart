@@ -463,10 +463,16 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       var lnCh = const <Map>[];
       if (LightningService.instance.configured) {
         try {
-          final nodes = <String>[
+          // Derive a node key for EVERY registry-known asset, not just assets with an on-chain balance:
+          // an asset held only INSIDE a channel (a sub-asset JIT-inbound buy, or all of it Moved to
+          // Lightning) has zero on-chain balance yet still has a node + channel. Keying off balances
+          // alone hid that channel, so the LN rail was falsely gated off with a "Move to Lightning" hint
+          // for funds already there. Set-dedup; union the balance assets in case any sit outside registry.
+          final nodes = <String>{
             lnkeys.ownNodeKeyForBtc(m),
+            for (final id in SeqAssets.resolvedIds) lnkeys.ownNodeKeyForAsset(m, id),
             for (final b in s.balances) lnkeys.ownNodeKeyForAsset(m, b.assetId),
-          ];
+          }.toList();
           final st = await LightningService.instance.getStatus(nodes: nodes);
           lnCh = ((st.raw['channels'] as List?) ?? const []).whereType<Map>().toList();
         } catch (_) {/* best-effort; toggles still work, the notes just say "no channel yet" */}
@@ -1096,10 +1102,16 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         ? route(_payAsset, _receiveAsset,
             payRailLn: _payRailLn, recvRailLn: _recvRailLn, lnAvailable: LightningService.instance.available)
         : null;
+    // The reverse (asset -> BTC on-chain) cross courier is NOT built, so a cross SELL is a dead rail:
+    // route() still returns kind=cross/isValid=true, which would enable Review on a settlement that only
+    // yields a "coming" snack. Treat it as not-actionable and explain inline (route summary), pointing at
+    // the live sell rails (pure-LN / sub-asset), instead of an enabled button that promises settlement.
+    final crossSellDead = isCross && r != null && r.kind == SwapRouteKind.cross && !r.payIsBtc;
     final canAct = !_loading &&
         _error == null &&
         _payAsset != null &&
         _receiveAsset != null &&
+        !crossSellDead &&
         (!isCross || (r?.isValid ?? false));
     return Column(children: [
       Expanded(
@@ -1261,7 +1273,15 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   /// offers rest durably. Read-only for now (lifting runs the interactive courier in the swap wizard).
   Widget _crossBookPanel(String? asset) {
     if (asset == null) return const SizedBox.shrink();
-    final offers = _crossOffers;
+    // Split by direction and slice EACH side, else a single ascending sort + take(N) hides the entire
+    // tappable BUY side whenever enough reverse bids rest (true on every live BTC market). Asks (maker
+    // sells the asset -> the taker BUYS, tappable) go cheapest-first = best; bids (the taker could sell)
+    // richest-first = best. Show the best few of each so the ladder reflects the real two-sided market.
+    final asks = _crossOffers.where((o) => o.makerSellsAsset).toList()
+      ..sort((a, b) => a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom));
+    final bids = _crossOffers.where((o) => !o.makerSellsAsset).toList()
+      ..sort((a, b) => b.btcPerAssetAtom.compareTo(a.btcPerAssetAtom));
+    final offers = [...asks.take(5), ...bids.take(5)];
     final aprec = SeqAssets.labelFor(asset).precision;
     final tk = _tk(asset);
     return Padding(
@@ -1270,13 +1290,13 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
             Text('$tk / BTC order book', style: AmbraText.body),
-            Text(offers.isEmpty ? 'no offers yet' : '${offers.length} resting', style: AmbraText.sub),
+            Text(_crossOffers.isEmpty ? 'no offers yet' : '${_crossOffers.length} resting', style: AmbraText.sub),
           ]),
           const SizedBox(height: 8),
           if (offers.isEmpty)
             const Text('No resting offers for this pair yet. Place an order to start the market.', style: AmbraText.sub)
           else ...[
-            for (final o in offers.take(8))
+            for (final o in offers)
               // A maker SELLING the asset (for BTC) is a BUY the taker can lift now (lock BTC -> get the
               // asset). The reverse (maker gives BTC) is the sell direction — read-only until the reverse
               // courier lands.
@@ -1409,7 +1429,13 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   /// Lightning leg has no usable channel yet (so we never promise a bare "Instant" before one opens).
   Widget _routeSummary(SwapRoute r) {
     var text = r.timing;
-    if (r.kind == SwapRouteKind.ln || r.kind == SwapRouteKind.mixed) {
+    // Dead rail: selling an asset for BTC on-chain (reverse cross courier) isn't built. Say so plainly
+    // and point at the live sell rails, instead of the timing line that reads as a promise of settlement.
+    final crossSellDead = r.kind == SwapRouteKind.cross && !r.payIsBtc;
+    if (crossSellDead) {
+      text = 'Selling ${_tk(r.seqAsset)} for Bitcoin on-chain is not available yet. '
+          'Turn on the Lightning rail to sell over pure-LN, or use a sub-asset sell.';
+    } else if (r.kind == SwapRouteKind.ln || r.kind == SwapRouteKind.mixed) {
       final ra = _railAvail();
       final payUnready = r.payRail == 'ln' && ra != null && !ra.payLn.ok;
       final recvUnready = r.recvRail == 'ln' && ra != null && !ra.recvLn.ok;
@@ -1419,7 +1445,8 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     }
     return AmbraCard(
       child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Icon(r.kind == SwapRouteKind.ln ? Icons.bolt : Icons.schedule, size: 18, color: AmbraColors.amber),
+        Icon(crossSellDead ? Icons.info_outline : (r.kind == SwapRouteKind.ln ? Icons.bolt : Icons.schedule),
+            size: 18, color: AmbraColors.amber),
         const SizedBox(width: 10),
         Expanded(child: Text(text, style: AmbraText.sub)),
       ]),
@@ -1433,8 +1460,18 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   /// their fund-safety internals.
   /// Lift a resting cross (BTC->asset) offer from the book: open the courier lift wizard, then refresh
   /// the book + balances on return.
-  Future<void> _liftCross(CrossOffer o) async {
-    await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => CrossLiftScreen(offer: o)));
+  /// The asset amount (atoms) the user typed in the cross composer, if any — the amount field sits on
+  /// whichever leg is the Sequentia asset (_payAmount when paying the asset, _recvAmount when buying it).
+  BigInt? _typedAssetAtoms(String asset, int aprec) {
+    final t = (_payAsset == asset ? _payAmount : _recvAmount).text.trim();
+    if (t.isEmpty) return null;
+    final a = parseAtoms(t, aprec);
+    return (a != null && a > BigInt.zero) ? a : null;
+  }
+
+  Future<void> _liftCross(CrossOffer o, {BigInt? requestedAtoms}) async {
+    await Navigator.of(context)
+        .push(MaterialPageRoute<void>(builder: (_) => CrossLiftScreen(offer: o, requestedAtoms: requestedAtoms)));
     if (mounted) {
       _fetchBook();
       _load();
@@ -1477,19 +1514,25 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     // retired /dex RFQ. Review = lift the best resting offer, exactly like tapping it in the book.
     if (r.kind == SwapRouteKind.cross) {
       if (r.payIsBtc) {
-        // BUY the asset with Bitcoin -> lift the best (cheapest) resting "buy" offer (maker sells asset).
-        CrossOffer? best;
-        for (final o in _crossOffers) {
-          if (o.makerSellsAsset) {
-            best = o;
-            break; // _crossOffers is sorted cheapest-BTC-per-asset first
-          }
-        }
-        if (best == null) {
+        // BUY the asset with Bitcoin. The rail lifts one resting "buy" offer (maker sells the asset) IN
+        // FULL — so pick the offer CLOSEST in size to what the user typed (tie-break cheaper), not just
+        // the cheapest, else typing "1" could lift a 60-unit offer. With no typed amount, the cheapest.
+        final aprec = SeqAssets.labelFor(asset).precision;
+        final reqAtoms = _typedAssetAtoms(asset, aprec);
+        final asks = _crossOffers.where((o) => o.makerSellsAsset).toList();
+        if (asks.isEmpty) {
           _snack('No resting Bitcoin offer for ${_tk(asset)} yet — the makers post continuously; check back in a moment.');
           return;
         }
-        await _liftCross(best);
+        if (reqAtoms != null && reqAtoms > BigInt.zero) {
+          asks.sort((a, b) {
+            final c = (a.assetAtoms - reqAtoms).abs().compareTo((b.assetAtoms - reqAtoms).abs());
+            return c != 0 ? c : a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom);
+          });
+        } else {
+          asks.sort((a, b) => a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom));
+        }
+        await _liftCross(asks.first, requestedAtoms: reqAtoms);
       } else {
         // SELL the asset for Bitcoin: the reverse courier direction is not live yet (buying is).
         _snack('Selling ${_tk(asset)} for Bitcoin over the order book is coming; buying it with Bitcoin is live now.');

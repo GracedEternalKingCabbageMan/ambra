@@ -1263,6 +1263,38 @@ pub fn xchain_seq_htlc_reverse(
     })
 }
 
+/// The SEQ-leg HTLC info for a FORWARD (BTC -> asset) swap: the redeemScript PLUS its Sequentia P2SH
+/// address/spk. Here the MAKER funds this leg and the TAKER claims it with the preimage (IF branch,
+/// claim = the taker's own canonical SEQ key), the maker refunding after `seq_locktime` (refund =
+/// `maker_seq_refund_pub_hex`) — the exact script [`xchain_seq_redeem_script`] rebuilds. Exposing the
+/// P2SH spk lets the forward taker BIND the maker's reported leg to a REAL on-chain output (existence +
+/// script + asset + value) before it reveals the secret, closing the "maker reports a fabricated or
+/// wrong-script leg" reveal-into-nothing attack. Pure derivation from the same inputs — no network.
+pub fn xchain_seq_htlc_forward(
+    mnemonic: String,
+    hash_hex: String,
+    maker_seq_refund_pub_hex: String,
+    seq_locktime: u32,
+) -> Result<SeqHtlcInfo> {
+    let redeem_hex = lwk_wollet::btc::xchain::seq_redeem_script_hex(
+        &btc_params(),
+        &mnemonic,
+        lwk_wollet::btc::xchain::PathMode::Canonical,
+        &hash_hex,
+        &maker_seq_refund_pub_hex,
+        seq_locktime,
+    )
+    .map_err(rerr)?;
+    let redeem = lwk_wollet::elements::Script::from(hexbytes(&redeem_hex)?);
+    // Sequentia P2SH (p2sh_prefix 196, byte-identical to Bitcoin testnet), under the SEQUENTIA params.
+    let address = lwk_wollet::elements::Address::p2sh(&redeem, None, crate::sequentia_testnet().address_params());
+    Ok(SeqHtlcInfo {
+        redeem_script_hex: redeem_hex,
+        p2sh_spk_hex: tohex(address.script_pubkey().as_bytes()),
+        p2sh_address: address.to_string(),
+    })
+}
+
 /// Build the taker's BTC CLAIM (reverse swap): spend the maker's funded BTC HTLC
 /// via the IF/preimage branch to `dest_address`, paying `amount - fee`. Only call
 /// once the maker has revealed the preimage on the SEQ leg (read it with
