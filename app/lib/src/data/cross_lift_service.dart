@@ -1,3 +1,4 @@
+import '../rust/api.dart' as core;
 import 'cross_courier.dart';
 import 'cross_terms.dart';
 import 'seqob_client.dart' show CrossOffer;
@@ -93,8 +94,29 @@ class CrossLiftService {
       // 5. Verify the leg + anchor + T_seq race, THEN claim (reveals the secret). Never reveal on a bad leg.
       step('Verifying the asset leg is anchored to Bitcoin…');
       await XchainSwapService.verifyLeg(rec);
-      final ev = await XchainSwapService.checkAnchor(rec);
-      if (!ev.ok) {
+      // LOOP the anchor gate (mirror the web awaitAnchor) instead of a single shot: a transient esplora
+      // lag, or a leg block a beat from confirming, should WAIT rather than abort the whole lift.
+      // checkAnchor throws while the leg is unconfirmed/unbindable and returns ok:false until the anchor
+      // is deep enough — keep waiting, but bail to the refund the moment claiming would start racing the
+      // maker's SEQ refund window (seqRefundRaceSafe). The secret is never revealed while waiting. ~40 min
+      // budget at 20s/tick; past that the record stays resumable from the in-flight banner.
+      core.AnchorEvidence? ev;
+      for (var i = 0; i < 120 && (ev == null || !ev.ok); i++) {
+        if (!await XchainSwapService.seqRefundRaceSafe(rec)) {
+          await courier.fail('anchor_unsafe', 'too close to the maker SEQ refund window');
+          throw Exception(
+              'The asset leg did not become claimable before the maker\'s refund window; your secret was NOT revealed and your Bitcoin is refundable after block ${rec.btcLocktime}.');
+        }
+        try {
+          ev = await XchainSwapService.checkAnchor(rec);
+        } catch (_) {
+          ev = null; // transient / not-yet-confirmed — wait and retry
+        }
+        if (ev != null && ev.ok) break;
+        step('Waiting for the asset block to confirm and anchor to Bitcoin…');
+        await Future<void>.delayed(const Duration(seconds: 20));
+      }
+      if (ev == null || !ev.ok) {
         await courier.fail('anchor_unsafe', 'asset leg not anchor-safe');
         throw Exception(
             'The asset leg is not anchored safely yet; your secret was NOT revealed and your Bitcoin is refundable after block ${rec.btcLocktime}.');

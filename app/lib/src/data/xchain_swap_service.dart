@@ -567,15 +567,26 @@ class XchainSwapService {
   /// asset's published rate (atoms per 1e8 native), min 1 atom, capped at half the output.
   /// Best-effort feed fetch; the flat [kSeqClaimFee] is the fallback when the feed is down.
   static Future<BigInt> _seqClaimFee(String assetHex, BigInt amount) async {
+    final ticker = SeqAssets.labelFor(assetHex).ticker;
     Map<String, BigInt> rates;
     try {
       rates = await ApiClient.feeRates();
     } catch (_) {
-      return kSeqClaimFee;
+      // Never fall back to a flat fee we cannot verify clears the per-asset producer floor. An unmineable
+      // claim leaves the preimage public while the leg sits unmined; once the tip reaches T_seq the maker
+      // refunds the asset leg and sweeps the taker's BTC with that secret. Refuse — the secret stays
+      // hidden and the leg claimable, so the claim retries once the feed is back.
+      throw Exception(
+          'The Sequentia fee rate is unavailable, so the claim fee cannot be sized safely; your secret was NOT revealed. This retries automatically.');
     }
-    final ticker = SeqAssets.labelFor(assetHex).ticker;
     final scale = BigInt.from(100000000);
-    final rate = rates[ticker] ?? rates[assetHex] ?? scale;
+    // Require a REAL per-asset rate: the old `?? scale` fallback assumed 1:1 with tSEQ, under-feeing a
+    // high-value asset's claim below the producer floor (the same unmined-claim -> BTC-swept risk).
+    final rate = rates[ticker] ?? rates[assetHex];
+    if (rate == null || rate <= BigInt.zero) {
+      throw Exception(
+          'No Sequentia fee rate for $ticker, so the claim fee cannot be sized safely; your secret was NOT revealed.');
+    }
     final native = BigInt.from(400); // ~vbytes * 1 sat/vB, matching the reverse refund sizing
     var fee = (native * scale + rate - BigInt.one) ~/ rate; // ceil(native * scale / rate)
     if (fee < BigInt.one) fee = BigInt.one;
