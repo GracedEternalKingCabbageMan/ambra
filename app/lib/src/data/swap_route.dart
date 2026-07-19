@@ -101,8 +101,8 @@ class SwapRoute {
 SwapRoute route(
   String? pay,
   String? recv, {
-  bool payRailLn = false,
-  bool recvRailLn = false,
+  bool? payRailLn, // settlement preference; NULL = unselected (no default). Treated as on-chain for
+  bool? recvRailLn, // the route KIND (so the book/quote renders); the UI gates placement on both != null.
   bool lnAvailable = true,
 }) {
   if (pay == null || recv == null || pay.isEmpty || recv.isEmpty || pay == recv) {
@@ -117,11 +117,11 @@ SwapRoute route(
   }
   final payIsBtc = pay == kBtcSentinel;
   final seqAsset = payIsBtc ? recv : pay;
-  // HONEST gating: a leg may sit on 'ln' only while Lightning is available. Any 'ln'
-  // preference is downgraded to 'chain' here, so stale rail state can never route
-  // into a dead Lightning path — the proven cross rail is the fallback.
-  var p = lnAvailable && payRailLn ? 'ln' : 'chain';
-  var r = lnAvailable && recvRailLn ? 'ln' : 'chain';
+  // HONEST gating: a leg may sit on 'ln' only while Lightning is available. A null (unselected) or
+  // downgraded 'ln' preference resolves to 'chain' here, so the book/quote always renders and a stale
+  // rail state can never route into a dead Lightning path — the proven cross rail is the fallback.
+  var p = lnAvailable && (payRailLn ?? false) ? 'ln' : 'chain';
+  var r = lnAvailable && (recvRailLn ?? false) ? 'ln' : 'chain';
   // Ambra serves three BTC<->asset shapes: pure-LN (both legs on Lightning), sub-asset (the ASSET leg
   // on Lightning + the BTC leg on-chain), and cross (both on-chain). The fourth shape — SUBMARINE, the
   // BTC leg on Lightning + the ASSET leg on-chain — is not yet built on mobile, so degrade its
