@@ -18,7 +18,19 @@ import '../widgets/widgets.dart';
 /// so there is no per-keystroke quote round-trip — pick a direction + asset +
 /// amount and settle; the exact base/quote amounts come back in the response.
 class LightningSwapScreen extends StatefulWidget {
-  const LightningSwapScreen({super.key});
+  const LightningSwapScreen({super.key, this.initialSide, this.initialAsset, this.initialAmount});
+
+  /// Optional composer seed: 'buy' (BTC -> asset) or 'sell' (asset -> BTC).
+  final String? initialSide;
+
+  /// Optional composer seed: preselect this asset id/ticker (added to the picker
+  /// if the hosted node did not report it).
+  final String? initialAsset;
+
+  /// Optional composer seed: prefill the amount field (a display string). The unit
+  /// follows the side: BTC to spend for 'buy', asset to sell for 'sell'.
+  final String? initialAmount;
+
   @override
   State<LightningSwapScreen> createState() => _LightningSwapScreenState();
 }
@@ -60,10 +72,22 @@ class _LightningSwapScreenState extends State<LightningSwapScreen> {
     if (assets.isEmpty) {
       assets = SeqAssets.faucetAssets.where((a) => a.isNotEmpty).map(_idForTicker).toList();
     }
+    // Composer seed: preselect the requested asset (adding it to the picker if the
+    // hosted node did not report it), side, and amount.
+    var asset = assets.isNotEmpty ? assets.first : null;
+    final seedAsset = widget.initialAsset;
+    if (seedAsset != null && seedAsset.isNotEmpty) {
+      if (!assets.contains(seedAsset)) assets = [seedAsset, ...assets];
+      asset = seedAsset;
+    }
+    if (widget.initialAmount != null && widget.initialAmount!.trim().isNotEmpty) {
+      _amount.text = widget.initialAmount!.trim();
+    }
     if (!mounted) return;
     setState(() {
       _assets = assets;
-      _asset = assets.isNotEmpty ? assets.first : null;
+      _asset = asset;
+      if (widget.initialSide == 'buy' || widget.initialSide == 'sell') _side = widget.initialSide!;
       _loading = false;
     });
   }

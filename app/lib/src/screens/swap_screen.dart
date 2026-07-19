@@ -8,6 +8,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../data/api_client.dart';
+import '../data/btc_state.dart';
 import '../data/config.dart';
 import '../data/format.dart';
 import '../data/lightning_service.dart';
@@ -15,10 +16,10 @@ import '../data/placed_orders.dart';
 import '../data/price_service.dart';
 import '../data/seqdex_client.dart';
 import '../data/seqob_client.dart';
-import '../data/subasset_buy_service.dart';
-import '../data/subasset_sell_service.dart';
+import '../data/swap_route.dart';
 import '../data/trade_receipts.dart';
 import '../data/wallet_repository.dart';
+import '../data/xchain_client.dart';
 import '../rust/api.dart' as core;
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
@@ -44,10 +45,12 @@ final BigInt _kScale = BigInt.from(100000000);
 /// the asset `vol` is denominated in (the candle feed's base/size asset).
 typedef _PairStats = ({List<double> pts, double changePct, double hi, double lo, BigInt vol, String sizeAsset});
 
-/// SeqOB same-chain order book: TAKE (lift a resting covenant offer) or POST (rest
-/// your own signed LIMIT order). Pay one Sequentia asset, receive another, settled
-/// by the passive covenant CLOB ("the order is the coin"). Cross-chain BTC swaps
-/// and the Lightning rail live behind the buttons at the top.
+/// Unified, rail-agnostic swap composer. Pick what you pay and what you receive —
+/// BTC is a first-class picker asset alongside every Sequentia asset — and the
+/// composer routes the settlement automatically ([route]): a same-chain pair
+/// settles on the passive covenant CLOB (TAKE a resting offer or POST your own
+/// LIMIT order, "the order is the coin"); a BTC pair dispatches to the cross-chain
+/// HTLC, pure-Lightning, or sub-asset submarine flow, with a per-leg rail toggle.
 class SwapTab extends StatefulWidget {
   const SwapTab({super.key, this.isActive = false});
   final bool isActive;
@@ -74,6 +77,9 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   final _feeRateCtl = TextEditingController();
 
   List<Market> _markets = [];
+  // Cross-chain (BTC <-> Sequentia asset) markets. Their presence is what makes BTC
+  // a first-class picker asset and sources every BTC pair the composer can route.
+  List<XchainMarket> _xmarkets = [];
   List<core.AssetBalance> _balances = [];
   Map<String, BigInt> _feeRates = {};
   int _tipHeight = 0;
@@ -82,16 +88,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   String? _receiveAsset;
   String? _feeAsset; // null => default (the paid asset)
 
-  // Sub-asset (asset over Lightning <-> BTC on-chain HTLC) rail availability for the current composer
-  // assets, probed from the LSP book — mirrors the web's subassetCapable/sellCapable dynamic gating.
-  // The `*InFlight` flags keep the entry reachable to resume/refund an in-flight swap even if live
-  // counterparty liquidity has since dried up (fund-safety).
-  bool _subBuyAvail = false;
-  bool _subSellAvail = false;
-  bool _subBuyInFlight = false;
-  bool _subSellInFlight = false;
-  String? _subBuyAsset; // the in-flight buy's asset (so its entry stays reachable even off-pair)
-  String? _subSellAsset; // the in-flight sell's asset
+  // Per-leg Lightning rail preferences for a BTC pair (mirrors the web's #swRailPicks). Fed into
+  // [route]: both on-chain -> cross-chain HTLC; both on Lightning -> pure-LN; one each -> submarine.
+  // Only meaningful (and only shown) for a BTC pair while Lightning is available; reset on a pair change.
+  bool _payRailLn = false;
+  bool _recvRailLn = false;
 
   // Book namespace: Unblinded (transparent, the default, byte-identical to the
   // live covenant rail) vs Blinded (confidential). The Blinded book routes to the
@@ -150,6 +151,9 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // Repaint when Lightning comes up / goes down: it gates the rail toggles and the
+    // route a BTC pair resolves to (the composer no longer wraps a ListenableBuilder).
+    LightningService.instance.addListener(_onLnChanged);
     _payAmount.addListener(_onPayChanged);
     _recvAmount.addListener(_onRecvChanged);
     _startPoll();
@@ -185,6 +189,12 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       _selected = null;
       _modeTouched = false;
       if (_confBook) _mode = 'post'; // Blinded book: post-only (lift needs co-sign).
+      if (_confBook && (_payAsset == kBtcSentinel || _receiveAsset == kBtcSentinel)) {
+        // The blinded book is Sequentia-only: drop a BTC pick and fall back to a same-chain pair.
+        final pays = _payableAssets();
+        _payAsset = pays.isNotEmpty ? pays.first : null;
+        _reconcileReceive();
+      }
       _actionError = null;
     });
     try {
@@ -203,6 +213,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   void dispose() {
     _poll?.cancel();
     WidgetsBinding.instance.removeObserver(this);
+    LightningService.instance.removeListener(_onLnChanged);
     _payAmount.removeListener(_onPayChanged);
     _recvAmount.removeListener(_onRecvChanged);
     _payAmount.dispose();
@@ -219,6 +230,19 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     if (active) _pollTick();
   }
 
+  /// Lightning came up or went down: repaint so the rail toggles and route summary
+  /// reflect it. When Lightning drops, forget any stale LN rail pick so a BTC pair
+  /// falls back to the proven on-chain cross route.
+  void _onLnChanged() {
+    if (!mounted) return;
+    setState(() {
+      if (!LightningService.instance.available) {
+        _payRailLn = false;
+        _recvRailLn = false;
+      }
+    });
+  }
+
   // --- live market data ------------------------------------------------------
 
   void _startPoll() {
@@ -233,7 +257,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     if (!mounted || !_appActive || _refreshing) return;
     if (_loading || _bookLoading) return; // a full load / pair-change fetch owns it
     final pay = _payAsset, recv = _receiveAsset;
-    if (pay == null || recv == null || pay == recv) return;
+    if (pay == null || recv == null || pay == recv || _isCrossPair) return; // BTC pairs have no covenant book
     _refreshing = true;
     try {
       await _refreshBookQuiet(pay, recv);
@@ -398,10 +422,19 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       // from the seqob markets (resolvable registry ids), not the /dex daemon (whose
       // reissued ids resolve to neither built-in nor registry -> hex placeholders).
       final markets = await SeqObClient.markets();
+      // Cross-chain BTC<->asset markets (best-effort): their presence is what makes BTC a first-class
+      // picker asset. Absence just hides BTC routes; it never blocks the same-chain composer.
+      List<XchainMarket> xmarkets;
+      try {
+        xmarkets = await XchainClient.markets();
+      } catch (_) {
+        xmarkets = const [];
+      }
       final s = await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
       if (!mounted) return;
       setState(() {
         _markets = markets;
+        _xmarkets = xmarkets;
         _balances = s.balances;
         _tipHeight = s.tipHeight;
         _error = null;
@@ -412,7 +445,6 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       });
       _cache();
       _fetchBook();
-      unawaited(_probeSubasset());
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -423,63 +455,12 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     }
   }
 
-  /// Probe the sub-asset book for the current receive (BUY) + pay (SELL) assets, and whether an
-  /// in-flight sub-asset swap is persisted, to gate the two "over Lightning · BTC on-chain" entry
-  /// buttons. Best-effort + dormant unless Lightning is available. Mirrors the web's
-  /// subassetCapable/sellCapable: a rail lights only when REAL resting counterparty liquidity exists.
-  Future<void> _probeSubasset() async {
-    // Whether a persisted swap needs resuming does NOT depend on live liquidity — read the records
-    // either way so the entry stays reachable (to refund/retry) even if the maker has since gone.
-    final buyRec = await SubBuyStore.load();
-    final sellRec = await SubSellStore.load();
-    final buyInFlight = buyRec != null && buyRec.inFlight;
-    final sellInFlight = sellRec != null && sellRec.inFlight;
-    var buyAvail = false, sellAvail = false;
-    if (LightningService.instance.available) {
-      final recv = _receiveAsset, pay = _payAsset;
-      if (recv != null) {
-        try {
-          buyAvail = (await LightningService.instance.subassetBook(recv)).buyAvailable;
-        } catch (_) {/* dynamic gating: no book => rail dark */}
-      }
-      if (pay != null) {
-        try {
-          sellAvail = (await LightningService.instance.subassetBook(pay)).sellAvailable;
-        } catch (_) {}
-      }
-    }
-    if (!mounted) return;
-    setState(() {
-      _subBuyAvail = buyAvail;
-      _subSellAvail = sellAvail;
-      _subBuyInFlight = buyInFlight;
-      _subSellInFlight = sellInFlight;
-      _subBuyAsset = buyInFlight ? buyRec.asset : null;
-      _subSellAsset = sellInFlight ? sellRec.asset : null;
-    });
-  }
-
-  /// Open the sub-asset BUY screen for the composer's receive asset (or the in-flight buy's asset),
-  /// then re-probe availability on return.
-  Future<void> _openSubBuy() async {
-    final asset = _subBuyAsset ?? _receiveAsset;
-    if (asset == null) return;
-    await Navigator.of(context).push(MaterialPageRoute(builder: (_) => SubassetBuyScreen(asset: asset)));
-    await _probeSubasset();
-  }
-
-  /// Open the sub-asset SELL screen for the composer's pay asset (or the in-flight sell's asset), then
-  /// re-probe availability on return.
-  Future<void> _openSubSell() async {
-    final asset = _subSellAsset ?? _payAsset;
-    if (asset == null) return;
-    await Navigator.of(context).push(MaterialPageRoute(builder: (_) => SubassetSellScreen(asset: asset)));
-    await _probeSubasset();
-  }
-
   // --- asset sets ------------------------------------------------------------
 
   String _bal(String hex) {
+    // BTC is the parent-chain leg: its balance comes from the shared Bitcoin state,
+    // not the Sequentia asset balances, so it formats like any other picker asset.
+    if (hex == kBtcSentinel) return BtcState.instance.last?.balanceSats ?? '0';
     for (final b in _balances) {
       if (b.assetId == hex) return b.atoms;
     }
@@ -502,18 +483,52 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     return set;
   }
 
-  /// Assets you can pay with: every asset the book trades, named (resolvable) or
-  /// held. NOT filtered to holdings — like the web wallet you may select any asset
-  /// and the review/balance check gates the actual trade, so an empty wallet still
-  /// sees the full market (fixes "pay only shows tSEQ"). Unnameable dust you don't
-  /// hold is dropped so no hex placeholders surface.
-  List<String> _payableAssets() =>
-      _counterparts(null).where((h) => SeqAssets.resolved(h) || _holds(h)).toList();
+  /// The Sequentia assets that have a cross-chain (BTC) market — the assets BTC can
+  /// pair with. Every BTC pair the composer offers is backed by one of these, so the
+  /// cross/ln/mixed flows always find their market when seeded.
+  Set<String> _btcMarketAssets() => {for (final m in _xmarkets) m.seqAsset};
 
-  /// Assets that trade against the chosen pay asset (named or held).
-  List<String> _receivableAssets() => _counterparts(_payAsset)
-      .where((h) => h != _payAsset && (SeqAssets.resolved(h) || _holds(h)))
-      .toList();
+  /// BTC is offered as a composer asset only on the transparent book (BTC lives on
+  /// the parent chain, which has no confidential transactions, so a BTC leg cannot
+  /// blind) and only when a cross-chain market exists.
+  bool get _btcOffered => _xmarkets.isNotEmpty && !_confBook;
+
+  /// True when either leg is BTC — a cross pair, routed off the same-chain book.
+  bool get _isCrossPair => _payAsset == kBtcSentinel || _receiveAsset == kBtcSentinel;
+
+  /// Assets you can pay with: every asset the book trades, plus every asset with a
+  /// BTC market, plus BTC itself (when offered). Named (resolvable) or held — NOT
+  /// filtered to holdings, so an empty wallet still sees the full market (the
+  /// review/balance check gates the actual trade). Unnameable dust you do not hold
+  /// is dropped so no hex placeholders surface. BTC is added LAST so the default
+  /// pay asset stays a Sequentia asset (a same-chain pair by default).
+  List<String> _payableAssets() {
+    final set = <String>{};
+    for (final h in _counterparts(null)) {
+      if (SeqAssets.resolved(h) || _holds(h)) set.add(h);
+    }
+    for (final a in _btcMarketAssets()) {
+      if (SeqAssets.resolved(a) || _holds(a)) set.add(a);
+    }
+    if (_btcOffered) set.add(kBtcSentinel);
+    return set.toList();
+  }
+
+  /// Assets that can be received against the chosen pay asset. When paying BTC, any
+  /// asset with a BTC market is a counterpart; otherwise the same-chain counterparts
+  /// (named or held), plus BTC when the pay asset itself has a BTC market.
+  List<String> _receivableAssets() {
+    final pay = _payAsset;
+    if (pay == kBtcSentinel) {
+      return [for (final a in _btcMarketAssets()) if (SeqAssets.resolved(a) || _holds(a)) a];
+    }
+    final set = <String>{};
+    for (final h in _counterparts(pay)) {
+      if (h != pay && (SeqAssets.resolved(h) || _holds(h))) set.add(h);
+    }
+    if (_btcOffered && pay != null && _btcMarketAssets().contains(pay)) set.add(kBtcSentinel);
+    return set.toList();
+  }
 
   void _reconcileReceive() {
     final recv = _receivableAssets();
@@ -582,7 +597,9 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   /// asset (base) for the pay asset (quote) — the offers a TAKE lifts.
   Future<void> _fetchBook() async {
     final pay = _payAsset, recv = _receiveAsset;
-    if (pay == null || recv == null || pay == recv) {
+    // A BTC pair is not on the same-chain covenant book (it routes cross-chain / Lightning), so
+    // there is nothing to fetch — clear the book so no stale same-chain state lingers under it.
+    if (pay == null || recv == null || pay == recv || _isCrossPair) {
       setState(() {
         _orderBook = null;
         _selected = null;
@@ -677,10 +694,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         _feeAsset = null;
         _feeRateCtl.clear();
         _priceFlip = false; // display flip is per-pair
+        _payRailLn = false; // rail picks are per-pair
+        _recvRailLn = false;
       });
       _cache();
       _fetchBook();
-      unawaited(_probeSubasset());
     }
   }
 
@@ -692,10 +710,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       setState(() {
         _receiveAsset = picked;
         _priceFlip = false; // display flip is per-pair
+        _payRailLn = false; // rail picks are per-pair
+        _recvRailLn = false;
       });
       _cache();
       _fetchBook();
-      unawaited(_probeSubasset());
     }
   }
 
@@ -963,65 +982,26 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final pays = _payableAssets();
     final book = _orderBook;
-    final canAct = !_loading && _error == null && _payAsset != null && _receiveAsset != null;
+    final isCross = _isCrossPair;
+    // Resolve the settlement route for a BTC pair from the current rail picks; same-chain pairs
+    // route to the covenant book and never touch this.
+    final r = isCross
+        ? route(_payAsset, _receiveAsset,
+            payRailLn: _payRailLn, recvRailLn: _recvRailLn, lnAvailable: LightningService.instance.available)
+        : null;
+    final canAct = !_loading &&
+        _error == null &&
+        _payAsset != null &&
+        _receiveAsset != null &&
+        (!isCross || (r?.isValid ?? false));
     return Column(children: [
       Expanded(
         child: ListView(padding: const EdgeInsets.fromLTRB(20, 20, 20, 24), children: [
           const Text('Swap', style: AmbraText.h1),
           const SizedBox(height: 6),
-          const Text('Lift a resting offer, or rest your own limit order on the SeqOB order book.',
+          const Text('Trade any Sequentia asset, or Bitcoin, from one composer. The settlement rail is chosen automatically.',
               style: AmbraText.sub),
-          const SizedBox(height: 12),
-          SecondaryButton(
-            label: 'Buy with Bitcoin (cross-chain)',
-            icon: Icons.currency_bitcoin,
-            onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const XchainSwapScreen())),
-          ),
-          const SizedBox(height: 10),
-          SecondaryButton(
-            label: 'Sell for Bitcoin (cross-chain)',
-            icon: Icons.currency_bitcoin,
-            onPressed: () =>
-                Navigator.of(context).push(MaterialPageRoute(builder: (_) => const XchainReverseSwapScreen())),
-          ),
-          ListenableBuilder(
-            listenable: LightningService.instance,
-            builder: (context, _) {
-              if (!LightningService.instance.available) return const SizedBox.shrink();
-              // Sub-asset rails: light a button only when REAL resting counterparty liquidity exists for
-              // the composer's asset (BUY -> the receive asset; SELL -> the pay asset), mirroring the
-              // web's subassetCapable/sellCapable. An in-flight swap keeps its entry reachable regardless
-              // (to resume / refund), even if that liquidity has since dried up.
-              final showBuy = _subBuyAvail || _subBuyInFlight;
-              final showSell = _subSellAvail || _subSellInFlight;
-              return Column(children: [
-                const SizedBox(height: 10),
-                SecondaryButton(
-                  label: 'Instant (Lightning)',
-                  icon: Icons.bolt,
-                  onPressed: () =>
-                      Navigator.of(context).push(MaterialPageRoute(builder: (_) => const LightningSwapScreen())),
-                ),
-                if (showBuy) ...[
-                  const SizedBox(height: 10),
-                  SecondaryButton(
-                    label: 'Buy over Lightning · BTC on-chain',
-                    icon: Icons.south_west,
-                    onPressed: (_subBuyAsset ?? _receiveAsset) == null ? null : _openSubBuy,
-                  ),
-                ],
-                if (showSell) ...[
-                  const SizedBox(height: 10),
-                  SecondaryButton(
-                    label: 'Sell over Lightning · BTC on-chain',
-                    icon: Icons.north_east,
-                    onPressed: (_subSellAsset ?? _payAsset) == null ? null : _openSubSell,
-                  ),
-                ],
-              ]);
-            },
-          ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 16),
           if (_loading)
             const Padding(padding: EdgeInsets.only(top: 40), child: Center(child: CircularProgressIndicator(color: AmbraColors.amber)))
           else if (_error != null)
@@ -1032,13 +1012,21 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
                 SecondaryButton(label: 'Retry', icon: Icons.refresh, onPressed: _load),
               ]),
             )
-          else if (_markets.isEmpty)
+          else if (_markets.isEmpty && _xmarkets.isEmpty)
             const AmbraCard(child: Text('No markets are open right now. Check back shortly.', style: AmbraText.muted))
           else if (pays.isEmpty)
             const AmbraCard(
                 child: Text('You hold no assets that trade yet. Receive a tradable asset, or use the faucet (More tab).',
                     style: AmbraText.muted))
-          else ...[
+          else if (isCross) ...[
+            // BTC pair: pickers + one amount on the asset leg + per-leg rail picks + the route summary.
+            // No book / mode / fee chrome (a BTC pair is not on the same-chain covenant book).
+            ..._crossComposerChildren(r!),
+            if (_actionError != null) ...[
+              const SizedBox(height: 12),
+              Text(_actionError!, style: const TextStyle(color: AmbraColors.red)),
+            ],
+          ] else ...[
             _bookToggle(),
             const SizedBox(height: 12),
             if (_confBook) _confBookNote() else _modeToggle(),
@@ -1097,20 +1085,158 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       if (canAct)
         BottomActionBar(children: [
           PrimaryButton(
-            label: _confBook
-                ? 'Review & post (blinded)'
-                : _mode == 'take'
-                    ? 'Review & take'
-                    : 'Review & post',
-            icon: _confBook
-                ? Icons.lock_outline
-                : _mode == 'take'
-                    ? Icons.swap_horiz
-                    : Icons.playlist_add,
-            onPressed: _submit,
+            label: isCross
+                ? 'Review swap'
+                : _confBook
+                    ? 'Review & post (blinded)'
+                    : _mode == 'take'
+                        ? 'Review & take'
+                        : 'Review & post',
+            icon: isCross
+                ? Icons.swap_horiz
+                : _confBook
+                    ? Icons.lock_outline
+                    : _mode == 'take'
+                        ? Icons.swap_horiz
+                        : Icons.playlist_add,
+            onPressed: isCross ? () => _dispatchCross(r!) : _submit,
           ),
         ]),
     ]);
+  }
+
+  /// The cross (BTC pair) composer body: pay + receive pickers, ONE amount field on
+  /// the Sequentia-asset leg (a BUY quotes its Bitcoin amount in the wizard; a SELL
+  /// is denominated in the asset), the per-leg rail picks, and the route summary.
+  List<Widget> _crossComposerChildren(SwapRoute r) {
+    final asset = r.seqAsset;
+    final assetTk = _tk(asset); // r.seqAsset is non-null for any BTC pair reachable from the pickers
+    final payIsAsset = _payAsset != kBtcSentinel; // the Sequentia-asset leg is the PAY leg
+    return [
+      const SectionLabel('You pay'),
+      const SizedBox(height: 8),
+      _PickerRow(
+        label: _tk(_payAsset),
+        trailing: _payAsset == null
+            ? null
+            : 'balance ${formatAtoms(_bal(_payAsset!), SeqAssets.labelFor(_payAsset!).precision)}',
+        onTap: _pickPay,
+      ),
+      if (payIsAsset) ...[
+        const SizedBox(height: 12),
+        AmbraField(label: 'Amount ($assetTk)', controller: _payAmount, hint: '0.0'),
+      ],
+      const SizedBox(height: 18),
+      Center(child: Icon(Icons.arrow_downward, color: AmbraColors.dim, size: 22)),
+      const SizedBox(height: 18),
+      const SectionLabel('You receive'),
+      const SizedBox(height: 8),
+      _PickerRow(label: _tk(_receiveAsset), onTap: _pickReceive),
+      if (!payIsAsset) ...[
+        const SizedBox(height: 12),
+        AmbraField(label: 'Amount ($assetTk)', controller: _recvAmount, hint: '0.0'),
+      ],
+      const SizedBox(height: 18),
+      _railPicks(),
+      _routeSummary(r),
+      const SizedBox(height: 8),
+      const Text('Review opens a guided swap that quotes the exact Bitcoin amount and settles it step by step.',
+          style: AmbraText.sub),
+    ];
+  }
+
+  /// Per-leg Lightning rail toggles for a BTC pair (the twin of the web's #swRailPicks).
+  /// Shown only while Lightning is available; each toggle feeds [route], so the pair
+  /// re-routes live between the on-chain cross, pure-Lightning, and submarine flows.
+  Widget _railPicks() {
+    if (!LightningService.instance.available) return const SizedBox.shrink();
+    Widget leg(String label, bool ln, ValueChanged<bool> onChanged) {
+      Widget opt(String text, IconData icon, bool value) {
+        final on = ln == value;
+        return Expanded(
+          child: InkWell(
+            borderRadius: BorderRadius.circular(AmbraRadii.input),
+            onTap: () => onChanged(value),
+            child: Container(
+              padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: on ? AmbraColors.amber.withValues(alpha: 0.12) : AmbraColors.panelDeep,
+                border: Border.all(color: on ? AmbraColors.amber : AmbraColors.line),
+                borderRadius: BorderRadius.circular(AmbraRadii.input),
+              ),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(icon, size: 15, color: on ? AmbraColors.amber : AmbraColors.dim),
+                const SizedBox(width: 6),
+                Text(text, style: AmbraText.body.copyWith(color: on ? AmbraColors.amber : AmbraColors.txt)),
+              ]),
+            ),
+          ),
+        );
+      }
+
+      return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(label, style: AmbraText.sub),
+        const SizedBox(height: 6),
+        Row(children: [
+          opt('On-chain', Icons.link, false),
+          const SizedBox(width: 10),
+          opt('Lightning', Icons.bolt, true),
+        ]),
+      ]);
+    }
+
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      const SectionLabel('How it settles'),
+      const SizedBox(height: 8),
+      leg('Pay from', _payRailLn, (v) => setState(() => _payRailLn = v)),
+      const SizedBox(height: 12),
+      leg('Receive to', _recvRailLn, (v) => setState(() => _recvRailLn = v)),
+      const SizedBox(height: 14),
+    ]);
+  }
+
+  /// One-line "how it settles" summary for the resolved cross route.
+  Widget _routeSummary(SwapRoute r) => AmbraCard(
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Icon(r.kind == SwapRouteKind.ln ? Icons.bolt : Icons.schedule, size: 18, color: AmbraColors.amber),
+          const SizedBox(width: 10),
+          Expanded(child: Text(r.timing, style: AmbraText.sub)),
+        ]),
+      );
+
+  /// Single dispatch for a BTC pair: push the downstream flow the resolved [route]
+  /// selects, seeded with the composer's asset + amount so the user does not re-enter
+  /// them. Same-chain pairs never reach here (they settle on the covenant book via
+  /// [_submit]); this only wires the composer to the existing flows, it does not touch
+  /// their fund-safety internals.
+  Future<void> _dispatchCross(SwapRoute r) async {
+    final asset = r.seqAsset;
+    if (asset == null || !r.isValid) return;
+    // The cross composer's single amount field sits on the Sequentia-asset leg (see _crossComposerChildren).
+    final amtText = (_payAsset == asset ? _payAmount : _recvAmount).text.trim();
+    final assetAmount = amtText.isEmpty ? null : amtText;
+    final Widget? screen = switch (r.kind) {
+      // On-chain cross-chain HTLC: buy the asset with BTC, or sell it for BTC.
+      SwapRouteKind.cross => r.payIsBtc
+          ? XchainSwapScreen(seqAsset: asset, assetAmount: assetAmount)
+          : XchainReverseSwapScreen(seqAsset: asset, assetAmount: assetAmount),
+      // Sub-asset submarine swap. A BUY is denominated in BTC-to-spend (quoted in the wizard), so the
+      // asset amount is not seeded there; a SELL is denominated in the asset, so it is seeded.
+      SwapRouteKind.mixed => r.payIsBtc
+          ? SubassetBuyScreen(asset: asset)
+          : SubassetSellScreen(asset: asset, assetAmount: assetAmount),
+      // Pure-LN: a BUY amount is BTC-to-spend (quoted in the wizard); a SELL amount is the asset.
+      SwapRouteKind.ln => LightningSwapScreen(
+          initialSide: r.payIsBtc ? 'buy' : 'sell',
+          initialAsset: asset,
+          initialAmount: r.payIsBtc ? null : assetAmount,
+        ),
+      SwapRouteKind.same || SwapRouteKind.invalid => null,
+    };
+    if (screen == null) return;
+    await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => screen));
+    if (mounted) _load(); // refresh balances + markets on return
   }
 
   /// Unblinded (transparent, default) vs Blinded (confidential) book namespace.

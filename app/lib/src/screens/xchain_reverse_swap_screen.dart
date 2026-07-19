@@ -20,7 +20,16 @@ import '../widgets/widgets.dart';
 /// secret by taking the asset. The wallet NEVER reveals a preimage, so the anchor
 /// reveal-discipline holds by construction; a CLTV asset refund is the off-ramp.
 class XchainReverseSwapScreen extends StatefulWidget {
-  const XchainReverseSwapScreen({super.key});
+  const XchainReverseSwapScreen({super.key, this.seqAsset, this.assetAmount});
+
+  /// Optional composer seed: preselect the cross-chain market for this Sequentia
+  /// asset id. Falls back to the first market when null or unmatched.
+  final String? seqAsset;
+
+  /// Optional composer seed: prefill the amount of [seqAsset] to sell (a display
+  /// string). Ignored when a swap is already in flight (never clobbers a resume).
+  final String? assetAmount;
+
   @override
   State<XchainReverseSwapScreen> createState() => _XchainReverseSwapScreenState();
 }
@@ -56,10 +65,25 @@ class _XchainReverseSwapScreenState extends State<XchainReverseSwapScreen> {
       final rec = await RSwapStore.load();
       final markets = await XchainClient.markets();
       if (!mounted) return;
+      // Composer seed: preselect the requested market + prefill the amount, but only
+      // when nothing is in flight (a resumed swap owns the form).
+      var sel = markets.isNotEmpty ? markets.first : null;
+      final seed = widget.seqAsset;
+      if (seed != null && seed.isNotEmpty) {
+        for (final m in markets) {
+          if (m.seqAsset == seed) {
+            sel = m;
+            break;
+          }
+        }
+      }
+      if (rec == null && widget.assetAmount != null && widget.assetAmount!.trim().isNotEmpty) {
+        _amount.text = widget.assetAmount!.trim();
+      }
       setState(() {
         _rec = rec;
         _markets = markets;
-        _market = markets.isNotEmpty ? markets.first : null;
+        _market = sel;
         _loading = false;
       });
       _arm();

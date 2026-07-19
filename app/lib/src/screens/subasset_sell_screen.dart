@@ -18,10 +18,14 @@ import '../widgets/widgets.dart';
 /// direction). So once the LN pay settles, the preimage + the maker's BTC HTLC terms are persisted
 /// BEFORE the on-chain claim, and the claim is retried (here and on cold start) until it confirms.
 class SubassetSellScreen extends StatefulWidget {
-  const SubassetSellScreen({super.key, required this.asset});
+  const SubassetSellScreen({super.key, required this.asset, this.assetAmount});
 
   /// The Sequentia asset to sell for Bitcoin (paid over Lightning).
   final String asset;
+
+  /// Optional composer seed: prefill the amount of [asset] to sell (a display
+  /// string). Ignored when a swap is already in flight (never clobbers a resume).
+  final String? assetAmount;
 
   @override
   State<SubassetSellScreen> createState() => _SubassetSellScreenState();
@@ -62,6 +66,10 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
         if (book.sellOffers.isNotEmpty) offer = book.sellOffers.first;
       } catch (_) {/* rail-agnostic: a sell can proceed without a pinned offer */}
       if (!mounted) return;
+      // Composer seed: prefill the amount to sell, but only when nothing is in flight.
+      if (rec == null && widget.assetAmount != null && widget.assetAmount!.trim().isNotEmpty) {
+        _amount.text = widget.assetAmount!.trim();
+      }
       setState(() {
         _rec = rec;
         _offer = offer;
