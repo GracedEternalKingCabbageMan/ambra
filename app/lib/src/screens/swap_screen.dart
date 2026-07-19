@@ -1118,7 +1118,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         child: ListView(padding: const EdgeInsets.fromLTRB(20, 20, 20, 24), children: [
           const Text('Swap', style: AmbraText.h1),
           const SizedBox(height: 6),
-          const Text('Trade any Sequentia asset, or Bitcoin, from one composer. The settlement rail is chosen automatically.',
+          const Text('Trade any Sequentia asset, or Bitcoin, from one order book. You choose how you pay and receive; the book matches on price and size.',
               style: AmbraText.sub),
           const SizedBox(height: 16),
           if (_xInFlight != null) ...[
