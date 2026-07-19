@@ -91,13 +91,12 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   String? _receiveAsset;
   String? _feeAsset; // null => default (the paid asset)
 
-  // Per-leg Lightning rail preferences for a BTC pair (mirrors the web's #swRailPicks). Fed into
-  // [route]: both on-chain -> cross-chain HTLC; both on Lightning -> pure-LN; asset-leg-LN -> sub-asset.
-  // Only meaningful (and only shown) for a BTC pair while Lightning is available. On a pair change they
-  // AUTO-SELECT from real per-leg channel liquidity (railAvail) until the user touches them.
-  bool _payRailLn = false;
-  bool _recvRailLn = false;
-  bool _railsTouched = false; // the user manually picked a rail -> stop auto-selecting (web S.railsTouched)
+  // The two settlement PREFERENCES the user sets per order: how they PAY and how they RECEIVE, each
+  // Lightning (true) or on-chain (false). RAIL-BLIND (spec §5): these never touch the book/matching/price
+  // — they are honored at settlement. They start NULL — there is NO default (spec §6.5): an order cannot
+  // be placed until BOTH are chosen, on EVERY pair. Fed into [route] as settlement prefs only.
+  bool? _payRailLn;
+  bool? _recvRailLn;
   XchainSwapRecord? _xInFlight; // a persisted cross-swap with locked BTC needing resume/refund (banner)
 
   // This wallet's OWN Lightning channels (node_key present), from a best-effort /status fetch. Feeds
@@ -252,10 +251,10 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     if (!mounted) return;
     setState(() {
       if (!LightningService.instance.available) {
-        _payRailLn = false;
-        _recvRailLn = false;
-      } else {
-        _autoRails(); // Lightning came up -> auto-select any leg that now has a usable channel
+        // Lightning went away: any leg the user had set to Lightning is no longer honorable, so clear it
+        // back to unselected (never silently force a rail). On-chain picks stand.
+        if (_payRailLn == true) _payRailLn = null;
+        if (_recvRailLn == true) _recvRailLn = null;
       }
     });
   }
@@ -489,7 +488,6 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         final pays = _payableAssets();
         if (_payAsset == null || !pays.contains(_payAsset)) _payAsset = pays.isNotEmpty ? pays.first : null;
         _reconcileReceive();
-        _autoRails();
       });
       _cache();
       _fetchBook();
@@ -793,8 +791,8 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         _feeAsset = null;
         _feeRateCtl.clear();
         _priceFlip = false; // display flip is per-pair
-        _railsTouched = false; // new pair -> auto-select rails from real channel liquidity
-        _autoRails();
+        _payRailLn = null; // new pair -> rails unselected (no default; the user must choose)
+        _recvRailLn = null;
       });
       _cache();
       _fetchBook();
@@ -809,8 +807,8 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       setState(() {
         _receiveAsset = picked;
         _priceFlip = false; // display flip is per-pair
-        _railsTouched = false; // new pair -> auto-select rails from real channel liquidity
-        _autoRails();
+        _payRailLn = null; // new pair -> rails unselected (no default; the user must choose)
+        _recvRailLn = null;
       });
       _cache();
       _fetchBook();
@@ -1107,12 +1105,15 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     // yields a "coming" snack. Treat it as not-actionable and explain inline (route summary), pointing at
     // the live sell rails (pure-LN / sub-asset), instead of an enabled button that promises settlement.
     final crossSellDead = isCross && r != null && r.kind == SwapRouteKind.cross && !r.payIsBtc;
-    final canAct = !_loading &&
+    // The pair is tradeable (book renders, quote works) — but placement also needs both settlement rails
+    // chosen (spec §6.5, no default). canQuote gates showing the CTA; railsChosen gates enabling it.
+    final canQuote = !_loading &&
         _error == null &&
         _payAsset != null &&
         _receiveAsset != null &&
         !crossSellDead &&
         (!isCross || (r?.isValid ?? false));
+    final railsChosen = _payRailLn != null && _recvRailLn != null;
     return Column(children: [
       Expanded(
         child: ListView(padding: const EdgeInsets.fromLTRB(20, 20, 20, 24), children: [
@@ -1142,9 +1143,14 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
                 child: Text('You hold no assets that trade yet. Receive a tradable asset, or use the faucet (More tab).',
                     style: AmbraText.muted))
           else if (isCross) ...[
-            // BTC pair: pickers + one amount on the asset leg + per-leg rail picks + the route summary.
-            // No book / mode / fee chrome (a BTC pair is not on the same-chain covenant book).
+            // BTC pair on the SAME unified terminal (spec §7): the Market/Limit toggle, price stats, the
+            // two-sided book, rail picks, and recent trades — exactly like a same-chain pair. No degraded
+            // chrome. (_crossComposerChildren already carries the pickers + amount + _railPicks + book.)
+            _modeToggle(),
+            const SizedBox(height: 16),
+            _pairStatsStrip(),
             ..._crossComposerChildren(r!),
+            _recentTradesPanel(),
             if (_actionError != null) ...[
               const SizedBox(height: 12),
               Text(_actionError!, style: const TextStyle(color: AmbraColors.red)),
@@ -1178,6 +1184,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
               hint: _mode == 'post' ? 'how much you want' : '0.0',
             ),
             const SizedBox(height: 18),
+            _railPicks(), // rail-blind settlement prefs on EVERY pair (spec §5) — a same-chain asset can move over SeqLN too
             _pairStatsStrip(),
             _bookPanel(book),
             _recentTradesPanel(),
@@ -1205,24 +1212,29 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           _recentActivity(),
         ]),
       ),
-      if (canAct)
+      if (canQuote)
         BottomActionBar(children: [
           PrimaryButton(
-            label: isCross
-                ? 'Review swap'
-                : _confBook
-                    ? 'Review & post (blinded)'
-                    : _mode == 'take'
-                        ? 'Review & take'
-                        : 'Review & post',
-            icon: isCross
-                ? Icons.swap_horiz
-                : _confBook
-                    ? Icons.lock_outline
-                    : _mode == 'take'
-                        ? Icons.swap_horiz
-                        : Icons.playlist_add,
-            onPressed: isCross ? () => _dispatchCross(r!) : _submit,
+            label: !railsChosen
+                ? 'Choose how you pay & receive'
+                : isCross
+                    ? 'Review swap'
+                    : _confBook
+                        ? 'Review & post (blinded)'
+                        : _mode == 'take'
+                            ? 'Review & take'
+                            : 'Review & post',
+            icon: !railsChosen
+                ? Icons.alt_route
+                : isCross
+                    ? Icons.swap_horiz
+                    : _confBook
+                        ? Icons.lock_outline
+                        : _mode == 'take'
+                            ? Icons.swap_horiz
+                            : Icons.playlist_add,
+            // Disabled (null) until both rails are chosen — no order on an unstated settlement choice.
+            onPressed: !railsChosen ? null : (isCross ? () => _dispatchCross(r!) : _submit),
           ),
         ]),
     ]);
@@ -1350,24 +1362,14 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     return railAvailability(channels: _lnChannels, payTarget: t(pay), recvTarget: t(recv));
   }
 
-  /// Auto-select the per-leg rails from real channel liquidity when the user hasn't touched them (the
-  /// twin of the web's updateRails: default a leg to Lightning exactly when it has a usable channel with
-  /// the direction it needs, else on-chain). A manual toggle sets [_railsTouched] and freezes the choice.
-  void _autoRails() {
-    if (_railsTouched) return;
-    final ra = _railAvail();
-    _payRailLn = ra?.payLn.ok ?? false;
-    _recvRailLn = ra?.recvLn.ok ?? false;
-  }
-
   /// Per-leg Lightning rail toggles for a BTC pair (the twin of the web's #swRailPicks + renderRailNote).
   /// Shown only while Lightning is available; each toggle feeds [route], so the pair re-routes live
   /// between the on-chain cross, pure-Lightning, and sub-asset flows. When a leg is set to Lightning but
   /// has no usable channel yet, an honest note says so rather than silently promising "Instant".
   Widget _railPicks() {
-    if (!LightningService.instance.available) return const SizedBox.shrink();
-    final ra = _railAvail();
-    Widget leg(String label, bool ln, LegOption? verdict, ValueChanged<bool> onChanged) {
+    final ra = LightningService.instance.available ? _railAvail() : null;
+    // ln is NULLABLE: null = unselected (no default). Neither button highlights until the user picks.
+    Widget leg(String label, bool? ln, LegOption? verdict, ValueChanged<bool> onChanged) {
       Widget opt(String text, IconData icon, bool value) {
         final on = ln == value;
         return Expanded(
@@ -1402,7 +1404,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         ]),
         // Honest per-leg note: this leg is set to Lightning but has no usable channel yet (mirrors the
         // web's renderRailNote). Never silently promise "Instant" when a channel must be arranged first.
-        if (ln && verdict != null && !verdict.ok) ...[
+        if (ln == true && !LightningService.instance.available) ...[
+          const SizedBox(height: 6),
+          Text('Lightning isn\'t set up yet · choose On-chain, or open a channel from the Balance tab.',
+              style: AmbraText.sub.copyWith(color: AmbraColors.dim)),
+        ] else if (ln == true && verdict != null && !verdict.ok) ...[
           const SizedBox(height: 6),
           Text('${verdict.reason} ${verdict.hint}', style: AmbraText.sub.copyWith(color: AmbraColors.dim)),
         ],
@@ -1410,17 +1416,16 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     }
 
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      const SectionLabel('How it settles'),
+      const SectionLabel('How you pay & receive'),
+      const SizedBox(height: 4),
+      Text(_payRailLn == null || _recvRailLn == null
+          ? 'Choose a settlement rail for each leg (there is no default). The book matches on price, not rail.'
+          : 'Settlement preference · the book matches on price, not rail.',
+          style: AmbraText.sub),
       const SizedBox(height: 8),
-      leg('Pay from', _payRailLn, ra?.payLn, (v) => setState(() {
-            _payRailLn = v;
-            _railsTouched = true;
-          })),
+      leg('Pay from', _payRailLn, ra?.payLn, (v) => setState(() => _payRailLn = v)),
       const SizedBox(height: 12),
-      leg('Receive to', _recvRailLn, ra?.recvLn, (v) => setState(() {
-            _recvRailLn = v;
-            _railsTouched = true;
-          })),
+      leg('Receive to', _recvRailLn, ra?.recvLn, (v) => setState(() => _recvRailLn = v)),
       const SizedBox(height: 14),
     ]);
   }
@@ -1509,6 +1514,15 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   Future<void> _dispatchCross(SwapRoute r) async {
     final asset = r.seqAsset;
     if (asset == null || !r.isValid) return;
+
+    // LIMIT (post) on a BTC pair: resting a Bitcoin bid/ask at your own price needs the cross-offer
+    // poster, which this build doesn't have yet. Be honest instead of a broken button — the Market path
+    // (take a resting offer) works now, and a Limit order works on any same-chain pair today.
+    if (_mode == 'post') {
+      _snack('Resting a Bitcoin order at your own price is coming. Use Market to take a resting offer now, '
+          'or place a limit order on a same-chain pair.');
+      return;
+    }
 
     // On-chain cross (BTC<->asset) settles over the relay ORDER-BOOK COURIER (the durable book), NOT the
     // retired /dex RFQ. Review = lift the best resting offer, exactly like tapping it in the book.
