@@ -118,6 +118,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   // POST on an empty book so a market can be started; `_modeTouched` stops that.
   String _mode = 'take';
   bool _modeTouched = false;
+  // KEEP RESTING WHILE OFFLINE (spec §5 / SBTC design §5). Relevant ONLY for an on-chain-BTC-pay
+  // LIMIT order: ON -> silently peg the maker's BTC to SBTC and rest it in a covenant that survives
+  // the wallet going offline, peg back out to real BTC on fill; OFF -> a native-BTC HTLC (needs the
+  // wallet online). Default ON. Market orders and any Lightning leg IGNORE it — pure native BTC.
+  bool _keepResting = true;
   String _edited = 'pay'; // which amount the user last typed
 
   // Price DISPLAY direction toggle. The book prices a pair ONE canonical way ("1 base = N
@@ -1185,6 +1190,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
             ),
             const SizedBox(height: 18),
             _railPicks(), // rail-blind settlement prefs on EVERY pair (spec §5) — a same-chain asset can move over SeqLN too
+            _offlineRestToggle(), // on-chain-BTC-pay + LIMIT only: rest as pegged SBTC while offline (spec §5)
             _pairStatsStrip(),
             _bookPanel(book),
             _recentTradesPanel(),
@@ -1428,6 +1434,45 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       leg('Receive to', _recvRailLn, ra?.recvLn, (v) => setState(() => _recvRailLn = v)),
       const SizedBox(height: 14),
     ]);
+  }
+
+  /// TRUE when the user is PAYING real Bitcoin ON-CHAIN. The "keep resting while offline" peg is
+  /// relevant ONLY for this pay leg (not Lightning, not paying a Sequentia asset).
+  bool get _payingBtcOnChain => _payAsset == kBtcSentinel && _payRailLn == false;
+
+  /// The "Keep resting while offline" opt-out (spec §5, SBTC design §5) — the ONE place SBTC touches
+  /// the DEX. Shown ONLY when paying on-chain BTC AND placing a LIMIT (post) order; hidden and
+  /// irrelevant otherwise (market orders and any Lightning leg are pure native BTC). Default ON: the
+  /// order rests as pegged BTC (SBTC) so it stays live while offline, and funds return as real BTC on
+  /// fill/cancel. OFF: a native-BTC HTLC that needs the wallet online. The placement path reads
+  /// _keepResting only when _payingBtcOnChain && _mode == 'post'.
+  Widget _offlineRestToggle() {
+    if (!(_payingBtcOnChain && _mode == 'post')) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(AmbraRadii.input),
+        onTap: () => setState(() => _keepResting = !_keepResting),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          SizedBox(
+            width: 40,
+            child: Switch(value: _keepResting, onChanged: (v) => setState(() => _keepResting = v)),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                _keepResting
+                    ? 'Keep this order resting while you\'re offline. It rests as pegged BTC (SBTC) so it stays live without the app open; your funds return as regular BTC if it fills or is cancelled.'
+                    : 'Rests as native BTC — keep the app open so the order stays live. Turn on to rest as pegged BTC and stay live while offline.',
+                style: AmbraText.sub.copyWith(color: AmbraColors.dim),
+              ),
+            ),
+          ),
+        ]),
+      ),
+    );
   }
 
   /// One-line "how it settles" summary for the resolved cross route, with an honest caveat when a
