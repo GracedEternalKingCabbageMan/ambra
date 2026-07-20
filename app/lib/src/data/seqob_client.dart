@@ -278,6 +278,38 @@ class SeqObClient {
     return out;
   }
 
+  /// The resting SBTC silent-peg covenants for [seqAsset] — funded, fillable covenants that LOCK SBTC
+  /// but ADVERTISE as a BTC offer (base_asset = BTC) so they rest in the asset/BTC market. A taker
+  /// SELLING the asset for BTC lifts one with the covenant FILL primitive (paying the asset, receiving
+  /// SBTC), then pegs the SBTC OUT to real BTC.
+  ///
+  /// Distinct from [crossBook], which returns interactive HTLC cross offers (they carry a `cross_chain`
+  /// field) and DROPS covenants: this returns ONLY fillable covenants on the `BTC/<asset>` shelf. Every
+  /// offer's maker signature is checked locally (the relay is untrusted) and the FILL re-derives + checks
+  /// the covenant against its on-chain scriptPubKey, so a lying relay cannot forge one. Cheapest
+  /// asset-per-BTC first (best for the seller). Never throws (returns []).
+  static Future<List<SeqObOffer>> peggedBtcCovenants(String seqAsset) async {
+    final out = <SeqObOffer>[];
+    final nowUnix = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    try {
+      final j = await _get('/v1/market/BTC/$seqAsset/orderbook');
+      final list = (j['offers'] as List?) ?? (j['Offers'] as List?) ?? const [];
+      for (final e in list) {
+        if (e is! Map) continue;
+        final o = Map<String, dynamic>.from(e);
+        final exp = _big(pick(o, ['expires_at_unix', 'expiresAtUnix'])).toInt();
+        if (exp > 0 && exp <= nowUnix) continue; // drop expired
+        final offer = await _parseOffer(o);
+        if (offer == null || !offer.verified) continue; // the relay is untrusted
+        if (!offer.isFillableCovenant) continue; // covenants only (advertised BTC, locks SBTC)
+        if (offer.baseAtoms <= BigInt.zero) continue;
+        out.add(offer);
+      }
+    } catch (_) {/* best-effort */}
+    out.sort((a, b) => a.priceAtomsPerBase.compareTo(b.priceAtomsPerBase));
+    return out;
+  }
+
   /// Recent executed trades for (base, quote), newest first. Empty (never throws)
   /// on a missing/one-directional market — the caller queries the canonical
   /// direction, then the inverse, and inverts prices for whichever has data.

@@ -15,6 +15,7 @@ import '../data/lightning_service.dart';
 import '../data/ln_rail.dart';
 import '../data/placed_orders.dart';
 import '../data/price_service.dart';
+import '../data/sbtc_peg_service.dart';
 import '../data/seqdex_client.dart';
 import '../data/seqln_keys.dart' as lnkeys;
 import '../data/seqob_client.dart';
@@ -136,6 +137,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   // Resting CROSS (BTC<->asset) offers from the relay order book, shown for a BTC pair (the same-chain
   // covenant book does not apply there). These are the durable cross offers restored by the relay fix.
   List<CrossOffer> _crossOffers = const [];
+
+  // Resting SBTC silent-peg COVENANTS advertised as BTC for the current BTC pair (funded, offline-
+  // resting bids). A taker SELLING the asset for BTC fills one with the covenant FILL primitive
+  // (paying the asset, receiving SBTC) and pegs the SBTC out to real BTC. Loaded alongside _crossOffers.
+  List<SeqObOffer> _peggedOffers = const [];
 
   bool _loading = true;
   bool _bookLoading = false;
@@ -496,6 +502,15 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       });
       _cache();
       _fetchBook();
+      // Resume any SBTC peg-in that was mid-flight when the wallet last closed: if its SBTC has since
+      // been credited, finish by posting the covenant (mirrors the web wallet's resumePegIns on load).
+      // Fire-and-forget + best-effort — never blocks the composer, and a still-pending peg-in is left
+      // for a later load. FUND-SAFETY: the bridge credits SBTC regardless, so nothing is ever lost.
+      unawaited(SbtcPegService.resumePegIns(
+        mnemonic: m,
+        tipHeight: _tipHeight,
+        nextMakerIndex: () => _SwapCache.makerIndexSeed++,
+      ));
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -684,6 +699,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         _orderBook = null;
         _selected = null;
         _crossOffers = const [];
+        _peggedOffers = const [];
         _trades = const [];
         _stats = null;
       });
@@ -705,10 +721,19 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       } catch (_) {
         if (mounted) setState(() => _crossOffers = const []);
       }
+      // Also load the SBTC silent-peg covenants advertised as BTC on this pair (the offline-resting bids
+      // a SELL-asset-for-BTC taker can fill). Separate from crossBook, which drops covenants (item 6).
+      try {
+        final pegged = await SeqObClient.peggedBtcCovenants(seqAsset);
+        if (mounted) setState(() => _peggedOffers = pegged);
+      } catch (_) {
+        if (mounted) setState(() => _peggedOffers = const []);
+      }
       return;
     }
     setState(() {
       _crossOffers = const [];
+      _peggedOffers = const [];
       _bookLoading = true;
     });
     try {
@@ -1267,6 +1292,13 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         const SizedBox(height: 12),
         AmbraField(label: 'Amount ($assetTk)', controller: _payAmount, hint: '0.0'),
       ],
+      // Pegged BUY-with-BTC LIMIT (keep-resting): the user sets BOTH sides of a limit bid — the BTC they
+      // pay (here) and the asset they want (below). Only when buying the asset with BTC in post mode with
+      // "keep resting" on; every other cross flow quotes the BTC amount from the book instead.
+      if (!payIsAsset && _mode == 'post' && _keepResting) ...[
+        const SizedBox(height: 12),
+        AmbraField(label: 'Amount (BTC you pay)', controller: _payAmount, hint: '0.0'),
+      ],
       const SizedBox(height: 18),
       Center(child: Icon(Icons.arrow_downward, color: AmbraColors.dim, size: 22)),
       const SizedBox(height: 18),
@@ -1275,10 +1307,15 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       _PickerRow(label: _tk(_receiveAsset), onTap: _pickReceive),
       if (!payIsAsset) ...[
         const SizedBox(height: 12),
-        AmbraField(label: 'Amount ($assetTk)', controller: _recvAmount, hint: '0.0'),
+        AmbraField(
+          label: _mode == 'post' ? 'Your price — amount ($assetTk)' : 'Amount ($assetTk)',
+          controller: _recvAmount,
+          hint: _mode == 'post' ? 'how much you want' : '0.0',
+        ),
       ],
       const SizedBox(height: 18),
       _railPicks(),
+      _offlineRestToggle(), // on-chain-BTC-pay + LIMIT only: rest as pegged SBTC while offline (spec §5)
       _routeSummary(r),
       _crossBookPanel(asset),
       const SizedBox(height: 8),
@@ -1349,6 +1386,39 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
               ),
             const SizedBox(height: 6),
             const Text('Tap a “buy” offer to lock Bitcoin and swap. Non-custodial; refundable if it does not complete.',
+                style: AmbraText.sub),
+          ],
+          if (_peggedOffers.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            const Divider(color: AmbraColors.line, height: 1),
+            const SizedBox(height: 10),
+            Text('Offline-resting BTC bids for $tk', style: AmbraText.body),
+            const SizedBox(height: 6),
+            // SBTC silent-peg covenants (advertised BTC, lock SBTC). Tap to SELL the asset: pay the
+            // asset, receive SBTC, auto-peg-out to real BTC. Funded + fillable while the maker is offline.
+            for (final o in _peggedOffers.take(5))
+              InkWell(
+                onTap: () => _takePeggedCovenant(o),
+                borderRadius: BorderRadius.circular(AmbraRadii.input),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 2),
+                  child: Row(children: [
+                    SizedBox(width: 58, child: Text('sell $tk', style: AmbraText.sub.copyWith(color: AmbraColors.red))),
+                    Expanded(
+                      child: Text('${formatAtoms(o.wantAtoms.toString(), aprec)} $tk',
+                          textAlign: TextAlign.right, style: AmbraText.mono),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text('${formatAtoms(o.baseAtoms.toString(), 8)} BTC',
+                          textAlign: TextAlign.right, style: AmbraText.mono),
+                    ),
+                    const SizedBox(width: 20, child: Icon(Icons.chevron_right, size: 16, color: AmbraColors.dim)),
+                  ]),
+                ),
+              ),
+            const SizedBox(height: 6),
+            Text('Tap to sell $tk for Bitcoin. You receive pegged BTC (SBTC) and it is redeemed to real BTC automatically.',
                 style: AmbraText.sub),
           ],
         ]),
@@ -1560,10 +1630,17 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     final asset = r.seqAsset;
     if (asset == null || !r.isValid) return;
 
-    // LIMIT (post) on a BTC pair: resting a Bitcoin bid/ask at your own price needs the cross-offer
-    // poster, which this build doesn't have yet. Be honest instead of a broken button — the Market path
-    // (take a resting offer) works now, and a Limit order works on any same-chain pair today.
+    // LIMIT (post) on a BTC pair.
     if (_mode == 'post') {
+      // BUY-with-on-chain-BTC + "keep resting while offline" ON: the SBTC silent peg (spec §5, the ONE
+      // place SBTC touches the DEX). Peg the maker's real BTC to SBTC and rest it in a covenant
+      // ADVERTISED as BTC so the order stays live while the wallet is offline; funds return as real BTC
+      // on fill/cancel. Any OTHER post on a BTC pair still needs the native cross-offer poster this build
+      // lacks, so it stays honest.
+      if (_payingBtcOnChain && _keepResting) {
+        await _placePeggedBtcOrder(asset);
+        return;
+      }
       _snack('Resting a Bitcoin order at your own price is coming. Use Market to take a resting offer now, '
           'or place a limit order on a same-chain pair.');
       return;
@@ -1593,8 +1670,26 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         }
         await _liftCross(asks.first, requestedAtoms: reqAtoms);
       } else {
-        // SELL the asset for Bitcoin: the reverse courier direction is not live yet (buying is).
-        _snack('Selling ${_tk(asset)} for Bitcoin over the order book is coming; buying it with Bitcoin is live now.');
+        // SELL the asset for Bitcoin. The reverse HTLC courier isn't live, but the SBTC silent-peg
+        // covenants ARE fillable: pay the asset, receive SBTC, peg the SBTC out to real BTC. Lift the
+        // resting pegged covenant CLOSEST in asset size to what the user typed (tie-break cheapest asset
+        // per BTC), matching the buy path's "lift in full" selection.
+        if (_peggedOffers.isEmpty) {
+          _snack('No resting Bitcoin bid for ${_tk(asset)} yet — check back in a moment, or sell over Lightning / a sub-asset swap.');
+          return;
+        }
+        final aprec = SeqAssets.labelFor(asset).precision;
+        final reqAtoms = _typedAssetAtoms(asset, aprec);
+        final offers = List<SeqObOffer>.from(_peggedOffers);
+        if (reqAtoms != null && reqAtoms > BigInt.zero) {
+          offers.sort((a, b) {
+            final c = (a.wantAtoms - reqAtoms).abs().compareTo((b.wantAtoms - reqAtoms).abs());
+            return c != 0 ? c : a.priceAtomsPerBase.compareTo(b.priceAtomsPerBase);
+          });
+        } else {
+          offers.sort((a, b) => a.priceAtomsPerBase.compareTo(b.priceAtomsPerBase));
+        }
+        await _takePeggedCovenant(offers.first);
       }
       return;
     }
@@ -1618,6 +1713,71 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     if (screen == null) return;
     await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => screen));
     if (mounted) _load(); // refresh balances + markets on return
+  }
+
+  // --- SBTC silent peg (spec §5) --------------------------------------------
+
+  /// MAKER: rest a BUY-with-on-chain-BTC LIMIT order as a pegged (SBTC) covenant advertised as BTC, so
+  /// it stays live while the wallet is offline. [asset] is the Sequentia asset being bought. The BTC
+  /// bid amount is the pay leg (_payAmount, 8 dp); the asset wanted is the receive leg (_recvAmount).
+  Future<void> _placePeggedBtcOrder(String asset) async {
+    final aprec = SeqAssets.labelFor(asset).precision;
+    final btcSats = parseAtoms(_payAmount.text, 8);
+    final assetAtoms = parseAtoms(_recvAmount.text, aprec);
+    if (btcSats == null || btcSats <= BigInt.zero) return _snack('Enter the amount of Bitcoin you pay.');
+    if (assetAtoms == null || assetAtoms <= BigInt.zero) return _snack('Enter how much ${_tk(asset)} you want.');
+    final btcBal = BigInt.tryParse(_bal(kBtcSentinel)) ?? BigInt.zero;
+    if (btcSats > btcBal) return _snack('You only hold ${formatAtoms(btcBal.toString(), 8)} BTC.');
+    if (SbtcPegService.sbtcAssetId() == null) {
+      return _snack('SBTC (the pegged-BTC asset) isn\'t available on this network. Turn off '
+          '"keep resting while offline" to rest as native BTC.');
+    }
+    final makerIndex = _SwapCache.makerIndexSeed++;
+    final txid = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AmbraColors.panel,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+      builder: (_) => _PeggedPostReviewSheet(
+        assetHex: asset,
+        btcSats: btcSats,
+        assetAtoms: assetAtoms,
+        makerIndex: makerIndex,
+        tipHeight: _tipHeight,
+      ),
+    );
+    if (txid != null && mounted) {
+      _payAmount.clear();
+      _recvAmount.clear();
+      _onSettled(txid, 'Order resting (pegged BTC)', clearBoth: true);
+    }
+  }
+
+  /// TAKER: fill a resting pegged (SBTC-locking, BTC-advertised) covenant — pay the asset, receive SBTC,
+  /// then peg the SBTC OUT to real BTC. Mirrors takePeggedCovenant + onCovMatched's peg-out branch.
+  Future<void> _takePeggedCovenant(SeqObOffer offer) async {
+    // Fill the covenant IN FULL (take all locked SBTC/BTC; pay all the asset it wants). The taker must
+    // hold the asset + a small tSEQ fee.
+    final asset = offer.quoteAsset; // asset_b — what the taker pays
+    final payBal = BigInt.tryParse(_bal(asset)) ?? BigInt.zero;
+    if (offer.wantAtoms > payBal) {
+      return _snack('Not enough ${_tk(asset)} to fill this offer (needs ${formatAtoms(offer.wantAtoms.toString(), SeqAssets.labelFor(asset).precision)}).');
+    }
+    // Fee in the policy asset (tSEQ): the fill builder rejects the covenant's sold asset A (= the SBTC we
+    // RECEIVE) as the fee asset, and tSEQ is universally accepted. Funded from the taker's own coins.
+    final feeAsset = SeqAssets.policy;
+    final feeAtoms = _feeAtomsFor(feeAsset);
+    if ((BigInt.tryParse(_bal(feeAsset)) ?? BigInt.zero) < feeAtoms) {
+      return _snack('Not enough ${_tk(feeAsset)} to pay the network fee.');
+    }
+    final txid = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AmbraColors.panel,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+      builder: (_) => _PeggedTakeReviewSheet(offer: offer, asset: asset, feeAsset: feeAsset, feeAtoms: feeAtoms),
+    );
+    if (txid != null && mounted) _onSettled(txid, 'Sold for BTC');
   }
 
   /// Unblinded (transparent, default) vs Blinded (confidential) book namespace.
@@ -2311,6 +2471,242 @@ class _PostReviewSheetState extends State<_PostReviewSheet> {
           if (_error != null)
             Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
           PrimaryButton(label: 'Confirm & post', busy: _busy, icon: Icons.fingerprint, onPressed: _busy ? null : _confirm),
+          const SizedBox(height: 6),
+          GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
+        ]),
+      ),
+    );
+  }
+}
+
+/// Confirm + run the SBTC silent-peg MAKER flow (spec §5): peg the maker's real BTC IN to SBTC, then
+/// rest that SBTC in a covenant ADVERTISED as BTC so the order stays live while the wallet is offline;
+/// funds return as real BTC on fill/cancel. Delegates to [SbtcPegService.placePeggedBtcCovenant], which
+/// persists a pending peg-in BEFORE broadcasting the deposit and a PlacedCovenant BEFORE posting.
+class _PeggedPostReviewSheet extends StatefulWidget {
+  const _PeggedPostReviewSheet({
+    required this.assetHex,
+    required this.btcSats,
+    required this.assetAtoms,
+    required this.makerIndex,
+    required this.tipHeight,
+  });
+  final String assetHex;
+  final BigInt btcSats;
+  final BigInt assetAtoms;
+  final int makerIndex;
+  final int tipHeight;
+  @override
+  State<_PeggedPostReviewSheet> createState() => _PeggedPostReviewSheetState();
+}
+
+class _PeggedPostReviewSheetState extends State<_PeggedPostReviewSheet> {
+  bool _busy = false;
+  String _status = '';
+  String? _error;
+
+  String _amt(String hex, BigInt atoms) {
+    final l = SeqAssets.labelFor(hex);
+    return '${formatAtoms(atoms.toString(), l.precision)} ${l.ticker}';
+  }
+
+  Future<void> _confirm() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+      _status = 'Authenticating…';
+    });
+    try {
+      // Payment auth up front (fail-closed): the flow SPENDS real BTC (the peg-in deposit) and funds a
+      // covenant. One auth covers the whole flow (mirrors subasset_buy.fund).
+      final ok = await WalletRepository.instance.requirePaymentAuth();
+      if (!ok) {
+        setState(() {
+          _busy = false;
+          _error = 'Authentication failed or cancelled; nothing sent.';
+        });
+        return;
+      }
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) throw Exception('wallet unavailable');
+      final placed = await SbtcPegService.placePeggedBtcCovenant(
+        mnemonic: m,
+        assetHex: widget.assetHex,
+        btcSats: widget.btcSats,
+        assetAtoms: widget.assetAtoms,
+        makerIndex: widget.makerIndex,
+        tipHeight: widget.tipHeight,
+        onStatus: (s) {
+          if (mounted) setState(() => _status = s);
+        },
+      );
+      final assetTk = SeqAssets.labelFor(widget.assetHex).ticker;
+      await TradeReceipts.log(
+        id: 'peg:${placed.covTxid}',
+        title: 'Posted BTC→$assetTk order (offline-resting)',
+        status: 'Resting',
+        txid: placed.covTxid,
+      );
+      if (mounted) Navigator.pop(context, placed.covTxid);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = e.toString().replaceFirst('Exception: ', '');
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          const Text('Review · rest a Bitcoin bid', style: AmbraText.h1),
+          const SizedBox(height: 18),
+          AmbraCard(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Column(children: [
+              _Row('You pay', _amt(kBtcSentinel, widget.btcSats)),
+              _Row('You want', _amt(widget.assetHex, widget.assetAtoms)),
+              _Row('Rests as', 'Pegged BTC (SBTC) in a covenant advertised as BTC — stays live while you\'re offline.'),
+              _Row('On fill / cancel', 'Your funds return as real BTC (auto-redeemed at the bridge).'),
+              _Row('Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'),
+            ]),
+          ),
+          const SizedBox(height: 14),
+          if (_busy && _status.isNotEmpty)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_status, style: AmbraText.muted)),
+          if (_error != null)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
+          if (_busy)
+            const Padding(
+              padding: EdgeInsets.only(bottom: 12),
+              child: Text('Pegging in can take a few blocks. Keep the app open; if you close it, the order '
+                  'finishes automatically next time you open Swap.', style: AmbraText.sub),
+            ),
+          PrimaryButton(label: 'Confirm & rest', busy: _busy, icon: Icons.fingerprint, onPressed: _busy ? null : _confirm),
+          const SizedBox(height: 6),
+          GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
+        ]),
+      ),
+    );
+  }
+}
+
+/// Confirm + run the SBTC silent-peg TAKER flow: fill a resting pegged covenant (advertised BTC, locks
+/// SBTC) with the covenant FILL primitive — pay the asset, receive SBTC — then peg the SBTC OUT to real
+/// BTC. Mirrors takePeggedCovenant + onCovMatched's peg-out branch. The peg-out is best-effort + safe:
+/// on any failure the user simply holds redeemable SBTC (never lost).
+class _PeggedTakeReviewSheet extends StatefulWidget {
+  const _PeggedTakeReviewSheet({
+    required this.offer,
+    required this.asset,
+    required this.feeAsset,
+    required this.feeAtoms,
+  });
+  final SeqObOffer offer;
+  final String asset; // asset_b — what the taker pays
+  final String feeAsset;
+  final BigInt feeAtoms;
+  @override
+  State<_PeggedTakeReviewSheet> createState() => _PeggedTakeReviewSheetState();
+}
+
+class _PeggedTakeReviewSheetState extends State<_PeggedTakeReviewSheet> {
+  bool _busy = false;
+  String _status = '';
+  String? _error;
+
+  String _amt(String hex, BigInt atoms) {
+    final l = SeqAssets.labelFor(hex);
+    return '${formatAtoms(atoms.toString(), l.precision)} ${l.ticker}';
+  }
+
+  Future<void> _confirm() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+      _status = 'Authenticating…';
+    });
+    try {
+      final ok = await WalletRepository.instance.requirePaymentAuth();
+      if (!ok) {
+        setState(() {
+          _busy = false;
+          _error = 'Authentication failed or cancelled; nothing sent.';
+        });
+        return;
+      }
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) throw Exception('wallet unavailable');
+      // Fill the covenant IN FULL: take all locked SBTC, pay the asset it wants. The covenant re-derives
+      // + is checked against its on-chain scriptPubKey inside the FFI (anti-relay-lie).
+      setState(() => _status = 'Building your FILL spend…');
+      final built = await core.covenantBuildFillTx(
+        mnemonic: m,
+        esploraUrl: Backend.esplora,
+        covenantTermsJson: widget.offer.covenantTermsJson,
+        takeAtoms: widget.offer.baseAtoms,
+        feeAsset: widget.feeAsset,
+        feeAtoms: widget.feeAtoms,
+      );
+      setState(() => _status = 'Broadcasting…');
+      final txid = await core.xchainSeqBroadcast(seqEsplora: Backend.esplora, txHex: built.rawHex);
+      final assetTk = SeqAssets.labelFor(widget.asset).ticker;
+      await TradeReceipts.log(id: 'pegtake:$txid', title: 'Sold $assetTk for BTC', status: 'Filled', txid: txid);
+
+      // Peg the received SBTC OUT to real BTC (we were buying BTC). Best-effort + safe: on any failure
+      // the user simply holds redeemable SBTC. Mirrors pegOutReceivedSbtc / onCovMatched.
+      if (SbtcPegService.isPeggedFillToRedeem(widget.offer)) {
+        setState(() => _status = 'Redeeming your SBTC to BTC at the bridge…');
+        try {
+          await SbtcPegService.pegOutReceivedSbtc(mnemonic: m, atoms: widget.offer.baseAtoms);
+        } catch (_) {
+          // Non-fatal: the fill already settled. Leave a note; the SBTC is redeemable.
+          if (mounted) {
+            ScaffoldMessenger.of(context)
+                .showSnackBar(ambraSnack('Filled. You received SBTC (redeemable to BTC); auto-redeem will retry.'));
+          }
+        }
+      }
+      if (mounted) Navigator.pop(context, txid);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = e.toString().replaceFirst('Exception: ', '');
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          const Text('Review · sell for Bitcoin', style: AmbraText.h1),
+          const SizedBox(height: 18),
+          AmbraCard(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Column(children: [
+              _Row('You pay', _amt(widget.asset, widget.offer.wantAtoms)),
+              _Row('You receive', _amt(kBtcSentinel, widget.offer.baseAtoms)),
+              _Row('Network fee', _feeWithApprox(widget.feeAsset, widget.feeAtoms)),
+              _Row('Settlement', 'Permissionless covenant fill; you receive pegged BTC (SBTC), auto-redeemed to real BTC.'),
+              _Row('Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'),
+            ]),
+          ),
+          const SizedBox(height: 14),
+          if (_busy && _status.isNotEmpty)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_status, style: AmbraText.muted)),
+          if (_error != null)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
+          PrimaryButton(label: 'Confirm & sell', busy: _busy, icon: Icons.fingerprint, onPressed: _busy ? null : _confirm),
           const SizedBox(height: 6),
           GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
         ]),
