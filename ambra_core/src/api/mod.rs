@@ -457,6 +457,15 @@ pub fn covenant_finalize_offer(
     let buy_asset = s("buy_asset");
     let sell_atoms = s("sell_atoms");
     let buy_atoms = s("buy_atoms");
+    // SBTC silent peg: a covenant that LOCKS SBTC (asset_a = sell_asset) advertises itself as a BTC
+    // offer so it rests in the asset/BTC market (route by the SELECTED asset, not the locked one). When
+    // the prepared params carry `advertise_sell_as` (e.g. the BTC sentinel), the OFFER ENVELOPE (pair
+    // base + offer_asset) uses it; the COVENANT terms + on-chain funding stay `sell_asset`. SBTC == BTC
+    // 1:1 so the advertised amount equals the locked amount. Defaults to sell_asset (same-chain).
+    let adv_sell = {
+        let a = p.get("advertise_sell_as").and_then(|v| v.as_str()).unwrap_or("");
+        if a.is_empty() { sell_asset.clone() } else { a.to_string() }
+    };
 
     let covenant = serde_json::json!({
         "covenant_txid": covenant_txid,
@@ -490,10 +499,10 @@ pub fn covenant_finalize_offer(
     let mut offer = serde_json::json!({
         "offer_id": offer_id,
         "schema_version": 1,
-        "pair": { "base_asset": sell_asset, "quote_asset": buy_asset },
-        "trade_dir": 1, // SELL: maker gives base (asset A)
+        "pair": { "base_asset": adv_sell, "quote_asset": buy_asset },
+        "trade_dir": 1, // SELL: maker gives base (the advertised asset; covenant locks asset_a)
         "base_amount": sell_atoms,
-        "offer_amount": sell_atoms, "offer_asset": sell_asset,
+        "offer_amount": sell_atoms, "offer_asset": adv_sell,
         "want_amount": buy_atoms, "want_asset": buy_asset,
         "allow_partial": true,
         "min_fill": s("min_lot"),
