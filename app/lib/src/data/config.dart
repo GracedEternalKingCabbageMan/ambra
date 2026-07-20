@@ -24,6 +24,7 @@ class Backend {
   static String get testnet4 => '$_origin/testnet4/api';
   static String get dex => '$_origin/dex'; // SeqDEX daemon (grpc-gateway REST) reverse-proxy
   static String get seqob => '$_origin/seqob'; // SeqOB order-book relay (grpc-gateway REST), matches the web wallet's SEQOB default
+  static String get sbtc => '$_origin/sbtc'; // SBTC bridge peg endpoints (Caddy injects the bridge token; only /pegin + /pegout exposed)
   static String get feerates => '$_origin/feerates';
   static String get prices => '$_origin/prices';
   static String get registry => '$_origin/registry/index.minimal.json';
