@@ -146,6 +146,13 @@ class LegOption {
   final LegLiquidity liquidity;
   final bool provisionable;
   final bool unfrontable;
+
+  /// Can this leg be OFFERED over Lightning at all? True when the wallet already has a usable channel
+  /// ([ok]) OR the LSP can front one JIT at placement ([provisionable]). This is the per-leg verdict the
+  /// composer gates the Lightning rail on — NOT the global "LN service up" flag: a wallet whose OTHER
+  /// node's live link is down can still trade the leg it holds a funded channel for (spec §5). A leg that
+  /// is neither ok nor provisionable is genuinely [unfrontable] and must be surfaced as unavailable.
+  bool get offerable => ok || provisionable;
 }
 
 /// [direction] is 'pay' (this leg SENDS over Lightning -> needs spendable) or 'recv' (RECEIVES ->

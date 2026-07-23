@@ -79,11 +79,19 @@ BigInt quotePayForOffer(SeqObOffer o, BigInt take) {
 /// worse than [slipFraction] below the inside price (slippage bound); the unfilled remainder is simply
 /// not planned — a market order rests nothing. The taker's OWN offers ([ownMakerPubkey]) are skipped so
 /// a sweep never self-fills.
+///
+/// [maxPriceAtomsPerBase] is the LIMIT bound (spec §4): the worst pay-per-receive (offer frame, quote
+/// atoms per base atom) the taker will accept. When provided, the walk crosses only offers at that price
+/// OR BETTER and the [slipFraction] slippage bound is IGNORED — the user's explicit limit IS the bound, so
+/// a limit order fills everything within its price (never truncated by a 15% slip on top). This is the
+/// take-half of a LIMIT order's fill-then-rest: whatever this plan does not fill is the remainder the
+/// composer rests at the limit price. Omit it for a Market order (then the slippage bound applies).
 MarketWalkPlan planMarketWalk({
   required List<SeqObOffer> offers,
   required BigInt wantBase,
   String? ownMakerPubkey,
   double slipFraction = kMarketSlip,
+  double? maxPriceAtomsPerBase,
 }) {
   final mine = (ownMakerPubkey ?? '').toLowerCase();
   // Fillable, non-self offers with a real price, cheapest-first. [offers] is already sorted, but re-sort
@@ -102,7 +110,9 @@ MarketWalkPlan planMarketWalk({
   }
 
   final best = asks.first.priceAtomsPerBase; // pay-per-receive of the inside offer
-  final maxPrice = best * (1 + slipFraction); // refuse to pay worse than this
+  // A LIMIT order's bound is its OWN price (cross at the limit or better); a Market order's bound is the
+  // slippage floor below the inside. When a limit is given, ignore the slip bound — the user's price rules.
+  final maxPrice = maxPriceAtomsPerBase ?? (best * (1 + slipFraction)); // refuse to pay worse than this
   var remaining = wantBase;
   var totRecv = BigInt.zero, totPay = BigInt.zero;
   var worst = best;

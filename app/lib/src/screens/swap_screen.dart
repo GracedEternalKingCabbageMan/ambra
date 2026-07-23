@@ -536,7 +536,15 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         _error = null;
         _loading = false;
         final pays = _payableAssets();
-        if (_payAsset == null || !pays.contains(_payAsset)) _payAsset = pays.isNotEmpty ? pays.first : null;
+        // DEFAULT (spec §6 / fresh-wallet rules): on FIRST open with no cached selection, pay = BTC and
+        // receive stays EMPTY (nothing pre-selected — the user picks it). A returning user's cached pay is
+        // preserved; only an invalid cached pay (its asset is gone) falls back to the first payable. This
+        // applies ONLY when there is no prior pick, so it never clobbers a returning user's cache.
+        if (_payAsset == null) {
+          _payAsset = (_btcOffered && pays.contains(kBtcSentinel)) ? kBtcSentinel : (pays.isNotEmpty ? pays.first : null);
+        } else if (!pays.contains(_payAsset)) {
+          _payAsset = pays.isNotEmpty ? pays.first : null;
+        }
         _reconcileReceive();
       });
       _cache();
@@ -667,10 +675,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   }
 
   void _reconcileReceive() {
+    // NO auto-default (spec §6.5): a receive asset is never pre-selected. Only DROP a now-invalid cached
+    // receive (e.g. after a pay change removed it from the counterpart set) so the composer prompts a fresh
+    // pick, rather than silently choosing one. A still-valid cached receive is preserved.
     final recv = _receivableAssets();
-    if (_receiveAsset == null || !recv.contains(_receiveAsset)) {
-      _receiveAsset = recv.isNotEmpty ? recv.first : null;
-    }
+    if (_receiveAsset != null && !recv.contains(_receiveAsset)) _receiveAsset = null;
   }
 
   // --- fee asset -------------------------------------------------------------
@@ -838,7 +847,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   /// price (the field repaints to their implied value). Never fights the field being typed.
   void _onAmountEdited() {
     if (_mode == 'take') {
-      _linkFrom(_edited);
+      _linkMarket(_edited); // MARKET: derive the other side from the book's actual sweep (VWAP)
     } else if (_priceTyped) {
       _applyPriceEdit(); // held price: size × price -> the other amount (price preserved)
     } else {
@@ -928,7 +937,71 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   }
 
   void _relink() {
-    if (_mode == 'take') _linkFrom(_edited);
+    if (_mode == 'take') _linkMarket(_edited);
+  }
+
+  /// MARKET two-way derivation (spec §6.2): the field the user typed anchors, the OTHER derives from the
+  /// book's ACTUAL sweep — not a single offer's inside price — so the preview matches what a Market order
+  /// executes (Review == execution). Typing RECEIVE derives PAY from the sweep's total cost for that size;
+  /// typing PAY derives RECEIVE from the base a sweep buys with that quote budget. Never overwrites the
+  /// field being typed; falls back to the inside-price link when there is no book to walk.
+  void _linkMarket(String edited) {
+    final book = _orderBook;
+    final pay = _payAsset, recv = _receiveAsset;
+    if (book == null || book.isEmpty || pay == null || recv == null || pay == recv) {
+      _linkFrom(edited); // no book to sweep: keep the simple inside-price link
+      return;
+    }
+    final payPrec = SeqAssets.labelFor(pay).precision;
+    final recvPrec = SeqAssets.labelFor(recv).precision;
+    _linking = true;
+    if (edited == 'receive') {
+      final want = parseAtoms(_recvAmount.text.trim(), recvPrec);
+      if (want != null && want > BigInt.zero) {
+        final plan = planMarketWalk(offers: book.offers, wantBase: want, ownMakerPubkey: _ownMakerPub);
+        if (!plan.isEmpty) _payAmount.text = _trim(plan.totalPay.toDouble() / _pow10(payPrec));
+      }
+    } else {
+      final budget = parseAtoms(_payAmount.text.trim(), payPrec);
+      if (budget != null && budget > BigInt.zero) {
+        final base = _marketBaseForQuoteBudget(budget);
+        if (base > BigInt.zero) _recvAmount.text = _trim(base.toDouble() / _pow10(recvPrec));
+      }
+    }
+    _linking = false;
+  }
+
+  /// Base atoms (the RECEIVE asset) a MARKET sweep buys spending up to [quoteBudget] of the pay asset —
+  /// the pay->receive twin of [planMarketWalk] (which walks by base size). Walks the resting SELLs
+  /// cheapest-first within the same slippage bound, skips this wallet's own offers, and partial-fills the
+  /// last touched offer by the leftover budget. Pure preview: the executed Market order re-plans from the
+  /// derived receive size, so this only needs to agree with that plan's shape.
+  BigInt _marketBaseForQuoteBudget(BigInt quoteBudget) {
+    final book = _orderBook;
+    if (book == null || book.isEmpty || quoteBudget <= BigInt.zero) return BigInt.zero;
+    final mine = (_ownMakerPub ?? '').toLowerCase();
+    final asks = <SeqObOffer>[
+      for (final o in book.offers)
+        if (o.baseAtoms > BigInt.zero &&
+            o.wantAtoms > BigInt.zero &&
+            (mine.isEmpty || o.makerPubkey.toLowerCase() != mine))
+          o,
+    ]..sort((a, b) => a.priceAtomsPerBase.compareTo(b.priceAtomsPerBase));
+    if (asks.isEmpty) return BigInt.zero;
+    final maxPrice = asks.first.priceAtomsPerBase * (1 + kMarketSlip);
+    var remaining = quoteBudget, base = BigInt.zero;
+    for (final o in asks) {
+      if (remaining <= BigInt.zero) break;
+      if (o.priceAtomsPerBase > maxPrice + 1e-12) break;
+      if (remaining >= o.wantAtoms) {
+        base += o.baseAtoms; // take the whole offer
+        remaining -= o.wantAtoms;
+      } else {
+        base += (remaining * o.baseAtoms) ~/ o.wantAtoms; // partial: base for the leftover budget
+        remaining = BigInt.zero;
+      }
+    }
+    return base;
   }
 
   // --- pickers ---------------------------------------------------------------
@@ -1057,7 +1130,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     } else if (_mode == 'take') {
       await _take();
     } else {
-      await _post();
+      await _placeLimit();
     }
   }
 
@@ -1180,6 +1253,87 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       ),
     );
     if (txid != null && mounted) _onSettled(txid, 'Rested', clearBoth: true);
+  }
+
+  /// LIMIT order (spec §4): FILL-THEN-REST. First take-fill against every resting offer that CROSSES the
+  /// limit price (planMarketWalk bounded by the limit so it never crosses worse), partial allowed; THEN rest
+  /// the EXACT unfilled remainder at the limit price via the proven covenant post. Crosses nothing -> pure
+  /// rest (today's behaviour); crosses fully -> pure take, no remainder. FUND-SAFETY: the taken receive size
+  /// and the rested receive size PARTITION the order (taken X of N -> rest exactly N-X) — never post the full
+  /// size after taking, never take more than N; the rested pay is the remainder priced at the user's limit.
+  Future<void> _placeLimit() async {
+    final pay = _payAsset, recv = _receiveAsset;
+    if (pay == null || recv == null) return _snack('Pick what you pay and receive');
+    final payPrec = SeqAssets.labelFor(pay).precision;
+    final recvPrec = SeqAssets.labelFor(recv).precision;
+    final sellAtoms = parseAtoms(_payAmount.text, payPrec);
+    final buyAtoms = parseAtoms(_recvAmount.text, recvPrec);
+    if (sellAtoms == null || sellAtoms <= BigInt.zero) return _snack('Enter how much ${_tk(pay)} to sell');
+    if (buyAtoms == null || buyAtoms <= BigInt.zero) return _snack('Enter your price: how much ${_tk(recv)} you want');
+
+    // The limit price in the OFFER frame (pay atoms per receive atom) = the MOST the user will pay per unit
+    // of receive. The take-fill crosses only resting offers at this price OR BETTER; the remainder rests at
+    // this price. Their ratio IS the limit whether the user typed a price or just the two amounts.
+    final book = _orderBook;
+    final limitPayPerRecv = sellAtoms.toDouble() / buyAtoms.toDouble();
+    final plan = (book == null || book.isEmpty)
+        ? null
+        : planMarketWalk(
+            offers: book.offers,
+            wantBase: buyAtoms,
+            ownMakerPubkey: _ownMakerPub,
+            maxPriceAtomsPerBase: limitPayPerRecv,
+          );
+
+    // Nothing crosses -> pure rest at the limit (today's behaviour): the existing covenant post path.
+    if (plan == null || plan.isEmpty) return _post();
+
+    final takenRecv = plan.totalRecv; // base (receive) atoms that fill now
+    final takenPay = plan.totalPay; // quote (pay) atoms spent now (VWAP <= limit)
+    // PARTITION the order: rest EXACTLY the unfilled receive size, priced at the limit (floor so the resting
+    // order never offers MORE pay per receive than the user's stated limit, and never exceeds the order).
+    final restRecv = buyAtoms - takenRecv;
+    final restPay = restRecv > BigInt.zero ? (restRecv * sellAtoms) ~/ buyAtoms : BigInt.zero;
+    final willRest = restRecv > BigInt.zero && restPay > BigInt.zero;
+
+    // FUND-SAFETY: the wallet must hold the pay for BOTH legs — the take fills (takenPay) and the rested
+    // covenant's locked funds (restPay) — plus the take fees when they are paid in the pay asset.
+    final takeFeeAsset = _takeFeeAsset();
+    final takeFeeAtoms = _feeAtomsFor(takeFeeAsset);
+    final n = BigInt.from(plan.fills.length);
+    final feeInPay = takeFeeAsset == pay;
+    final payBal = BigInt.tryParse(_bal(pay)) ?? BigInt.zero;
+    final payNeed = takenPay + (willRest ? restPay : BigInt.zero) + (feeInPay ? takeFeeAtoms * n : BigInt.zero);
+    if (payNeed > payBal) {
+      return _snack('Not enough ${_tk(pay)} to fill and rest this order${feeInPay ? ' + fees' : ''}');
+    }
+    if (!feeInPay && (BigInt.tryParse(_bal(takeFeeAsset)) ?? BigInt.zero) < takeFeeAtoms * n) {
+      return _snack('Not enough ${_tk(takeFeeAsset)} to pay the network fees');
+    }
+
+    final restFeeAsset = _feeAssetHex;
+    final txid = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AmbraColors.panel,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+      builder: (_) => _LimitReviewSheet(
+        plan: plan,
+        payAsset: pay,
+        recvAsset: recv,
+        takeFeeAsset: takeFeeAsset,
+        takeFeeAtomsPerFill: takeFeeAtoms,
+        restSellAtoms: willRest ? restPay : BigInt.zero,
+        restBuyAtoms: willRest ? restRecv : BigInt.zero,
+        restFeeAsset: restFeeAsset,
+        restFeeAtoms: _feeAtomsFor(restFeeAsset),
+        restFeeRate: _rateFor(restFeeAsset),
+        tipHeight: _tipHeight,
+      ),
+    );
+    if (txid != null && mounted) {
+      _onSettled(txid, willRest ? 'Filled + resting' : 'Filled', clearBoth: true);
+    }
   }
 
   void _onSettled(String txid, String verb, {bool clearBoth = false}) {
@@ -1363,6 +1517,81 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     target.text = _trim(atoms.toDouble() / _pow10(l.precision));
   }
 
+  /// The reference-currency value of ONE whole unit of [hex] (e.g. 1 GOLD ≈ 49 USD), or null when the feed
+  /// can't price the asset. Used to convert a limit price entered in the reference currency into quote units.
+  double? _refPerUnit(String hex) {
+    final l = SeqAssets.labelFor(hex);
+    final oneUnitAtoms = BigInt.from(_pow10(l.precision));
+    return PriceService.instance.refValue(l.ticker, oneUnitAtoms.toString(), l.precision);
+  }
+
+  /// Enter the limit price IN the reference currency (spec §6.2): the user types what ONE base unit is worth
+  /// in USD / BTC / chosen, and it converts to the price in quote units (quote-per-base) via the price-server
+  /// rates — the price-field twin of the amount fields' ⇄ ref entry. Writing _priceAmount triggers the normal
+  /// held-limit-price handling ([_onPriceChanged] -> [_applyPriceEdit]). FUND-SAFE: only a native price
+  /// string is written; every downstream fund calc still reads native atoms exactly as before.
+  Future<void> _enterRefPrice(({String base, String quote}) dir) async {
+    final ref = PriceService.instance.ref;
+    final baseTk = _tk(dir.base), quoteTk = _tk(dir.quote);
+    final quoteRef = _refPerUnit(dir.quote);
+    if (quoteRef == null || !(quoteRef > 0)) {
+      return _snack('Can\'t price $quoteTk in $ref right now — enter the price in $quoteTk directly.');
+    }
+    final ctl = TextEditingController();
+    final v = await showDialog<double>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AmbraColors.panel,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AmbraRadii.card)),
+        title: Text('Set price in $ref', style: AmbraText.title),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('Enter what 1 $baseTk is worth in $ref; it converts to your $quoteTk price.', style: AmbraText.sub),
+          const SizedBox(height: 12),
+          TextField(
+            controller: ctl,
+            autofocus: true,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            style: AmbraText.body,
+            onSubmitted: (_) => Navigator.pop(ctx, double.tryParse(ctl.text.trim())),
+            decoration: InputDecoration(
+              hintText: '0.00',
+              hintStyle: const TextStyle(color: AmbraColors.dim),
+              prefixText: '$ref ',
+              prefixStyle: AmbraText.body,
+              filled: true,
+              fillColor: AmbraColors.panelDeep,
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(AmbraRadii.input),
+                borderSide: const BorderSide(color: AmbraColors.line),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(AmbraRadii.input),
+                borderSide: const BorderSide(color: AmbraColors.amber),
+              ),
+            ),
+          ),
+        ]),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text('Cancel', style: AmbraText.body.copyWith(color: AmbraColors.dim)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, double.tryParse(ctl.text.trim())),
+            child: Text('Set price', style: AmbraText.body.copyWith(color: AmbraColors.amber)),
+          ),
+        ],
+      ),
+    );
+    ctl.dispose();
+    if (v == null || !mounted) return;
+    final price = v / quoteRef; // (1 base in ref) / (1 quote in ref) = quote per base
+    if (!(price > 0) || !price.isFinite) {
+      return _snack('Couldn\'t convert that price — enter it in $quoteTk directly.');
+    }
+    _priceAmount.text = _trim(price); // triggers _onPriceChanged -> held limit price + derive the amount
+  }
+
   /// A Market sweep estimate over the same-chain book for buying [wantBase] base atoms: the VWAP, the
   /// worst price level touched, the inside (best) price, and whether the book can't fully fill. A direct
   /// port of the web wallet's sweepEstimate (swap.js) — the taker walks cheapest-first covenant SELLs,
@@ -1443,10 +1672,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     final baseTk = _tk(dir.base), quoteTk = _tk(dir.quote);
     // LIMIT / POST (including the blinded book, which is post-only): an editable price input.
     if (_mode == 'post') {
+      final ref = PriceService.instance.ref;
       final inside = _insidePrice();
       final String note;
       if (_priceTyped) {
-        note = 'Your limit price · the order rests until a taker crosses it.';
+        note = 'Your limit price · fills any crossing offers now, rests the remainder at this price.';
       } else if (inside != null) {
         note = 'Book inside · ${_fmtPrice(inside)} $quoteTk per $baseTk — or type your own.';
       } else {
@@ -1463,7 +1693,24 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           ),
           Padding(
             padding: const EdgeInsets.only(top: 6, left: 4),
-            child: Text(note, style: AmbraText.sub.copyWith(color: AmbraColors.dim)),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Expanded(child: Text(note, style: AmbraText.sub.copyWith(color: AmbraColors.dim))),
+              const SizedBox(width: 8),
+              // ⇄ enter the price IN the reference currency (spec §6.2): converts a "1 base = X $ref" value
+              // to the quote-per-base price via the price-server rate — the price-field twin of _refLine.
+              InkWell(
+                borderRadius: BorderRadius.circular(6),
+                onTap: () => _enterRefPrice(dir),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2, horizontal: 2),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(Icons.swap_horiz, size: 12, color: AmbraColors.amber.withValues(alpha: 0.8)),
+                    const SizedBox(width: 3),
+                    Text('in $ref', style: AmbraText.sub.copyWith(color: AmbraColors.amber.withValues(alpha: 0.8))),
+                  ]),
+                ),
+              ),
+            ]),
           ),
         ]),
       );
@@ -1610,10 +1857,8 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
                     : isCross
                         ? 'Review swap'
                         : _confBook
-                            ? 'Review & post (blinded)'
-                            : _mode == 'take'
-                                ? 'Review & take'
-                                : 'Review & post',
+                            ? 'Review order (blinded)'
+                            : 'Review order',
             icon: !railsChosen
                 ? Icons.alt_route
                 : sameChainLnUnbuilt
@@ -1669,9 +1914,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       const SizedBox(height: 18),
       const SectionLabel('You receive'),
       const SizedBox(height: 8),
-      _PickerRow(label: recvTk, onTap: _pickReceive),
+      // Receive has no default (spec §6.5): until the user picks one the row prompts a choice and the
+      // amount label reads generically, so the composer renders cleanly with _receiveAsset == null.
+      _PickerRow(label: _receiveAsset == null ? 'Select asset' : recvTk, onTap: _pickReceive),
       const SizedBox(height: 12),
-      AmbraField(label: 'Amount ($recvTk)', controller: _recvAmount, hint: '0.0'),
+      AmbraField(label: 'Amount (${_receiveAsset == null ? 'receive' : recvTk})', controller: _recvAmount, hint: '0.0'),
       _refLine(_recvAmount, _receiveAsset), // ≈ reference-currency valuation (spec §6.2)
       const SizedBox(height: 14),
       _priceField(), // editable limit price / read-only market estimate — IDENTICAL on every pair (§6.4)
@@ -1884,7 +2131,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   /// between the on-chain cross, pure-Lightning, and sub-asset flows. When a leg is set to Lightning but
   /// has no usable channel yet, an honest note says so rather than silently promising "Instant".
   Widget _railPicks() {
-    final ra = LightningService.instance.available ? _railAvail() : null;
+    // Per-leg verdicts (spec §5): populate whenever Lightning is CONFIGURED — NOT gated on the global
+    // `available` flag. `available` is false whenever ANY enabled hub's live link is down (e.g. the BTC
+    // node), which wrongly hid a leg the wallet holds a funded channel for. The per-leg verdict reads the
+    // real _lnChannels + _frontable snapshot, so each leg is judged on its OWN liquidity.
+    final ra = LightningService.instance.configured ? _railAvail() : null;
     // ln is NULLABLE: null = unselected (no default). Neither button highlights until the user picks.
     Widget leg(String label, bool? ln, LegOption? verdict, ValueChanged<bool> onChanged) {
       Widget opt(String text, IconData icon, bool value) {
@@ -1919,15 +2170,20 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           const SizedBox(width: 10),
           opt('Lightning', Icons.bolt, true),
         ]),
-        // Honest per-leg note: this leg is set to Lightning but has no usable channel yet (mirrors the
-        // web's renderRailNote). Never silently promise "Instant" when a channel must be arranged first.
-        if (ln == true && !LightningService.instance.available) ...[
+        // Honest per-leg note (spec §5), gated on the PER-LEG verdict — never the global LN flag. A leg
+        // with a funded channel (ok) reads live; a channel-less-but-frontable leg (provisionable) is
+        // opened for you at placement; a genuinely unfrontable leg is honestly unavailable (its reason +
+        // hint from ln_rail carry that wording). Only when Lightning is not configured at all do we say so.
+        if (ln == true && verdict != null) ...[
+          const SizedBox(height: 6),
+          Text(
+            verdict.ok ? 'Lightning is live for this leg.' : '${verdict.reason} ${verdict.hint}',
+            style: AmbraText.sub.copyWith(color: verdict.ok ? AmbraColors.green : AmbraColors.dim),
+          ),
+        ] else if (ln == true && !LightningService.instance.configured) ...[
           const SizedBox(height: 6),
           Text('Lightning isn\'t set up yet · choose On-chain, or open a channel from the Balance tab.',
               style: AmbraText.sub.copyWith(color: AmbraColors.dim)),
-        ] else if (ln == true && verdict != null && !verdict.ok) ...[
-          const SizedBox(height: 6),
-          Text('${verdict.reason} ${verdict.hint}', style: AmbraText.sub.copyWith(color: AmbraColors.dim)),
         ],
       ]);
     }
@@ -1989,6 +2245,9 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   /// One-line "how it settles" summary for the resolved cross route, with an honest caveat when a
   /// Lightning leg has no usable channel yet (so we never promise a bare "Instant" before one opens).
   Widget _routeSummary(SwapRoute r) {
+    // No pair resolved yet (e.g. receive not chosen): nothing to summarise — the composer shows the picker
+    // prompt instead of an empty route card.
+    if (!r.isValid) return const SizedBox.shrink();
     var text = r.timing;
     // Dead rail: selling an asset for BTC on-chain (reverse cross courier) isn't built. Say so plainly
     // and point at the live sell rails, instead of the timing line that reads as a promise of settlement.
@@ -2321,7 +2580,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         const SizedBox(width: 10),
         Expanded(
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('Post a blinded offer', style: AmbraText.body.copyWith(color: AmbraColors.amber)),
+            Text('Rest a blinded offer', style: AmbraText.body.copyWith(color: AmbraColors.amber)),
             const SizedBox(height: 4),
             const Text(
               'Your offer rests confidentially with a blinded receive address. Lifting a blinded '
@@ -2367,9 +2626,9 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     }
 
     return Row(children: [
-      seg('take', 'Take · Market', 'lift a resting offer'),
+      seg('take', 'Market', 'fill now against the book'),
       const SizedBox(width: 10),
-      seg('post', 'Post · Limit', 'rest your own price'),
+      seg('post', 'Limit', 'fill now, rest the rest at your price'),
     ]);
   }
 
@@ -2414,8 +2673,8 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           const SizedBox(height: 6),
           Text(
               _confBook
-                  ? 'Post a blinded offer to start this confidential market — you set the price.'
-                  : 'Post a limit order to start this market — you set the price.',
+                  ? 'Rest a blinded offer to start this confidential market — you set the price.'
+                  : 'Place a limit order to start this market — you set the price.',
               style: AmbraText.sub),
         ]),
       );
@@ -2726,6 +2985,153 @@ String _feeWithApprox(String hex, BigInt atoms) {
   return approx == null ? amt : '$amt  ($approx)';
 }
 
+/// Execute a planned MARKET sweep by looping the PROVEN covenant FILL primitive once per level (spec §4):
+/// build -> broadcast -> sync -> next. Each fill is atomic (settles in full or not at all) and
+/// consensus-exact, so a level that fails (a covenant just taken by someone else, transient) is SKIPPED and
+/// the walk continues — nothing strands. Returns the broadcast txids (one per settled level). Throws when
+/// there were fills to attempt but EVERY one failed; returns [] when [fills] is empty (the caller decides
+/// what an empty result means — for a Market order it is "nothing filled", for a LIMIT it is "no crossing
+/// portion, just rest"). Does NOT authenticate or read the mnemonic: the caller authenticates once and
+/// passes [mnemonic], so a LIMIT order's single auth covers both its take and rest legs. This is the ONE
+/// settlement path shared by the Market review sheet AND a LIMIT order's take-first leg.
+Future<List<String>> _executeMarketFills({
+  required String mnemonic,
+  required List<MarketFill> fills,
+  required String payAsset,
+  required String recvAsset,
+  required String feeAsset,
+  required BigInt feeAtomsPerFill,
+  void Function(String)? onStatus,
+}) async {
+  final recvTk = SeqAssets.labelFor(recvAsset).ticker;
+  final payTk = SeqAssets.labelFor(payAsset).ticker;
+  final txids = <String>[];
+  Object? lastErr;
+  for (var i = 0; i < fills.length; i++) {
+    final f = fills[i];
+    onStatus?.call('Filling level ${i + 1} of ${fills.length}…');
+    try {
+      final built = await core.covenantBuildFillTx(
+        mnemonic: mnemonic,
+        esploraUrl: Backend.esplora,
+        covenantTermsJson: f.offer.covenantTermsJson,
+        takeAtoms: f.take,
+        feeAsset: feeAsset,
+        feeAtoms: feeAtomsPerFill,
+      );
+      final txid = await core.xchainSeqBroadcast(seqEsplora: Backend.esplora, txHex: built.rawHex);
+      txids.add(txid);
+      await TradeReceipts.log(id: 'take:$txid', title: 'Bought $recvTk with $payTk', status: 'Filled', txid: txid);
+      // Reflect the spent UTXOs (+ the fill's change) before the next spend, so a multi-level sweep never
+      // tries to re-spend a coin the previous level already consumed.
+      if (i + 1 < fills.length) {
+        onStatus?.call('Updating balances…');
+        try {
+          await core.syncWallet(mnemonic: mnemonic, esploraUrl: Backend.esplora);
+        } catch (_) {/* transient; the next build re-fetches UTXOs from esplora regardless */}
+      }
+    } catch (e) {
+      // A single level failing (covenant already taken, transient) must NOT abort the sweep — skip it and
+      // walk on. Nothing is committed for a failed fill (build+broadcast is atomic), so skipping strands
+      // nothing.
+      lastErr = e;
+    }
+  }
+  if (txids.isEmpty && lastErr != null) {
+    throw Exception(lastErr.toString().replaceFirst('Exception: ', ''));
+  }
+  return txids;
+}
+
+/// Rest a covenant LIMIT order (or the unfilled REMAINDER of one) via the PROVEN post path: derive the
+/// covenant, fund it on-chain from the wallet, persist its reclaim material BEFORE posting (fund-safety, so
+/// a post failure never strands the funds without a local record), then sign + post the offer to the relay.
+/// Returns the covenant funding txid. Does NOT authenticate or read the mnemonic (the caller does). The ONE
+/// rest-settlement path shared by the pure-rest Limit review sheet AND a crossing LIMIT order's rest leg.
+Future<String> _executeRestPost({
+  required String mnemonic,
+  required String payAsset,
+  required BigInt sellAtoms,
+  required String recvAsset,
+  required BigInt buyAtoms,
+  required String feeAsset,
+  required BigInt feeRate,
+  required int tipHeight,
+  void Function(String)? onStatus,
+}) async {
+  onStatus?.call('Deriving the covenant…');
+  final makerIndex = _SwapCache.makerIndexSeed++;
+  final prepared = await core.covenantPrepareOffer(
+    mnemonic: mnemonic,
+    sellAsset: payAsset,
+    sellAtoms: sellAtoms,
+    buyAsset: recvAsset,
+    buyAtoms: buyAtoms,
+    tipHeight: tipHeight,
+    expiryBlocks: 0, // 0 => default ~1 day horizon
+    makerIndex: makerIndex,
+  );
+
+  onStatus?.call('Funding the order on-chain…');
+  final fa = feeAsset == SeqAssets.policy ? null : core.FeeAsset(assetId: feeAsset, rate: feeRate);
+  final pset = await core.buildSendTx(
+    mnemonic: mnemonic,
+    esploraUrl: Backend.esplora,
+    recipients: [
+      core.Recipient(address: prepared.covenantAddress, assetId: payAsset, satoshi: sellAtoms),
+    ],
+    feeRateSatKvb: null,
+    feeAsset: fa,
+  );
+  final signed = await core.signPset(mnemonic: mnemonic, pset: pset);
+  final covTxid = await core.finalizeAndBroadcast(mnemonic: mnemonic, esploraUrl: Backend.esplora, pset: signed);
+
+  onStatus?.call('Locating the funded output…');
+  final covVout = await resolveCovenantVout(covTxid, prepared.covenantSpkHex);
+
+  // FUND-SAFETY: the covenant is now funded ON-CHAIN. Persist its reclaim material (funding outpoint +
+  // preparedJson + makerIndex + expiry) BEFORE finalizing and posting, so a post failure (relay reject,
+  // dropped connection) can never strand the funds without a local record to reclaim them.
+  var placed = PlacedCovenant(
+    covTxid: covTxid,
+    covVout: covVout,
+    pay: payAsset,
+    receive: recvAsset,
+    sellAtoms: sellAtoms.toString(),
+    recvAtoms: buyAtoms.toString(),
+    makerIndex: makerIndex,
+    covenantSpkHex: prepared.covenantSpkHex,
+    preparedJson: prepared.preparedJson,
+    expiryLocktime: prepared.expiryLocktime,
+    posted: false,
+    createdMs: DateTime.now().millisecondsSinceEpoch,
+  );
+  await PlacedOrders.put(placed);
+
+  onStatus?.call('Signing & posting your order…');
+  final signedOffer = await core.covenantFinalizeOffer(
+    mnemonic: mnemonic,
+    preparedJson: prepared.preparedJson,
+    covenantTxid: covTxid,
+    covenantVout: covVout,
+  );
+  final offer = jsonDecode(signedOffer) as Map<String, dynamic>;
+  placed = placed.copyWith(offerId: offer['offer_id'] as String?);
+  await PlacedOrders.put(placed);
+  await SeqObClient.postOffer(offer);
+  await PlacedOrders.put(placed.copyWith(posted: true));
+
+  final sellTk = SeqAssets.labelFor(payAsset).ticker;
+  final wantTk = SeqAssets.labelFor(recvAsset).ticker;
+  final offerId = '${offer['offer_id'] ?? ''}';
+  await TradeReceipts.log(
+    id: 'post:${offerId.isEmpty ? covTxid : offerId}',
+    title: 'Rested $sellTk→$wantTk order',
+    status: 'Resting',
+  );
+  return covTxid;
+}
+
 class _PickerRow extends StatelessWidget {
   const _PickerRow({required this.label, this.trailing, this.onTap});
   final String label;
@@ -2836,45 +3242,21 @@ class _MarketWalkReviewSheetState extends State<_MarketWalkReviewSheet> {
       }
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) throw Exception('wallet unavailable');
-      final fills = widget.plan.fills;
-      final recvTk = SeqAssets.labelFor(widget.recvAsset).ticker;
-      final payTk = SeqAssets.labelFor(widget.payAsset).ticker;
-      final txids = <String>[];
-      Object? lastErr;
-      for (var i = 0; i < fills.length; i++) {
-        final f = fills[i];
-        setState(() => _status = 'Filling level ${i + 1} of ${fills.length}…');
-        try {
-          final built = await core.covenantBuildFillTx(
-            mnemonic: m,
-            esploraUrl: Backend.esplora,
-            covenantTermsJson: f.offer.covenantTermsJson,
-            takeAtoms: f.take,
-            feeAsset: widget.feeAsset,
-            feeAtoms: widget.feeAtomsPerFill,
-          );
-          final txid = await core.xchainSeqBroadcast(seqEsplora: Backend.esplora, txHex: built.rawHex);
-          txids.add(txid);
-          await TradeReceipts.log(id: 'take:$txid', title: 'Bought $recvTk with $payTk', status: 'Filled', txid: txid);
-          // Reflect the spent UTXOs (+ the fill's change) before building the next level's spend, so a
-          // multi-level sweep never tries to re-spend a coin the previous level already consumed.
-          if (i + 1 < fills.length) {
-            setState(() => _status = 'Updating balances…');
-            try {
-              await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
-            } catch (_) {/* transient; the next build re-fetches UTXOs from esplora regardless */}
-          }
-        } catch (e) {
-          // A single level failing (covenant already taken, transient) must NOT abort the sweep — skip it
-          // and walk on. Nothing is committed for a failed fill (build+broadcast is atomic), so skipping
-          // strands nothing.
-          lastErr = e;
-        }
-      }
+      // One payment auth covers the whole sweep; the shared helper loops the proven covenant FILL primitive
+      // per level (build → settle → sync → next), skipping any level that fails.
+      final txids = await _executeMarketFills(
+        mnemonic: m,
+        fills: widget.plan.fills,
+        payAsset: widget.payAsset,
+        recvAsset: widget.recvAsset,
+        feeAsset: widget.feeAsset,
+        feeAtomsPerFill: widget.feeAtomsPerFill,
+        onStatus: (s) {
+          if (mounted) setState(() => _status = s);
+        },
+      );
       if (txids.isEmpty) {
-        throw Exception(lastErr == null
-            ? 'Nothing on the book could be filled — switch to Limit to rest an order.'
-            : lastErr.toString().replaceFirst('Exception: ', ''));
+        throw Exception('Nothing on the book could be filled — switch to Limit to rest an order.');
       }
       if (mounted) Navigator.pop(context, txids.first);
     } catch (e) {
@@ -2981,82 +3363,21 @@ class _PostReviewSheetState extends State<_PostReviewSheet> {
       }
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) throw Exception('wallet unavailable');
-
-      setState(() => _status = 'Deriving the covenant…');
-      final makerIndex = _SwapCache.makerIndexSeed++;
-      final prepared = await core.covenantPrepareOffer(
+      // Pure-rest LIMIT (nothing crossed): the shared post helper derives + funds the covenant, persists
+      // its reclaim material before posting, then signs + posts the resting offer.
+      final covTxid = await _executeRestPost(
         mnemonic: m,
-        sellAsset: widget.payAsset,
+        payAsset: widget.payAsset,
         sellAtoms: widget.sellAtoms,
-        buyAsset: widget.recvAsset,
+        recvAsset: widget.recvAsset,
         buyAtoms: widget.buyAtoms,
+        feeAsset: widget.feeAsset,
+        feeRate: widget.feeRate,
         tipHeight: widget.tipHeight,
-        expiryBlocks: 0, // 0 => default ~1 day horizon
-        makerIndex: makerIndex,
+        onStatus: (s) {
+          if (mounted) setState(() => _status = s);
+        },
       );
-
-      setState(() => _status = 'Funding the order on-chain…');
-      final feeAsset = widget.feeAsset == SeqAssets.policy
-          ? null
-          : core.FeeAsset(assetId: widget.feeAsset, rate: widget.feeRate);
-      final pset = await core.buildSendTx(
-        mnemonic: m,
-        esploraUrl: Backend.esplora,
-        recipients: [
-          core.Recipient(address: prepared.covenantAddress, assetId: widget.payAsset, satoshi: widget.sellAtoms),
-        ],
-        feeRateSatKvb: null,
-        feeAsset: feeAsset,
-      );
-      final signed = await core.signPset(mnemonic: m, pset: pset);
-      final covTxid = await core.finalizeAndBroadcast(mnemonic: m, esploraUrl: Backend.esplora, pset: signed);
-
-      setState(() => _status = 'Locating the funded output…');
-      final covVout = await resolveCovenantVout(covTxid, prepared.covenantSpkHex);
-
-      // FUND-SAFETY: the covenant is now funded ON-CHAIN. Persist its reclaim material (the funding
-      // outpoint + preparedJson + makerIndex + expiry) BEFORE finalizing and posting, so a post failure
-      // (relay reject, dropped connection) can never strand the funds without a local record to reclaim
-      // them. Flip posted:true once the relay accepts the offer.
-      var placed = PlacedCovenant(
-        covTxid: covTxid,
-        covVout: covVout,
-        pay: widget.payAsset,
-        receive: widget.recvAsset,
-        sellAtoms: widget.sellAtoms.toString(),
-        recvAtoms: widget.buyAtoms.toString(),
-        makerIndex: makerIndex,
-        covenantSpkHex: prepared.covenantSpkHex,
-        preparedJson: prepared.preparedJson,
-        expiryLocktime: prepared.expiryLocktime,
-        posted: false,
-        createdMs: DateTime.now().millisecondsSinceEpoch,
-      );
-      await PlacedOrders.put(placed);
-
-      setState(() => _status = 'Signing & posting your order…');
-      final signedOffer = await core.covenantFinalizeOffer(
-        mnemonic: m,
-        preparedJson: prepared.preparedJson,
-        covenantTxid: covTxid,
-        covenantVout: covVout,
-      );
-      final offer = jsonDecode(signedOffer) as Map<String, dynamic>;
-      placed = placed.copyWith(offerId: offer['offer_id'] as String?);
-      await PlacedOrders.put(placed);
-      await SeqObClient.postOffer(offer);
-      await PlacedOrders.put(placed.copyWith(posted: true));
-
-      // Local activity receipt: the offer is now accepted by the relay and resting.
-      final sellTk = SeqAssets.labelFor(widget.payAsset).ticker;
-      final wantTk = SeqAssets.labelFor(widget.recvAsset).ticker;
-      final offerId = '${offer['offer_id'] ?? ''}';
-      await TradeReceipts.log(
-        id: 'post:${offerId.isEmpty ? covTxid : offerId}',
-        title: 'Posted $sellTk→$wantTk order',
-        status: 'Resting',
-      );
-
       if (mounted) Navigator.pop(context, covTxid);
     } catch (e) {
       if (mounted) {
@@ -3074,7 +3395,7 @@ class _PostReviewSheetState extends State<_PostReviewSheet> {
       child: Padding(
         padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
         child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          const Text('Review · post limit order', style: AmbraText.h1),
+          const Text('Review · limit order', style: AmbraText.h1),
           const SizedBox(height: 18),
           AmbraCard(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
@@ -3091,7 +3412,195 @@ class _PostReviewSheetState extends State<_PostReviewSheet> {
             Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_status, style: AmbraText.muted)),
           if (_error != null)
             Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
-          PrimaryButton(label: 'Confirm & post', busy: _busy, icon: Icons.fingerprint, onPressed: _busy ? null : _confirm),
+          PrimaryButton(label: 'Confirm & place', busy: _busy, icon: Icons.fingerprint, onPressed: _busy ? null : _confirm),
+          const SizedBox(height: 6),
+          GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
+        ]),
+      ),
+    );
+  }
+}
+
+/// Review + execute a LIMIT order's FILL-THEN-REST (spec §4, §6.7): the split shown IS what runs (Review ==
+/// execution). On confirm it (1) walks the crossing offers with the PROVEN covenant FILL primitive
+/// ([_executeMarketFills]), then (2) rests the EXACT unfilled remainder at the limit price with the PROVEN
+/// covenant post ([_executeRestPost]). ONE payment auth covers both legs. Each fill is atomic and the rest
+/// persists its reclaim material before posting, so a mid-flight failure strands nothing. This sheet only
+/// opens when the order crosses something; a pure-rest limit uses [_PostReviewSheet] instead.
+class _LimitReviewSheet extends StatefulWidget {
+  const _LimitReviewSheet({
+    required this.plan,
+    required this.payAsset,
+    required this.recvAsset,
+    required this.takeFeeAsset,
+    required this.takeFeeAtomsPerFill,
+    required this.restSellAtoms,
+    required this.restBuyAtoms,
+    required this.restFeeAsset,
+    required this.restFeeAtoms,
+    required this.restFeeRate,
+    required this.tipHeight,
+  });
+  final MarketWalkPlan plan;
+  final String payAsset;
+  final String recvAsset;
+  final String takeFeeAsset;
+  final BigInt takeFeeAtomsPerFill;
+  final BigInt restSellAtoms; // pay atoms locked in the resting covenant (0 => fully crossed, no rest)
+  final BigInt restBuyAtoms; // receive atoms the resting covenant wants (0 => no remainder)
+  final String restFeeAsset;
+  final BigInt restFeeAtoms;
+  final BigInt restFeeRate;
+  final int tipHeight;
+  @override
+  State<_LimitReviewSheet> createState() => _LimitReviewSheetState();
+}
+
+class _LimitReviewSheetState extends State<_LimitReviewSheet> {
+  bool _busy = false;
+  String _status = '';
+  String? _error;
+
+  bool get _willRest => widget.restBuyAtoms > BigInt.zero && widget.restSellAtoms > BigInt.zero;
+
+  String _amt(String hex, BigInt atoms) {
+    final l = SeqAssets.labelFor(hex);
+    return '${formatAtoms(atoms.toString(), l.precision)} ${l.ticker}';
+  }
+
+  static double _p10(int n) {
+    var v = 1.0;
+    for (var i = 0; i < n; i++) {
+      v *= 10;
+    }
+    return v;
+  }
+
+  static String _fmtNum(double n) {
+    if (!n.isFinite || n == 0) return '0';
+    final a = n.abs();
+    final dp = a >= 1000 ? 2 : (a >= 1 ? 4 : (a >= 0.01 ? 6 : 8));
+    var s = n.toStringAsFixed(dp);
+    if (s.contains('.')) s = s.replaceAll(RegExp(r'0+$'), '').replaceAll(RegExp(r'\.$'), '');
+    return s;
+  }
+
+  /// The realised take price as a "1 receive = N pay" line (plan.vwap is pay-per-receive in ATOM terms).
+  String _takePriceLine() {
+    final p = widget.plan;
+    if (!(p.vwap > 0)) return '—';
+    final payTk = SeqAssets.labelFor(widget.payAsset).ticker;
+    final recvTk = SeqAssets.labelFor(widget.recvAsset).ticker;
+    final payPrec = SeqAssets.labelFor(widget.payAsset).precision;
+    final recvPrec = SeqAssets.labelFor(widget.recvAsset).precision;
+    final v = p.vwap * _p10(recvPrec) / _p10(payPrec);
+    return '~${_fmtNum(v)} $payTk per $recvTk';
+  }
+
+  Future<void> _confirm() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+      _status = 'Authenticating…';
+    });
+    try {
+      // ONE payment auth covers BOTH legs (the take fills + the rest funding). Fail-closed.
+      final ok = await WalletRepository.instance.requirePaymentAuth();
+      if (!ok) {
+        setState(() {
+          _busy = false;
+          _error = 'Authentication failed or cancelled; nothing sent.';
+        });
+        return;
+      }
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) throw Exception('wallet unavailable');
+
+      // (1) TAKE: walk the crossing offers, each an atomic covenant fill (best price first, up to the limit).
+      final txids = await _executeMarketFills(
+        mnemonic: m,
+        fills: widget.plan.fills,
+        payAsset: widget.payAsset,
+        recvAsset: widget.recvAsset,
+        feeAsset: widget.takeFeeAsset,
+        feeAtomsPerFill: widget.takeFeeAtomsPerFill,
+        onStatus: (s) {
+          if (mounted) setState(() => _status = s);
+        },
+      );
+
+      // (2) REST the remainder at the limit price. Sync first so the covenant funding sees the coins the
+      // take fills just spent. A rest failure after a successful take is surfaced, but the fills settled
+      // and nothing is stranded (the received asset is in the wallet; the user can re-rest the remainder).
+      String? restTxid;
+      if (_willRest) {
+        setState(() => _status = 'Updating balances…');
+        try {
+          await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
+        } catch (_) {/* the covenant funding re-fetches UTXOs from esplora regardless */}
+        restTxid = await _executeRestPost(
+          mnemonic: m,
+          payAsset: widget.payAsset,
+          sellAtoms: widget.restSellAtoms,
+          recvAsset: widget.recvAsset,
+          buyAtoms: widget.restBuyAtoms,
+          feeAsset: widget.restFeeAsset,
+          feeRate: widget.restFeeRate,
+          tipHeight: widget.tipHeight,
+          onStatus: (s) {
+            if (mounted) setState(() => _status = s);
+          },
+        );
+      }
+
+      final result = txids.isNotEmpty ? txids.first : restTxid;
+      if (result == null) throw Exception('Nothing could be filled or rested — try again.');
+      if (mounted) Navigator.pop(context, result);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = e.toString().replaceFirst('Exception: ', '');
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final p = widget.plan;
+    final n = p.fills.length;
+    final takeFee = _feeWithApprox(widget.takeFeeAsset, widget.takeFeeAtomsPerFill);
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          const Text('Review · limit order', style: AmbraText.h1),
+          const SizedBox(height: 18),
+          AmbraCard(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Column(children: [
+              _Row('Fills now', '~${_amt(widget.recvAsset, p.totalRecv)} for up to ${_amt(widget.payAsset, p.totalPay)}'),
+              _Row('Fill price', _takePriceLine()),
+              if (n > 1) _Row('Across', 'walks $n resting offers, best price first'),
+              if (_willRest)
+                _Row('Then rests',
+                    '${_amt(widget.recvAsset, widget.restBuyAtoms)} for ${_amt(widget.payAsset, widget.restSellAtoms)} at your price')
+              else
+                _Row('Remainder', 'Your order fully crosses now — nothing is left to rest.'),
+              _Row('Take fee', '$takeFee  (per level)'),
+              if (_willRest) _Row('Rest funding fee', _feeWithApprox(widget.restFeeAsset, widget.restFeeAtoms)),
+              _Row('Settlement',
+                  'Each fill is a permissionless covenant fill (settles in full or not at all); the remainder rests as a funded covenant.'),
+              _Row('Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'),
+            ]),
+          ),
+          const SizedBox(height: 14),
+          if (_busy && _status.isNotEmpty)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_status, style: AmbraText.muted)),
+          if (_error != null)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
+          PrimaryButton(label: 'Confirm & place', busy: _busy, icon: Icons.fingerprint, onPressed: _busy ? null : _confirm),
           const SizedBox(height: 6),
           GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
         ]),
@@ -3164,7 +3673,7 @@ class _PeggedPostReviewSheetState extends State<_PeggedPostReviewSheet> {
       final assetTk = SeqAssets.labelFor(widget.assetHex).ticker;
       await TradeReceipts.log(
         id: 'peg:${placed.covTxid}',
-        title: 'Posted BTC→$assetTk order (offline-resting)',
+        title: 'Rested BTC→$assetTk order (offline-resting)',
         status: 'Resting',
         txid: placed.covTxid,
       );
@@ -3447,7 +3956,7 @@ class _ConfPostReviewSheetState extends State<_ConfPostReviewSheet> {
       child: Padding(
         padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
         child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          const Text('Review · post blinded offer', style: AmbraText.h1),
+          const Text('Review · blinded offer', style: AmbraText.h1),
           const SizedBox(height: 18),
           AmbraCard(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
@@ -3466,7 +3975,7 @@ class _ConfPostReviewSheetState extends State<_ConfPostReviewSheet> {
             Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_status, style: AmbraText.muted)),
           if (_error != null)
             Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
-          PrimaryButton(label: 'Confirm & post', busy: _busy, icon: Icons.fingerprint, onPressed: _busy ? null : _confirm),
+          PrimaryButton(label: 'Confirm & place', busy: _busy, icon: Icons.fingerprint, onPressed: _busy ? null : _confirm),
           const SizedBox(height: 6),
           GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
         ]),
