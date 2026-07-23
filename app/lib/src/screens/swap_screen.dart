@@ -982,35 +982,70 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       // whose last rows (e.g. GOLD) hid behind the nav bar and could not be selected.
       isScrollControlled: true,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
-      builder: (_) => SafeArea(
-        child: ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.7),
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Padding(padding: const EdgeInsets.all(16), child: Text(title, style: AmbraText.title)),
-            if (ids.isEmpty)
-              const Padding(padding: EdgeInsets.all(16), child: Text('No assets available.', style: AmbraText.muted)),
-            Flexible(
-              child: ListView(
-                shrinkWrap: true,
-                padding: const EdgeInsets.only(bottom: 8),
-                children: [
-                  for (final id in ids)
-                    ListTile(
-                      title: Text(SeqAssets.labelFor(id).ticker, style: AmbraText.body),
-                      subtitle: SeqAssets.labelFor(id).subtitle != null
-                          ? Text(SeqAssets.labelFor(id).subtitle!, style: AmbraText.sub)
-                          : null,
-                      trailing: withBalance
-                          ? Text(formatAtoms(_bal(id), SeqAssets.labelFor(id).precision), style: AmbraText.mono)
-                          : null,
-                      onTap: () => Navigator.pop(context, id),
+      builder: (_) {
+        final search = TextEditingController();
+        return SafeArea(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.7),
+            child: StatefulBuilder(
+              builder: (context, setSheet) {
+                final q = search.text.trim().toLowerCase();
+                // Filter by ticker OR name (subtitle), case-insensitive.
+                final shown = q.isEmpty
+                    ? ids
+                    : ids.where((id) {
+                        final l = SeqAssets.labelFor(id);
+                        return l.ticker.toLowerCase().contains(q) ||
+                            (l.subtitle?.toLowerCase().contains(q) ?? false);
+                      }).toList();
+                return Column(mainAxisSize: MainAxisSize.min, children: [
+                  Padding(padding: const EdgeInsets.all(16), child: Text(title, style: AmbraText.title)),
+                  // Search box — only when the list is long enough to warrant it.
+                  if (ids.length > 6)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                      child: TextField(
+                        controller: search,
+                        style: AmbraText.body,
+                        decoration: const InputDecoration(
+                          hintText: 'Search assets',
+                          prefixIcon: Icon(Icons.search, size: 20),
+                          isDense: true,
+                        ),
+                        onChanged: (_) => setSheet(() {}),
+                      ),
                     ),
-                ],
-              ),
+                  if (shown.isEmpty)
+                    Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Text(ids.isEmpty ? 'No assets available.' : 'No asset matches your search.',
+                          style: AmbraText.muted),
+                    ),
+                  Flexible(
+                    child: ListView(
+                      shrinkWrap: true,
+                      padding: const EdgeInsets.only(bottom: 8),
+                      children: [
+                        for (final id in shown)
+                          ListTile(
+                            title: Text(SeqAssets.labelFor(id).ticker, style: AmbraText.body),
+                            subtitle: SeqAssets.labelFor(id).subtitle != null
+                                ? Text(SeqAssets.labelFor(id).subtitle!, style: AmbraText.sub)
+                                : null,
+                            trailing: withBalance
+                                ? Text(formatAtoms(_bal(id), SeqAssets.labelFor(id).precision), style: AmbraText.mono)
+                                : null,
+                            onTap: () => Navigator.pop(context, id),
+                          ),
+                      ],
+                    ),
+                  ),
+                ]);
+              },
             ),
-          ]),
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 
