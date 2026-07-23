@@ -288,7 +288,16 @@ class SeqObClient {
   /// offer's maker signature is checked locally (the relay is untrusted) and the FILL re-derives + checks
   /// the covenant against its on-chain scriptPubKey, so a lying relay cannot forge one. Cheapest
   /// asset-per-BTC first (best for the seller). Never throws (returns []).
-  static Future<List<SeqObOffer>> peggedBtcCovenants(String seqAsset) async {
+  ///
+  /// FUND-SAFETY (spec §5, web P1-W5): a covenant advertised as BTC is treated as PEGGED BTC only when
+  /// it genuinely LOCKS the known SBTC asset ([sbtcAssetId], `covenant.asset_a`). A BTC-advertised
+  /// covenant that locks any OTHER asset would let a lying/hostile maker collect the taker's asset while
+  /// the taker is promised real BTC on redeem but receives something else — a mis-sell. Such offers are
+  /// REFUSED here (dropped), so the pegged-covenant shelf can never carry a non-SBTC lock. When SBTC is
+  /// not registered on this network ([sbtcAssetId] == null) there is nothing to trust, so this returns [].
+  static Future<List<SeqObOffer>> peggedBtcCovenants(String seqAsset, {required String? sbtcAssetId}) async {
+    final sbtc = (sbtcAssetId ?? '').toLowerCase();
+    if (sbtc.isEmpty) return const []; // SBTC unavailable on this network -> no pegged covenants to trust
     final out = <SeqObOffer>[];
     final nowUnix = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     try {
@@ -303,6 +312,10 @@ class SeqObClient {
         if (offer == null || !offer.verified) continue; // the relay is untrusted
         if (!offer.isFillableCovenant) continue; // covenants only (advertised BTC, locks SBTC)
         if (offer.baseAtoms <= BigInt.zero) continue;
+        // MIS-SELL BINDING: require the covenant to actually lock SBTC (asset_a == the known SBTC id).
+        // Refuse a BTC-advertised covenant that locks anything else — we must never fill it as "pegged BTC".
+        final lockedAsset = (pick(offer.covenant ?? const {}, ['asset_a', 'assetA'])?.toString() ?? '').toLowerCase();
+        if (lockedAsset != sbtc) continue;
         out.add(offer);
       }
     } catch (_) {/* best-effort */}
