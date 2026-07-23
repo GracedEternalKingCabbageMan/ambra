@@ -84,4 +84,40 @@ void main() {
     final r = route(btc, seqA, payRailLn: true, recvRailLn: true, lnAvailable: false);
     expect(r.kind, SwapRouteKind.cross, reason: 'no Lightning -> both legs on-chain regardless of stale rail state');
   });
+
+  group('same-chain asset<->asset pure-LN (priority D)', () {
+    test('both legs Lightning + a known quote -> pure-LN asset<->asset route (not the covenant book)', () {
+      // seqB is the canonical quote; seqA the base. Paying the base, both rails LN.
+      final r = route(seqA, seqB, payRailLn: true, recvRailLn: true, lnAvailable: true, sameChainQuote: seqB);
+      expect(r.kind, SwapRouteKind.ln);
+      expect(r.assetAsset, isTrue);
+      expect(r.seqAsset, seqA, reason: 'the base leg');
+      expect(r.quoteAsset, seqB, reason: 'the counter asset takes BTC\'s structural place');
+      expect(r.payIsBtc, isFalse, reason: 'paying the base = a SELL of the base for the quote');
+      expect(r.payRail, 'ln');
+      expect(r.recvRail, 'ln');
+    });
+
+    test('paying the QUOTE asset over LN -> payIsBtc true (structural BUY of the base)', () {
+      final r = route(seqB, seqA, payRailLn: true, recvRailLn: true, lnAvailable: true, sameChainQuote: seqB);
+      expect(r.kind, SwapRouteKind.ln);
+      expect(r.payIsBtc, isTrue);
+      expect(r.seqAsset, seqA);
+      expect(r.quoteAsset, seqB);
+    });
+
+    test('only one leg Lightning -> stays same-chain covenant', () {
+      expect(route(seqA, seqB, payRailLn: true, recvRailLn: false, lnAvailable: true, sameChainQuote: seqB).kind,
+          SwapRouteKind.same);
+    });
+
+    test('both legs LN but no known quote -> stays same-chain covenant (never guesses the frame)', () {
+      expect(route(seqA, seqB, payRailLn: true, recvRailLn: true, lnAvailable: true).kind, SwapRouteKind.same);
+    });
+
+    test('both legs LN but Lightning unavailable -> same-chain covenant', () {
+      expect(route(seqA, seqB, payRailLn: true, recvRailLn: true, lnAvailable: false, sameChainQuote: seqB).kind,
+          SwapRouteKind.same);
+    });
+  });
 }

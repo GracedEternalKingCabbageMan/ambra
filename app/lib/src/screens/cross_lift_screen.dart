@@ -16,9 +16,10 @@ class CrossLiftScreen extends StatefulWidget {
   const CrossLiftScreen({super.key, required this.offer, this.requestedAtoms});
   final CrossOffer offer;
 
-  /// The asset amount (atoms) the user typed in the composer, if any. The cross rail lifts the chosen
-  /// offer WHOLE (no partial fill), so when the offer's size differs materially from this we say so
-  /// explicitly — otherwise a user who typed "1" could lock the Bitcoin for a 12-unit offer unaware.
+  /// The asset amount (atoms) the user typed in the composer, if any. The cross rail now PARTIAL-fills
+  /// (priority C): a slice smaller than the offer is couriered as the take amount and the maker quotes it
+  /// at the proportional BTC (forward CEIL, [CrossLiftService.requestAndValidateTerms]), so a taker who
+  /// typed "buy 10 of a 43" locks BTC for exactly 10. Only a size ≥ the offer lifts it whole.
   final BigInt? requestedAtoms;
 
   @override
@@ -64,7 +65,7 @@ class _CrossLiftScreenState extends State<CrossLiftScreen> {
       _error = null;
     });
     try {
-      final q = await CrossLiftService.requestAndValidateTerms(widget.offer);
+      final q = await CrossLiftService.requestAndValidateTerms(widget.offer, requestedAtoms: widget.requestedAtoms);
       if (!mounted) {
         await q.close();
         return;
@@ -184,9 +185,8 @@ class _CrossLiftScreenState extends State<CrossLiftScreen> {
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    'This offer fills in full — ${formatAtoms(_quote!.terms.assetAtoms.toString(), _aprec)} $_tk, '
-                    'more than the ${formatAtoms(widget.requestedAtoms!.toString(), _aprec)} $_tk you entered. '
-                    'Partial fills are not possible on the cross rail.',
+                    'This lift is for ${formatAtoms(_quote!.terms.assetAtoms.toString(), _aprec)} $_tk, '
+                    'more than the ${formatAtoms(widget.requestedAtoms!.toString(), _aprec)} $_tk you entered.',
                     style: AmbraText.sub.copyWith(color: AmbraColors.amber),
                   ),
                 ),

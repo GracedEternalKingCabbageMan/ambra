@@ -8,11 +8,13 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../data/api_client.dart';
+import '../data/book_levels.dart';
 import '../data/btc_state.dart';
 import '../data/config.dart';
 import '../data/format.dart';
 import '../data/lightning_service.dart';
 import '../data/ln_rail.dart';
+import '../data/market_walk.dart';
 import '../data/placed_orders.dart';
 import '../data/price_service.dart';
 import '../data/sbtc_peg_service.dart';
@@ -79,6 +81,15 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   final _payAmount = TextEditingController();
   final _recvAmount = TextEditingController();
   final _feeRateCtl = TextEditingController();
+  // The always-present PRICE field (spec §6.4). In Limit/POST it is EDITABLE ("your price", quote-per-base
+  // in the display frame): typing it derives the other amount from the anchor size (mirrors web
+  // applyPriceEdit); typing an amount re-derives it (or, once the user has typed a price, holds it and
+  // derives the amount instead). In Market/TAKE it is a read-only sweep estimate. `_priceTyped` = the user
+  // set a limit price (so amount edits derive from it, and paints don't clobber it); `_settingPrice`
+  // guards a programmatic write so the listener doesn't mistake it for user input.
+  final _priceAmount = TextEditingController();
+  bool _priceTyped = false;
+  bool _settingPrice = false;
 
   List<Market> _markets = [];
   // Cross-chain (BTC <-> Sequentia asset) markets. Their presence is what makes BTC
@@ -111,6 +122,12 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   // as provisionable, never pessimised). Fed into railAvailability so the composer copy is honest:
   // fronted/own-channel (ok) vs provisionable (near-instant, opened at placement) vs unfrontable.
   Frontable? _frontable;
+
+  // This wallet's OWN seqob maker identity pubkey (best-effort, from the mnemonic). A same-chain MARKET
+  // sweep must never SELF-FILL its own resting covenant (it would pay itself + burn fees), so the
+  // book-walk planner ([planMarketWalk]) is handed this to skip the taker's own offers — the twin of the
+  // web wallet's `makerPubHex()` self-filter in takeMarketWalk.
+  String? _ownMakerPub;
 
   // Book namespace: Unblinded (transparent, the default, byte-identical to the
   // live covenant rail) vs Blinded (confidential). The Blinded book routes to the
@@ -154,6 +171,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   bool _bookLoading = false;
   String? _error;
   String? _actionError;
+  // Distinguishes the three empty-book states (spec §3, ux-audit T7/T14): null = the fetch succeeded (an
+  // empty book then means "no offers yet — post a limit"); 'unreachable' = the relay fetch THREW (a
+  // transient/connectivity failure — "order book unreachable, retrying"), which must never read as
+  // "no market". Set in [_fetchBook]; cleared on any successful book fetch.
+  String? _bookError;
 
   // --- live market data (foreground poll; the web uses a WS, mobile polls) -----
   // A 5s foreground poll refreshes the book + trades + stats. It pauses in the
@@ -188,6 +210,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     LightningService.instance.addListener(_onLnChanged);
     _payAmount.addListener(_onPayChanged);
     _recvAmount.addListener(_onRecvChanged);
+    _priceAmount.addListener(_onPriceChanged);
     _startPoll();
     _loadReceipts();
     if (_SwapCache.markets != null) {
@@ -248,8 +271,10 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     LightningService.instance.removeListener(_onLnChanged);
     _payAmount.removeListener(_onPayChanged);
     _recvAmount.removeListener(_onRecvChanged);
+    _priceAmount.removeListener(_onPriceChanged);
     _payAmount.dispose();
     _recvAmount.dispose();
+    _priceAmount.dispose();
     _feeRateCtl.dispose();
     super.dispose();
   }
@@ -311,6 +336,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       if (!mounted || _payAsset != pay || _receiveAsset != recv) return;
       setState(() {
         _orderBook = book;
+        _bookError = null; // a live poll succeeded -> clear any prior "unreachable"
         if (_confBook) {
           _selected = null;
           _mode = 'post';
@@ -453,6 +479,8 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       // opens that screen directly, so without this banner a mid-flight swap (and its
       // CLTV refund) would be stranded off-screen.
       try { _xInFlight = await XchainStore.inFlightWithFunds(); } catch (_) { _xInFlight = null; }
+      // Own maker identity, so a MARKET book-walk never self-fills this wallet's own resting covenants.
+      try { _ownMakerPub = await core.seqobMakerPubkey(mnemonic: m); } catch (_) {/* self-filter is best-effort */}
       try {
         final rates = await ApiClient.feeRates();
         if (mounted && rates.isNotEmpty) _feeRates = rates;
@@ -749,12 +777,14 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       _crossOffers = const [];
       _peggedOffers = const [];
       _bookLoading = true;
+      _bookError = null;
     });
     try {
       final book = await SeqObClient.fetchBook(recv, pay, confidential: _confBook);
       if (!mounted) return;
       setState(() {
         _orderBook = book;
+        _bookError = null;
         // Blinded offers rest as interactive intents (no covenant to lift), so
         // they are never auto-selected for a TAKE.
         _selected = _confBook ? null : book.best;
@@ -772,7 +802,10 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         _orderBook = null;
         _selected = null;
         _bookLoading = false;
-        // A missing book is not an error — it just means POST to start the market.
+        // The relay fetch THREW (connectivity/transient), distinct from a genuinely empty book: surface
+        // "unreachable, retrying" (the 5s poll retries), never "no market". Still allow POST so a maker
+        // can rest an order once the relay is back.
+        _bookError = 'unreachable';
         _mode = 'post';
       });
     }
@@ -789,14 +822,88 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     if (_linking) return;
     _edited = 'pay';
     setState(() => _actionError = null);
-    if (_mode == 'take') _linkFrom('pay');
+    _onAmountEdited();
   }
 
   void _onRecvChanged() {
     if (_linking) return;
     _edited = 'receive';
     setState(() => _actionError = null);
-    if (_mode == 'take') _linkFrom('receive');
+    _onAmountEdited();
+  }
+
+  /// Shared amount-edit interplay (spec §6.2/§6.4, mirrors web wireAmount): TAKE links the two amounts by
+  /// the selected offer's price; POST/Limit with a user-set price treats this amount as the SIZE anchor and
+  /// derives the OTHER amount from the held price; POST with no user price lets the two amounts DEFINE the
+  /// price (the field repaints to their implied value). Never fights the field being typed.
+  void _onAmountEdited() {
+    if (_mode == 'take') {
+      _linkFrom(_edited);
+    } else if (_priceTyped) {
+      _applyPriceEdit(); // held price: size × price -> the other amount (price preserved)
+    } else {
+      _repaintImpliedPrice(); // no held price: the two amounts define the price
+    }
+  }
+
+  /// The user typed in the PRICE field (Limit only): mark it a held limit price and derive the other
+  /// amount from the size anchor. In Market the field is read-only (disabled), so this is a no-op there.
+  void _onPriceChanged() {
+    if (_settingPrice) return; // a programmatic repaint, not user input
+    if (_mode != 'post') return;
+    _priceTyped = true;
+    setState(() => _actionError = null);
+    _applyPriceEdit();
+  }
+
+  /// LIMIT: keep the last-edited amount ([_edited]) as the size anchor and derive the OTHER amount =
+  /// size × price, in the pair's display frame. Mirrors the web wallet's applyPriceEdit. Writes only the
+  /// derived (non-anchor) amount, so it never overwrites the size the user is entering.
+  void _applyPriceEdit() {
+    final pay = _payAsset, recv = _receiveAsset;
+    if (pay == null || recv == null || pay == recv) return;
+    final price = double.tryParse(_priceAmount.text.trim());
+    if (price == null || !(price > 0)) return;
+    final dir = _pairDir(pay, recv);
+    // price is quote-per-base (display frame); recv-per-pay = price when base==pay, else 1/price.
+    final recvPerPay = dir.base == pay ? price : 1 / price;
+    if (!(recvPerPay > 0) || !recvPerPay.isFinite) return;
+    final anchorIsPay = _edited != 'receive';
+    final anchorUnits = double.tryParse((anchorIsPay ? _payAmount : _recvAmount).text.trim());
+    if (anchorUnits == null || !(anchorUnits > 0)) return; // no size yet -> the price stands as the limit
+    final otherUnits = anchorIsPay ? anchorUnits * recvPerPay : anchorUnits / recvPerPay;
+    if (!(otherUnits > 0) || !otherUnits.isFinite) return;
+    _linking = true;
+    (anchorIsPay ? _recvAmount : _payAmount).text = _trim(otherUnits);
+    _linking = false;
+  }
+
+  /// POST with NO user-set price: the two amount fields DEFINE the limit price, so paint the price field
+  /// with their implied quote-per-base (display frame). Guarded ([_settingPrice]) so the write is not read
+  /// back as user input.
+  void _repaintImpliedPrice() {
+    final pay = _payAsset, recv = _receiveAsset;
+    if (pay == null || recv == null || pay == recv) return;
+    final pv = double.tryParse(_payAmount.text.trim());
+    final rv = double.tryParse(_recvAmount.text.trim());
+    if (pv == null || rv == null || !(pv > 0) || !(rv > 0)) return;
+    final dir = _pairDir(pay, recv);
+    final ppr = pv / rv; // pay per receive
+    final qpb = dir.base == recv ? ppr : (ppr > 0 ? 1 / ppr : 0);
+    if (!(qpb > 0) || !qpb.isFinite) return;
+    _settingPrice = true;
+    _priceAmount.text = _trim(qpb);
+    _settingPrice = false;
+  }
+
+  /// Reset the price field's held state (on a pair change or a mode switch): clear the user-set flag and
+  /// the value, then repaint the implied price from any amounts already entered.
+  void _resetPriceField() {
+    _priceTyped = false;
+    _settingPrice = true;
+    _priceAmount.clear();
+    _settingPrice = false;
+    _repaintImpliedPrice();
   }
 
   /// In TAKE, the pay/receive fields are linked by the selected offer's price;
@@ -837,6 +944,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         _priceFlip = false; // display flip is per-pair
         _payRailLn = null; // new pair -> rails unselected (no default; the user must choose)
         _recvRailLn = null;
+        _resetPriceField(); // new pair -> no held limit price
       });
       _cache();
       _fetchBook();
@@ -853,6 +961,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         _priceFlip = false; // display flip is per-pair
         _payRailLn = null; // new pair -> rails unselected (no default; the user must choose)
         _recvRailLn = null;
+        _resetPriceField(); // new pair -> no held limit price
       });
       _cache();
       _fetchBook();
@@ -957,25 +1066,37 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     }
   }
 
+  /// TAKE = a MARKET order that WALKS the same-chain covenant book (spec §4): sweep the resting SELLs
+  /// best-first, partial-filling each up to the requested size, bounded by a slippage floor, and CANCEL
+  /// (never rest) any remainder. Each level settles with the proven covenant FILL primitive. This is the
+  /// buy-10-of-43 fix on mobile — it replaces the old single-offer lift (which could only take ONE
+  /// resting offer capped to its own size, so it could neither combine depth nor honour a size across
+  /// levels). The realised VWAP + slippage the Review shows IS what executes (Review == execution).
   Future<void> _take() async {
-    final o = _selected;
     final pay = _payAsset, recv = _receiveAsset;
-    if (o == null || pay == null || recv == null) return _snack('No resting offer to lift');
+    if (pay == null || recv == null) return _snack('Pick what you pay and receive');
+    final book = _orderBook;
+    if (book == null || book.isEmpty) {
+      return _snack('No resting offers to take — switch to Limit to rest an order at your price.');
+    }
     final recvPrec = SeqAssets.labelFor(recv).precision;
-    final takeAtoms = parseAtoms(_recvAmount.text, recvPrec);
-    if (takeAtoms == null || takeAtoms <= BigInt.zero) return _snack('Enter how much ${_tk(recv)} to buy');
-    var take = takeAtoms;
-    if (take > o.baseAtoms) take = o.baseAtoms; // cap to the offer's available size
+    final wantBase = parseAtoms(_recvAmount.text, recvPrec);
+    if (wantBase == null || wantBase <= BigInt.zero) return _snack('Enter how much ${_tk(recv)} to buy');
+
+    final plan = planMarketWalk(offers: book.offers, wantBase: wantBase, ownMakerPubkey: _ownMakerPub);
+    if (plan.isEmpty) {
+      return _snack('Nothing on the book crosses your price right now — switch to Limit to rest an order.');
+    }
 
     final feeAsset = _takeFeeAsset();
-    final feeAtoms = _feeAtomsFor(feeAsset);
-    final payAtoms = _quotePayFor(o, take); // covenant-enforced ceil price
+    final feeAtoms = _feeAtomsFor(feeAsset); // per fill (each level is its own on-chain settlement)
     final feeInPay = feeAsset == pay;
+    final n = BigInt.from(plan.fills.length);
     final payBal = BigInt.tryParse(_bal(pay)) ?? BigInt.zero;
-    final need = feeInPay ? payAtoms + feeAtoms : payAtoms;
-    if (need > payBal) return _snack('Not enough ${_tk(pay)} to lift this offer${feeInPay ? ' + fee' : ''}');
-    if (!feeInPay && (BigInt.tryParse(_bal(feeAsset)) ?? BigInt.zero) < feeAtoms) {
-      return _snack('Not enough ${_tk(feeAsset)} to pay the fee');
+    final need = feeInPay ? plan.totalPay + feeAtoms * n : plan.totalPay;
+    if (need > payBal) return _snack('Not enough ${_tk(pay)} to fill this order${feeInPay ? ' + fees' : ''}');
+    if (!feeInPay && (BigInt.tryParse(_bal(feeAsset)) ?? BigInt.zero) < feeAtoms * n) {
+      return _snack('Not enough ${_tk(feeAsset)} to pay the network fees');
     }
 
     final txid = await showModalBottomSheet<String>(
@@ -983,17 +1104,15 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       isScrollControlled: true,
       backgroundColor: AmbraColors.panel,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
-      builder: (_) => _TakeReviewSheet(
-        offer: o,
+      builder: (_) => _MarketWalkReviewSheet(
+        plan: plan,
         payAsset: pay,
-        payAtoms: payAtoms,
         recvAsset: recv,
-        recvAtoms: take,
         feeAsset: feeAsset,
-        feeAtoms: feeAtoms,
+        feeAtomsPerFill: feeAtoms,
       ),
     );
-    if (txid != null && mounted) _onSettled(txid, 'Lifted');
+    if (txid != null && mounted) _onSettled(txid, plan.partial ? 'Filled (partial)' : 'Filled');
   }
 
   Future<void> _post() async {
@@ -1116,15 +1235,97 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     return PriceService.instance.approx(l.ticker, atoms.toString(), l.precision);
   }
 
-  /// The always-present reference-currency line under an amount field: the "≈ X REF" valuation when the
-  /// field holds a priced amount, else a muted affordance so the read-out never simply vanishes.
+  /// The always-present reference-currency line under an amount field (spec §6.2, priority A). It is a
+  /// FIRST-CLASS TYPEABLE entry, not just a read-out: it shows the "≈ X REF" valuation of what's typed AND
+  /// is tappable to enter a size IN the reference currency (USD / BTC / chosen), which converts to the asset
+  /// amount and fills the field (then the composer links the other leg) — the mobile twin of the web
+  /// wallet's attachRefHint/fieldUnits ⇄ reference-currency input.
   Widget _refLine(TextEditingController ctl, String? hex) {
     final a = _refApprox(ctl.text, hex);
+    final ref = PriceService.instance.ref;
     return Padding(
       padding: const EdgeInsets.only(top: 6, left: 4),
-      child: Text(a ?? 'valued in ${PriceService.instance.ref}',
-          style: AmbraText.sub.copyWith(color: AmbraColors.dim)),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(6),
+        onTap: hex == null ? null : () => _enterRefAmount(ctl, hex),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            Flexible(
+              child: Text(a ?? 'valued in $ref',
+                  style: AmbraText.sub.copyWith(color: AmbraColors.dim), overflow: TextOverflow.ellipsis),
+            ),
+            const SizedBox(width: 6),
+            Icon(Icons.edit_outlined, size: 12, color: AmbraColors.amber.withValues(alpha: 0.8)),
+            const SizedBox(width: 3),
+            Text('enter in $ref', style: AmbraText.sub.copyWith(color: AmbraColors.amber.withValues(alpha: 0.8))),
+          ]),
+        ),
+      ),
     );
+  }
+
+  /// Type a size in the reference currency (USD / BTC / chosen) and convert it to the asset amount, filling
+  /// [target] (the composer then links the other leg via the field's listener). FUND-SAFE: it only writes a
+  /// NATIVE asset amount into the existing field — every downstream fund calculation still reads native
+  /// atoms exactly as before; the conversion never touches the trade math itself.
+  Future<void> _enterRefAmount(TextEditingController target, String hex) async {
+    final l = SeqAssets.labelFor(hex);
+    final ref = PriceService.instance.ref;
+    final ctl = TextEditingController();
+    final v = await showDialog<double>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AmbraColors.panel,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AmbraRadii.card)),
+        title: Text('Enter amount in $ref', style: AmbraText.title),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('Converts to ${l.ticker} at the current $ref price.', style: AmbraText.sub),
+          const SizedBox(height: 12),
+          TextField(
+            controller: ctl,
+            autofocus: true,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            style: AmbraText.body,
+            onSubmitted: (_) => Navigator.pop(ctx, double.tryParse(ctl.text.trim())),
+            decoration: InputDecoration(
+              hintText: '0.00',
+              hintStyle: const TextStyle(color: AmbraColors.dim),
+              prefixText: '$ref ',
+              prefixStyle: AmbraText.body,
+              filled: true,
+              fillColor: AmbraColors.panelDeep,
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(AmbraRadii.input),
+                borderSide: const BorderSide(color: AmbraColors.line),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(AmbraRadii.input),
+                borderSide: const BorderSide(color: AmbraColors.amber),
+              ),
+            ),
+          ),
+        ]),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text('Cancel', style: AmbraText.body.copyWith(color: AmbraColors.dim)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, double.tryParse(ctl.text.trim())),
+            child: Text('Convert', style: AmbraText.body.copyWith(color: AmbraColors.amber)),
+          ),
+        ],
+      ),
+    );
+    ctl.dispose();
+    if (v == null || !mounted) return;
+    final atoms = PriceService.instance.atomsForRef(l.ticker, v, l.precision);
+    if (atoms == null || atoms <= BigInt.zero) {
+      return _snack('Can\'t price ${l.ticker} right now — enter the ${l.ticker} amount directly.');
+    }
+    // Write the converted NATIVE amount; the field's listener runs the normal amount-edit linking.
+    target.text = _trim(atoms.toDouble() / _pow10(l.precision));
   }
 
   /// A Market sweep estimate over the same-chain book for buying [wantBase] base atoms: the VWAP, the
@@ -1161,21 +1362,87 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     return (vwap: vwap, worst: worst, best: best, partial: remaining > BigInt.zero);
   }
 
-  /// The always-present PRICE field for the same-chain composer (spec §6.4). In Take/Market it is a
-  /// read-only sweep estimate (VWAP + slippage bound, walked from the book — the web's paintPriceField);
-  /// in Post/Limit it shows the price implied by the amounts you entered (or the book's inside price as a
-  /// reference). The control is present on every pair, empty book or not (invariant §2.1).
+  /// The pair's INSIDE price (quote-per-base, display frame) for the price-field placeholder and Limit
+  /// reference: the best resting same-chain offer, or the best cross (BTC<->asset) offer for a BTC pair.
+  /// Null when nothing rests. BTC pairs price the asset in BTC (BTC is the quote), which _pairDir enforces.
+  double? _insidePrice() {
+    final pay = _payAsset, recv = _receiveAsset;
+    if (pay == null || recv == null || pay == recv) return null;
+    final dir = _pairDir(pay, recv);
+    if (_isCrossPair) {
+      final asset = pay == kBtcSentinel ? recv : pay;
+      final aprec = SeqAssets.labelFor(asset).precision;
+      double perUnit(double perAtom) => perAtom * _pow10(aprec) / 1e8; // BTC-sats/atom -> BTC per whole unit
+      final asks = _crossOffers.where((o) => o.makerSellsAsset).toList()
+        ..sort((a, b) => a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom));
+      final bids = _crossOffers.where((o) => !o.makerSellsAsset).toList()
+        ..sort((a, b) => b.btcPerAssetAtom.compareTo(a.btcPerAssetAtom));
+      double? btcPerAsset;
+      if (asks.isNotEmpty) {
+        btcPerAsset = perUnit(asks.first.btcPerAssetAtom);
+      } else if (bids.isNotEmpty) {
+        btcPerAsset = perUnit(bids.first.btcPerAssetAtom);
+      }
+      if (btcPerAsset == null || !(btcPerAsset > 0)) return null;
+      // BTC-per-asset is quote-per-base with base=asset (BTC is the quote); _pairDir keeps asset as base.
+      return dir.base == asset ? btcPerAsset : (btcPerAsset > 0 ? 1 / btcPerAsset : 0);
+    }
+    final book = _orderBook;
+    final o = book?.best;
+    if (o == null) return null;
+    final payPrec = SeqAssets.labelFor(pay).precision;
+    final recvPrec = SeqAssets.labelFor(recv).precision;
+    final ppr = (o.wantAtoms.toDouble() / _pow10(payPrec)) / (o.baseAtoms.toDouble() / _pow10(recvPrec));
+    return dir.base == recv ? ppr : (ppr > 0 ? 1 / ppr : 0);
+  }
+
+  /// The always-present PRICE field (spec §6.4), IDENTICAL on same-chain and BTC pairs. In Limit/POST it
+  /// is an EDITABLE "your price" input (quote-per-base in the display frame), linked to the amount fields
+  /// (typing a price derives the other amount, typing an amount derives the price) — the mobile twin of the
+  /// web wallet's paintPriceField + applyPriceEdit. In Market/TAKE it is a read-only sweep estimate (VWAP +
+  /// slippage for same-chain; the inside price for a BTC pair). Present on every pair, empty book or not.
   Widget _priceField() {
     final pay = _payAsset, recv = _receiveAsset;
     if (pay == null || recv == null || pay == recv) return const SizedBox.shrink();
     final dir = _pairDir(pay, recv);
     final baseTk = _tk(dir.base), quoteTk = _tk(dir.quote);
-    final book = _orderBook;
-    final IconData icon;
+    // LIMIT / POST (including the blinded book, which is post-only): an editable price input.
+    if (_mode == 'post') {
+      final inside = _insidePrice();
+      final String note;
+      if (_priceTyped) {
+        note = 'Your limit price · the order rests until a taker crosses it.';
+      } else if (inside != null) {
+        note = 'Book inside · ${_fmtPrice(inside)} $quoteTk per $baseTk — or type your own.';
+      } else {
+        note = 'Enter both amounts, or type a price, to set your limit.';
+      }
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          AmbraField(
+            label: 'Your price (1 $baseTk in $quoteTk)',
+            controller: _priceAmount,
+            hint: inside != null ? _trim(inside) : 'your price',
+            mono: true,
+          ),
+          Padding(
+            padding: const EdgeInsets.only(top: 6, left: 4),
+            child: Text(note, style: AmbraText.sub.copyWith(color: AmbraColors.dim)),
+          ),
+        ]),
+      );
+    }
+    // MARKET / TAKE: a read-only estimate of what will execute.
     final String line;
-    if (_mode == 'take') {
-      icon = Icons.trending_flat;
+    if (_isCrossPair) {
+      final inside = _insidePrice();
+      line = inside == null
+          ? 'No resting Bitcoin offers yet — switch to Limit to set your own price.'
+          : 'Market · ~${_fmtPrice(inside)} $quoteTk per $baseTk (best resting offer).';
+    } else {
       final recvPrec = SeqAssets.labelFor(recv).precision;
+      final book = _orderBook;
       final want = parseAtoms(_recvAmount.text.trim(), recvPrec);
       final est = _sweepEstimate((want != null && want > BigInt.zero) ? want : (book?.best?.baseAtoms ?? BigInt.zero));
       if (est == null) {
@@ -1183,38 +1450,17 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
             ? 'No resting offers — switch to Limit to set your own price.'
             : 'Fills at the best available price now.';
       } else {
-        // Magnitude-only slippage (frame-independent): how far the VWAP moves from the inside price.
         final slip = est.best > 0 ? (est.vwap - est.best).abs() / est.best * 100 : 0.0;
         final b = StringBuffer('Market · ~${_fmtPrice(est.vwap)} $quoteTk per $baseTk');
         if (slip > 0.01) b.write(' · est. up to ${slip.toStringAsFixed(slip < 1 ? 2 : 1)}% slippage');
         if (est.partial) b.write(' · partial liquidity only');
         line = b.toString();
       }
-    } else {
-      icon = Icons.sell_outlined;
-      final payPrec = SeqAssets.labelFor(pay).precision;
-      final recvPrec = SeqAssets.labelFor(recv).precision;
-      final pv = double.tryParse(_payAmount.text.trim());
-      final rv = double.tryParse(_recvAmount.text.trim());
-      double? qpb;
-      var implied = false;
-      if (pv != null && pv > 0 && rv != null && rv > 0) {
-        final ppr = pv / rv; // pay per receive
-        qpb = dir.base == recv ? ppr : (ppr > 0 ? 1 / ppr : 0);
-        implied = true;
-      } else if (book?.best != null) {
-        final o = book!.best!;
-        final ppr = (o.wantAtoms.toDouble() / _pow10(payPrec)) / (o.baseAtoms.toDouble() / _pow10(recvPrec));
-        qpb = dir.base == recv ? ppr : (ppr > 0 ? 1 / ppr : 0);
-      }
-      line = qpb == null
-          ? 'Set your price by entering both amounts.'
-          : '${implied ? 'Your price' : 'Book best'} · 1 $baseTk = ${_fmtPrice(qpb)} $quoteTk';
     }
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
       child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Icon(icon, size: 15, color: AmbraColors.dim),
+        const Icon(Icons.trending_flat, size: 15, color: AmbraColors.dim),
         const SizedBox(width: 8),
         Expanded(child: Text(line, style: AmbraText.sub)),
       ]),
@@ -1257,26 +1503,31 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     final pays = _payableAssets();
     final book = _orderBook;
     final isCross = _isCrossPair;
-    // Resolve the settlement route for a BTC pair from the current rail picks; same-chain pairs
-    // route to the covenant book and never touch this.
-    final r = isCross
-        ? route(_payAsset, _receiveAsset,
-            payRailLn: _payRailLn, recvRailLn: _recvRailLn, lnAvailable: LightningService.instance.available)
+    final dir = (_payAsset != null && _receiveAsset != null && _payAsset != _receiveAsset)
+        ? _pairDir(_payAsset!, _receiveAsset!)
         : null;
+    // ONE route for EVERY pair (spec §5, priority A/D): a same-chain pair resolves to the covenant book, or
+    // — when BOTH rails are Lightning — to a pure-LN asset↔asset swap; a BTC pair resolves to cross / pure-LN
+    // / sub-asset. The composer dispatches off this single verdict; rails never touch the book or matching.
+    final r = route(_payAsset, _receiveAsset,
+        payRailLn: _payRailLn,
+        recvRailLn: _recvRailLn,
+        lnAvailable: LightningService.instance.available,
+        sameChainQuote: dir?.quote);
     // The reverse (asset -> BTC on-chain) cross courier is NOT built, so a cross SELL is a dead rail:
     // route() still returns kind=cross/isValid=true, which would enable Review on a settlement that only
     // yields a "coming" snack. Treat it as not-actionable and explain inline (route summary), pointing at
     // the live sell rails (pure-LN / sub-asset), instead of an enabled button that promises settlement.
-    final crossSellDead = isCross && r != null && r.kind == SwapRouteKind.cross && !r.payIsBtc;
+    final crossSellDead = isCross && r.kind == SwapRouteKind.cross && !r.payIsBtc;
+    // Same-chain both-Lightning (pure-LN asset↔asset) isn't wired on mobile yet (priority D): show the CTA
+    // but keep it disabled with a reason, and an inline note — never silently settle on the covenant book.
+    final sameChainLnUnbuilt = !isCross && r.kind == SwapRouteKind.ln;
     // The pair is tradeable (book renders, quote works) — but placement also needs both settlement rails
-    // chosen (spec §6.5, no default). canQuote gates showing the CTA; railsChosen gates enabling it.
-    final canQuote = !_loading &&
-        _error == null &&
-        _payAsset != null &&
-        _receiveAsset != null &&
-        !crossSellDead &&
-        (!isCross || (r?.isValid ?? false));
+    // chosen (spec §6.5, no default). canQuote gates showing the CTA; railsChosen + a built rail enable it.
+    final canQuote =
+        !_loading && _error == null && _payAsset != null && _receiveAsset != null && !crossSellDead && r.isValid;
     final railsChosen = _payRailLn != null && _recvRailLn != null;
+    final placeable = railsChosen && !sameChainLnUnbuilt;
     return Column(children: [
       Expanded(
         child: ListView(padding: const EdgeInsets.fromLTRB(20, 20, 20, 24), children: [
@@ -1305,76 +1556,10 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
             const AmbraCard(
                 child: Text('You hold no assets that trade yet. Receive a tradable asset, or use the faucet (More tab).',
                     style: AmbraText.muted))
-          else if (isCross) ...[
-            // BTC pair on the SAME unified terminal (spec §7): the Market/Limit toggle, price stats, the
-            // two-sided book, rail picks, and recent trades — exactly like a same-chain pair. No degraded
-            // chrome. (_crossComposerChildren already carries the pickers + amount + _railPicks + book.)
-            _modeToggle(),
-            const SizedBox(height: 16),
-            _pairStatsStrip(),
-            ..._crossComposerChildren(r!),
-            _recentTradesPanel(),
-            if (_actionError != null) ...[
-              const SizedBox(height: 12),
-              Text(_actionError!, style: const TextStyle(color: AmbraColors.red)),
-            ],
-          ] else ...[
-            _bookToggle(),
-            const SizedBox(height: 12),
-            if (_confBook) _confBookNote() else _modeToggle(),
-            const SizedBox(height: 16),
-            const SectionLabel('You pay'),
-            const SizedBox(height: 8),
-            _PickerRow(
-              label: _tk(_payAsset),
-              trailing: _payAsset == null
-                  ? null
-                  : 'balance ${formatAtoms(_bal(_payAsset!), SeqAssets.labelFor(_payAsset!).precision)}',
-              onTap: _pickPay,
-            ),
-            const SizedBox(height: 12),
-            AmbraField(label: 'Amount (${_tk(_payAsset)})', controller: _payAmount, hint: '0.0'),
-            _refLine(_payAmount, _payAsset), // ≈ reference-currency valuation (spec §6.2)
-            const SizedBox(height: 18),
-            Center(child: Icon(Icons.arrow_downward, color: AmbraColors.dim, size: 22)),
-            const SizedBox(height: 18),
-            const SectionLabel('You receive'),
-            const SizedBox(height: 8),
-            _PickerRow(label: _tk(_receiveAsset), onTap: _pickReceive),
-            const SizedBox(height: 12),
-            AmbraField(
-              label: _mode == 'post' ? 'Your price — amount (${_tk(_receiveAsset)})' : 'Amount (${_tk(_receiveAsset)})',
-              controller: _recvAmount,
-              hint: _mode == 'post' ? 'how much you want' : '0.0',
-            ),
-            _refLine(_recvAmount, _receiveAsset), // ≈ reference-currency valuation (spec §6.2)
-            const SizedBox(height: 14),
-            _priceField(), // always-present price field: Market sweep estimate / Limit your-price (spec §6.4)
-            const SizedBox(height: 4),
-            _railPicks(), // rail-blind settlement prefs on EVERY pair (spec §5) — a same-chain asset can move over SeqLN too
-            _offlineRestToggle(), // on-chain-BTC-pay + LIMIT only: rest as pegged SBTC while offline (spec §5)
-            _pairStatsStrip(),
-            _bookPanel(book),
-            _recentTradesPanel(),
-            const SizedBox(height: 18),
-            const SectionLabel('Network fee'),
-            const SizedBox(height: 8),
-            _PickerRow(label: _tk(_feeAssetHex), trailing: 'any asset you hold', onTap: _pickFee),
-            const SizedBox(height: 10),
-            AmbraField(label: 'Fee rate (${_tk(_feeAssetHex)}/vB, optional)', controller: _feeRateCtl, hint: 'suggested'),
-            const SizedBox(height: 8),
-            Text(
-              _confBook
-                  ? 'A blinded offer rests confidentially (no on-chain funding); a taker fills it later by co-signing a blinded swap. Fee terms apply when it settles.'
-                  : _mode == 'take'
-                      ? 'Fee paid in the asset you pay (never the asset you receive). Leave the rate blank for the suggested fee.'
-                      : 'Resting your order funds a covenant on-chain, then posts it to the relay. Cancel anytime; reclaim the funds after expiry.',
-              style: AmbraText.sub,
-            ),
-            if (_actionError != null) ...[
-              const SizedBox(height: 12),
-              Text(_actionError!, style: const TextStyle(color: AmbraColors.red)),
-            ],
+          else ...[
+            // THE ONE COMPOSER (priority A): same-chain and BTC pairs render the identical control set;
+            // switching a leg to/from BTC never swaps composer bodies.
+            ..._composerBody(isCross, r, book),
           ],
           _myOrdersLink(),
           _recentActivity(),
@@ -1385,116 +1570,145 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           PrimaryButton(
             label: !railsChosen
                 ? 'Choose how you pay & receive'
-                : isCross
-                    ? 'Review swap'
-                    : _confBook
-                        ? 'Review & post (blinded)'
-                        : _mode == 'take'
-                            ? 'Review & take'
-                            : 'Review & post',
+                : sameChainLnUnbuilt
+                    ? 'Set a leg to On-chain to trade now'
+                    : isCross
+                        ? 'Review swap'
+                        : _confBook
+                            ? 'Review & post (blinded)'
+                            : _mode == 'take'
+                                ? 'Review & take'
+                                : 'Review & post',
             icon: !railsChosen
                 ? Icons.alt_route
-                : isCross
-                    ? Icons.swap_horiz
-                    : _confBook
-                        ? Icons.lock_outline
-                        : _mode == 'take'
-                            ? Icons.swap_horiz
-                            : Icons.playlist_add,
-            // Disabled (null) until both rails are chosen — no order on an unstated settlement choice.
-            onPressed: !railsChosen ? null : (isCross ? () => _dispatchCross(r!) : _submit),
+                : sameChainLnUnbuilt
+                    ? Icons.bolt
+                    : isCross
+                        ? Icons.swap_horiz
+                        : _confBook
+                            ? Icons.lock_outline
+                            : _mode == 'take'
+                                ? Icons.swap_horiz
+                                : Icons.playlist_add,
+            // Disabled (null) until both rails are chosen AND the resolved rail is actually built — no order
+            // on an unstated settlement choice, and no silent covenant fallback for a same-chain LN pair.
+            onPressed: !placeable ? null : (isCross ? () => _dispatchCross(r) : _submit),
           ),
         ]),
     ]);
   }
 
-  /// The cross (BTC pair) composer body: pay + receive pickers, ONE amount field on
-  /// the Sequentia-asset leg (a BUY quotes its Bitcoin amount in the wizard; a SELL
-  /// is denominated in the asset), the per-leg rail picks, and the route summary.
-  List<Widget> _crossComposerChildren(SwapRoute r) {
-    final asset = r.seqAsset;
-    final assetTk = _tk(asset); // r.seqAsset is non-null for any BTC pair reachable from the pickers
-    final payIsAsset = _payAsset != kBtcSentinel; // the Sequentia-asset leg is the PAY leg
+  /// THE ONE COMPOSER (spec §2.1, §6, priority A). Same-chain AND BTC pairs render the IDENTICAL control
+  /// set — Market/Limit toggle, both pickers with amount + reference-currency line, the editable price
+  /// field, both rail toggles, fee controls, and the book. [isCross] switches only the CONTENTS of a
+  /// control (which book panel, the covenant fee picker vs the honest "set at lift" cross note, the
+  /// dispatch), never whether a control exists. This replaces the old degraded cross branch: switching a
+  /// leg to/from BTC no longer swaps composer bodies.
+  List<Widget> _composerBody(bool isCross, SwapRoute r, OrderBook? book) {
+    final payTk = _tk(_payAsset), recvTk = _tk(_receiveAsset);
     return [
+      // Book namespace (Unblinded / Blinded) — same-chain only: a BTC leg lives on the parent chain, which
+      // has no confidential transactions, so a BTC pair cannot use the blinded book (a physical constraint,
+      // not a degraded control).
+      if (!isCross) ...[
+        _bookToggle(),
+        const SizedBox(height: 12),
+      ],
+      if (isCross || !_confBook) _modeToggle() else _confBookNote(),
+      const SizedBox(height: 16),
+      _pairStatsStrip(),
       const SectionLabel('You pay'),
       const SizedBox(height: 8),
       _PickerRow(
-        label: _tk(_payAsset),
+        label: payTk,
         trailing: _payAsset == null
             ? null
             : 'balance ${formatAtoms(_bal(_payAsset!), SeqAssets.labelFor(_payAsset!).precision)}',
         onTap: _pickPay,
       ),
-      if (payIsAsset) ...[
-        const SizedBox(height: 12),
-        AmbraField(label: 'Amount ($assetTk)', controller: _payAmount, hint: '0.0'),
-        _refLine(_payAmount, _payAsset), // ≈ reference-currency valuation (spec §6.2) — present on BTC pairs too
-      ],
-      // Pegged BUY-with-BTC LIMIT (keep-resting): the user sets BOTH sides of a limit bid — the BTC they
-      // pay (here) and the asset they want (below). Only when buying the asset with BTC in post mode with
-      // "keep resting" on; every other cross flow quotes the BTC amount from the book instead.
-      if (!payIsAsset && _mode == 'post' && _keepResting) ...[
-        const SizedBox(height: 12),
-        AmbraField(label: 'Amount (BTC you pay)', controller: _payAmount, hint: '0.0'),
-        _refLine(_payAmount, kBtcSentinel), // ≈ reference-currency valuation of the BTC bid
-      ],
+      const SizedBox(height: 12),
+      AmbraField(label: 'Amount ($payTk)', controller: _payAmount, hint: '0.0'),
+      _refLine(_payAmount, _payAsset), // ≈ reference-currency valuation (spec §6.2)
       const SizedBox(height: 18),
       Center(child: Icon(Icons.arrow_downward, color: AmbraColors.dim, size: 22)),
       const SizedBox(height: 18),
       const SectionLabel('You receive'),
       const SizedBox(height: 8),
-      _PickerRow(label: _tk(_receiveAsset), onTap: _pickReceive),
-      if (!payIsAsset) ...[
-        const SizedBox(height: 12),
-        AmbraField(
-          label: _mode == 'post' ? 'Your price — amount ($assetTk)' : 'Amount ($assetTk)',
-          controller: _recvAmount,
-          hint: _mode == 'post' ? 'how much you want' : '0.0',
-        ),
-        _refLine(_recvAmount, _receiveAsset), // ≈ reference-currency valuation (spec §6.2)
-      ],
+      _PickerRow(label: recvTk, onTap: _pickReceive),
+      const SizedBox(height: 12),
+      AmbraField(label: 'Amount ($recvTk)', controller: _recvAmount, hint: '0.0'),
+      _refLine(_recvAmount, _receiveAsset), // ≈ reference-currency valuation (spec §6.2)
       const SizedBox(height: 14),
-      _crossPriceLine(asset), // always-present price line for the BTC pair (best resting BTC-per-asset)
+      _priceField(), // editable limit price / read-only market estimate — IDENTICAL on every pair (§6.4)
       const SizedBox(height: 4),
-      _railPicks(),
+      _railPicks(), // both settlement rails, always present (spec §5/§6.5)
+      // Same-chain both-Lightning (priority D): pure-LN asset↔asset settlement isn't wired on mobile yet,
+      // so gate it honestly instead of silently settling on the covenant book or misrouting.
+      if (!isCross && r.kind == SwapRouteKind.ln) _sameChainLnNote(),
       _offlineRestToggle(), // on-chain-BTC-pay + LIMIT only: rest as pegged SBTC while offline (spec §5)
-      _crossFeeNote(), // any-asset fee, honestly: a cross maker fee is set at lift, not a fake "0 BTC" (spec §8)
-      _routeSummary(r),
-      _crossBookPanel(asset),
-      const SizedBox(height: 8),
-      const Text('Review opens a guided swap that quotes the exact Bitcoin amount and settles it step by step.',
-          style: AmbraText.sub),
+      // Fee: the same-chain covenant fee picker, or the honest cross note (a cross maker fee is set at lift,
+      // never a fake "0 BTC" — spec §8).
+      if (isCross) ...[
+        _crossFeeNote(),
+        _routeSummary(r),
+      ] else ...[
+        const SizedBox(height: 4),
+        const SectionLabel('Network fee'),
+        const SizedBox(height: 8),
+        _PickerRow(label: _tk(_feeAssetHex), trailing: 'any asset you hold', onTap: _pickFee),
+        const SizedBox(height: 10),
+        AmbraField(
+            label: 'Fee rate (${_tk(_feeAssetHex)}/vB, optional)', controller: _feeRateCtl, hint: 'suggested'),
+        const SizedBox(height: 8),
+        Text(_feeNoteText(), style: AmbraText.sub),
+      ],
+      // The book: the same-chain covenant ladder (price-level aggregated, three empty states) OR the cross
+      // (BTC<->asset) book. Same control, different contents.
+      isCross ? _crossBookPanel(r.seqAsset) : _bookPanel(book),
+      _recentTradesPanel(),
+      if (isCross) ...[
+        const SizedBox(height: 8),
+        const Text('Review fetches a live maker quote for the exact Bitcoin amount before you lock anything.',
+            style: AmbraText.sub),
+      ],
+      if (_actionError != null) ...[
+        const SizedBox(height: 12),
+        Text(_actionError!, style: const TextStyle(color: AmbraColors.red)),
+      ],
     ];
   }
 
-  /// The best resting BTC-per-asset price for a cross pair — the always-present price line the degraded
-  /// BTC composer previously lacked (spec §2.1, §6.4). BTC/asset is a one-way ladder (fixed to "1 asset =
-  /// N BTC"), so this shows the inside price of whichever side has depth. Renders nothing on an empty book.
-  Widget _crossPriceLine(String? asset) {
-    if (asset == null) return const SizedBox.shrink();
-    final tk = _tk(asset);
-    final aprec = SeqAssets.labelFor(asset).precision;
-    double perUnit(double perAtom) => perAtom * _pow10(aprec) / 1e8; // BTC-sats/atom -> BTC per whole unit
-    final asks = _crossOffers.where((o) => o.makerSellsAsset).toList()
-      ..sort((a, b) => a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom));
-    final bids = _crossOffers.where((o) => !o.makerSellsAsset).toList()
-      ..sort((a, b) => b.btcPerAssetAtom.compareTo(a.btcPerAssetAtom));
-    String? line;
-    if (asks.isNotEmpty) {
-      line = 'Best buy · ${_fmtPrice(perUnit(asks.first.btcPerAssetAtom))} BTC per $tk';
-    } else if (bids.isNotEmpty) {
-      line = 'Best sell · ${_fmtPrice(perUnit(bids.first.btcPerAssetAtom))} BTC per $tk';
+  /// The mode-dependent fee note under the same-chain fee picker.
+  String _feeNoteText() {
+    if (_confBook) {
+      return 'A blinded offer rests confidentially (no on-chain funding); a taker fills it later by '
+          'co-signing a blinded swap. Fee terms apply when it settles.';
     }
-    if (line == null) return const SizedBox.shrink();
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
-      child: Row(children: [
-        const Icon(Icons.trending_flat, size: 15, color: AmbraColors.dim),
-        const SizedBox(width: 8),
-        Expanded(child: Text(line, style: AmbraText.sub)),
-      ]),
-    );
+    return _mode == 'take'
+        ? 'Fee paid in the asset you pay (never the asset you receive). Leave the rate blank for the suggested fee.'
+        : 'Resting your order funds a covenant on-chain, then posts it to the relay. Cancel anytime; reclaim the funds after expiry.';
   }
+
+  /// Honest gate for a same-chain pair whose BOTH rails are set to Lightning (priority D): the route()
+  /// classifies it as a pure-LN asset↔asset swap, but that settlement path is not wired on mobile yet, so
+  /// we neither silently settle on the covenant book nor misroute. The user switches a leg to On-chain to
+  /// trade now on the covenant book.
+  Widget _sameChainLnNote() => Padding(
+        padding: const EdgeInsets.only(top: 4, bottom: 4),
+        child: AmbraCard(
+          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Icon(Icons.bolt, size: 18, color: AmbraColors.amber),
+            const SizedBox(width: 10),
+            const Expanded(
+              child: Text(
+                'Pure-Lightning settlement for asset pairs (both legs over Lightning) is being finalised. '
+                'To trade this pair now, set at least one leg to On-chain — it settles on the covenant order book.',
+                style: AmbraText.sub,
+              ),
+            ),
+          ]),
+        ),
+      );
 
   /// The honest fee note for a cross (BTC) pair (spec §8). A cross leg's maker fee is fixed at LIFT (the
   /// courier quote), and the network fee is paid in the transacted asset — never a fake "0 BTC", never
@@ -1544,7 +1758,9 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
               // asset). The reverse (maker gives BTC) is the sell direction — read-only until the reverse
               // courier lands.
               InkWell(
-                onTap: o.makerSellsAsset ? () => _liftCross(o) : null,
+                // Tapping a "buy" row lifts THAT offer at the size the user typed (partial-fill, priority
+                // C): a null typed size lifts it whole; a smaller size takes just that slice.
+                onTap: o.makerSellsAsset ? () => _liftCross(o, requestedAtoms: _typedAssetAtoms(asset, aprec)) : null,
                 borderRadius: BorderRadius.circular(AmbraRadii.input),
                 child: Padding(
                   padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 2),
@@ -1858,9 +2074,14 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           return;
         }
         if (reqAtoms != null && reqAtoms > BigInt.zero) {
+          // Partial fills are live now (priority C): prefer the CHEAPEST offer that can COVER the typed
+          // slice (we partial-fill it to exactly the slice), falling back to the closest-sized one when
+          // none is big enough. This replaces the old closest-size heuristic that a whole-offer lift needed.
           asks.sort((a, b) {
-            final c = (a.assetAtoms - reqAtoms).abs().compareTo((b.assetAtoms - reqAtoms).abs());
-            return c != 0 ? c : a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom);
+            final aCovers = a.assetAtoms >= reqAtoms, bCovers = b.assetAtoms >= reqAtoms;
+            if (aCovers != bCovers) return aCovers ? -1 : 1;
+            final c = a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom);
+            return c != 0 ? c : (a.assetAtoms - reqAtoms).abs().compareTo((b.assetAtoms - reqAtoms).abs());
           });
         } else {
           asks.sort((a, b) => a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom));
@@ -2090,6 +2311,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
               _mode = value;
               _modeTouched = true;
             });
+            _resetPriceField(); // switching Market<->Limit re-derives the price from the current amounts
             _relink();
           },
           child: Container(
@@ -2126,6 +2348,26 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         ]),
       );
     }
+    // Empty state (2) — RELAY UNREACHABLE (spec §3, ux-audit T7/T14): the fetch THREW (connectivity /
+    // transient), which is NOT the same as a genuinely empty book. Say "unreachable, retrying" (the 5s poll
+    // retries), never "no market" — a blank book must never read as breakage.
+    if (_bookError == 'unreachable' && (book == null || book.isEmpty)) {
+      return const AmbraCard(
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Icon(Icons.cloud_off_outlined, size: 18, color: AmbraColors.amber),
+          SizedBox(width: 10),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Order book unreachable — retrying…', style: AmbraText.body),
+              SizedBox(height: 4),
+              Text('The relay didn\'t respond. This keeps retrying every few seconds; nothing you hold is affected. '
+                  'You can still post a limit order once it\'s back.', style: AmbraText.sub),
+            ]),
+          ),
+        ]),
+      );
+    }
+    // Empty state (1) — GENUINELY EMPTY BOOK: invite a limit order (you set the price).
     if (book == null || book.isEmpty) {
       return AmbraCard(
         child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
@@ -2145,7 +2387,30 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     }
     final recvPrec = SeqAssets.labelFor(_receiveAsset!).precision;
     final payPrec = SeqAssets.labelFor(_payAsset!).precision;
-    final rows = book.offers.take(6).toList();
+    final dir = _pairDir(_payAsset!, _receiveAsset!);
+    // Re-express each offer's price in the pair's CANONICAL display frame (quote per base), then collapse
+    // same-price offers into LEVELS with summed size + cumulative depth (spec §3/§7, web P2.7).
+    double priceOf(SeqObOffer o) {
+      final ppr = (o.wantAtoms.toDouble() / _pow10(payPrec)) / (o.baseAtoms.toDouble() / _pow10(recvPrec));
+      return dir.base == _receiveAsset ? ppr : (ppr > 0 ? 1 / ppr : 0);
+    }
+
+    final levels = aggregateLevels(book.offers, priceOf).take(6).toList();
+    // Empty state (3) — UNFILLABLE AT YOUR SIZE (spec §3): the book has depth, but a Market order for the
+    // size you typed can't be sourced (nothing crosses) or only partly fills. Say so inline, honestly.
+    String? unfillable;
+    if (_mode == 'take') {
+      final want = parseAtoms(_recvAmount.text.trim(), recvPrec);
+      if (want != null && want > BigInt.zero) {
+        final plan = planMarketWalk(offers: book.offers, wantBase: want, ownMakerPubkey: _ownMakerPub);
+        if (plan.isEmpty) {
+          unfillable = 'Nothing on the book crosses your size right now — switch to Limit to rest an order at your price.';
+        } else if (plan.partial) {
+          unfillable = 'Only ${formatAtoms(plan.totalRecv.toString(), recvPrec)} ${_tk(_receiveAsset)} rests within reach; '
+              'a Market order fills that and cancels the rest (or use Limit to rest the remainder).';
+        }
+      }
+    }
     return AmbraCard(
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         Row(children: [
@@ -2171,7 +2436,23 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           ],
         ]),
         const Divider(height: 16, color: AmbraColors.line),
-        for (final o in rows) _bookRow(o, recvPrec, payPrec),
+        Padding(
+          padding: const EdgeInsets.only(bottom: 4),
+          child: Row(children: const [
+            Expanded(child: Text('Price', style: AmbraText.sub)),
+            Text('Size   Σ depth', style: AmbraText.sub),
+          ]),
+        ),
+        for (final lv in levels) _levelRow(lv, dir, recvPrec),
+        if (unfillable != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Icon(Icons.info_outline, size: 14, color: AmbraColors.amber),
+              const SizedBox(width: 6),
+              Expanded(child: Text(unfillable, style: AmbraText.sub.copyWith(color: AmbraColors.amber))),
+            ]),
+          ),
         Padding(
           padding: const EdgeInsets.only(top: 8),
           child: Text(
@@ -2184,35 +2465,40 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     );
   }
 
-  Widget _bookRow(SeqObOffer o, int recvPrec, int payPrec) {
-    final on = identical(o, _selected);
-    // pay-per-receive (quote-per-base in the OFFER's frame, whose base is the receive asset)…
-    final payPerRecv = (o.wantAtoms.toDouble() / _pow10(payPrec)) / (o.baseAtoms.toDouble() / _pow10(recvPrec));
-    // …re-expressed in the pair's CANONICAL display frame so buy and sell read identically:
-    // qpb = quote per base = pay-per-receive when the display base is the receive asset, else its inverse.
-    final dir = _pairDir(_payAsset!, _receiveAsset!);
-    final qpb = dir.base == _receiveAsset ? payPerRecv : (payPerRecv > 0 ? 1 / payPerRecv : 0);
+  /// One aggregated price LEVEL row (spec §3/§7): the level price (display frame), the summed size at the
+  /// level, and cumulative depth from the inside. Tapping it in TAKE selects the level's inside offer as
+  /// the price anchor (the Market sweep still walks the whole book best-first).
+  Widget _levelRow(BookLevel lv, ({String base, String quote}) dir, int recvPrec) {
+    final inside = lv.insideOffer;
+    final on = _mode == 'take' && lv.offers.any((o) => identical(o, _selected));
+    final anyUnverified = lv.offers.any((o) => !o.verified);
     return InkWell(
       onTap: _mode == 'take'
           ? () {
-              setState(() => _selected = o);
+              setState(() => _selected = inside);
               _relink();
             }
           : null,
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 6),
         child: Row(children: [
-          Icon(on && _mode == 'take' ? Icons.radio_button_checked : Icons.circle_outlined,
+          Icon(on ? Icons.radio_button_checked : Icons.circle_outlined,
               size: 16, color: on ? AmbraColors.amber : AmbraColors.dim),
           const SizedBox(width: 10),
           Expanded(
-            child: Text('1 ${_tk(dir.base)} = ${_fmtPrice(qpb)} ${_tk(dir.quote)}',
+            child: Text('1 ${_tk(dir.base)} = ${_fmtPrice(lv.price)} ${_tk(dir.quote)}',
                 style: AmbraText.mono.copyWith(color: on ? AmbraColors.amber : AmbraColors.txt)),
           ),
-          Text(formatAtoms(o.baseAtoms.toString(), recvPrec), style: AmbraText.mono),
-          const SizedBox(width: 6),
-          if (!o.verified)
-            const Tooltip(message: 'signature unverified', child: Icon(Icons.warning_amber, size: 14, color: AmbraColors.red)),
+          Text(formatAtoms(lv.sizeAtoms.toString(), recvPrec), style: AmbraText.mono),
+          const SizedBox(width: 8),
+          Text('Σ ${formatAtoms(lv.cumAtoms.toString(), recvPrec)}',
+              style: AmbraText.mono.copyWith(color: AmbraColors.dim)),
+          if (anyUnverified) ...[
+            const SizedBox(width: 6),
+            const Tooltip(
+                message: 'a resting offer at this level is signature-unverified',
+                child: Icon(Icons.warning_amber, size: 14, color: AmbraColors.red)),
+          ],
         ]),
       ),
     );
@@ -2434,30 +2720,30 @@ class _PickerRow extends StatelessWidget {
   }
 }
 
-/// Confirm + run a TAKE (permissionless covenant FILL): build the fill tx against
-/// the resting covenant, then broadcast. No maker round-trip.
-class _TakeReviewSheet extends StatefulWidget {
-  const _TakeReviewSheet({
-    required this.offer,
+/// Confirm + run a MARKET order that WALKS the same-chain covenant book (spec §4). Executes the planned
+/// sweep ([MarketWalkPlan]) by looping the PROVEN covenant FILL primitive once per level: build → settle
+/// → sync → next. Each fill is atomic (settles in full or not at all) and consensus-exact (the ceil
+/// price is enforced on-chain), so a level that fails (a covenant just taken by someone else) is SKIPPED
+/// and the walk continues — nothing is stranded. Any size with no liquidity behind it simply does not
+/// fill (IOC): a market order never rests a remainder. What the Review shows IS what executes.
+class _MarketWalkReviewSheet extends StatefulWidget {
+  const _MarketWalkReviewSheet({
+    required this.plan,
     required this.payAsset,
-    required this.payAtoms,
     required this.recvAsset,
-    required this.recvAtoms,
     required this.feeAsset,
-    required this.feeAtoms,
+    required this.feeAtomsPerFill,
   });
-  final SeqObOffer offer;
+  final MarketWalkPlan plan;
   final String payAsset;
-  final BigInt payAtoms;
   final String recvAsset;
-  final BigInt recvAtoms;
   final String feeAsset;
-  final BigInt feeAtoms;
+  final BigInt feeAtomsPerFill;
   @override
-  State<_TakeReviewSheet> createState() => _TakeReviewSheetState();
+  State<_MarketWalkReviewSheet> createState() => _MarketWalkReviewSheetState();
 }
 
-class _TakeReviewSheetState extends State<_TakeReviewSheet> {
+class _MarketWalkReviewSheetState extends State<_MarketWalkReviewSheet> {
   bool _busy = false;
   String _status = '';
   String? _error;
@@ -2467,6 +2753,36 @@ class _TakeReviewSheetState extends State<_TakeReviewSheet> {
     return '${formatAtoms(atoms.toString(), l.precision)} ${l.ticker}';
   }
 
+  /// The realised sweep price as a "1 receive = N pay" line (the plan's VWAP is pay-per-receive).
+  String _priceLine() {
+    final p = widget.plan;
+    if (!(p.vwap > 0)) return '—';
+    final payTk = SeqAssets.labelFor(widget.payAsset).ticker;
+    final recvTk = SeqAssets.labelFor(widget.recvAsset).ticker;
+    // vwap is quote(pay)-per-base(receive) in ATOM terms; scale to whole units for display.
+    final payPrec = SeqAssets.labelFor(widget.payAsset).precision;
+    final recvPrec = SeqAssets.labelFor(widget.recvAsset).precision;
+    var v = p.vwap * _p10(recvPrec) / _p10(payPrec);
+    return 'Market · ~${_fmtNum(v)} $payTk per $recvTk';
+  }
+
+  static double _p10(int n) {
+    var v = 1.0;
+    for (var i = 0; i < n; i++) {
+      v *= 10;
+    }
+    return v;
+  }
+
+  static String _fmtNum(double n) {
+    if (!n.isFinite || n == 0) return '0';
+    final a = n.abs();
+    final dp = a >= 1000 ? 2 : (a >= 1 ? 4 : (a >= 0.01 ? 6 : 8));
+    var s = n.toStringAsFixed(dp);
+    if (s.contains('.')) s = s.replaceAll(RegExp(r'0+$'), '').replaceAll(RegExp(r'\.$'), '');
+    return s;
+  }
+
   Future<void> _confirm() async {
     setState(() {
       _busy = true;
@@ -2474,6 +2790,7 @@ class _TakeReviewSheetState extends State<_TakeReviewSheet> {
       _status = 'Authenticating…';
     });
     try {
+      // One payment auth covers the whole sweep (each level is a separate on-chain settlement below).
       final ok = await WalletRepository.instance.requirePaymentAuth();
       if (!ok) {
         setState(() {
@@ -2484,22 +2801,47 @@ class _TakeReviewSheetState extends State<_TakeReviewSheet> {
       }
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) throw Exception('wallet unavailable');
-      setState(() => _status = 'Building your FILL spend…');
-      final built = await core.covenantBuildFillTx(
-        mnemonic: m,
-        esploraUrl: Backend.esplora,
-        covenantTermsJson: widget.offer.covenantTermsJson,
-        takeAtoms: widget.recvAtoms,
-        feeAsset: widget.feeAsset,
-        feeAtoms: widget.feeAtoms,
-      );
-      setState(() => _status = 'Broadcasting…');
-      final txid = await core.xchainSeqBroadcast(seqEsplora: Backend.esplora, txHex: built.rawHex);
-      // Local activity receipt for the completed same-chain covenant fill.
+      final fills = widget.plan.fills;
       final recvTk = SeqAssets.labelFor(widget.recvAsset).ticker;
       final payTk = SeqAssets.labelFor(widget.payAsset).ticker;
-      await TradeReceipts.log(id: 'take:$txid', title: 'Bought $recvTk with $payTk', status: 'Filled', txid: txid);
-      if (mounted) Navigator.pop(context, txid);
+      final txids = <String>[];
+      Object? lastErr;
+      for (var i = 0; i < fills.length; i++) {
+        final f = fills[i];
+        setState(() => _status = 'Filling level ${i + 1} of ${fills.length}…');
+        try {
+          final built = await core.covenantBuildFillTx(
+            mnemonic: m,
+            esploraUrl: Backend.esplora,
+            covenantTermsJson: f.offer.covenantTermsJson,
+            takeAtoms: f.take,
+            feeAsset: widget.feeAsset,
+            feeAtoms: widget.feeAtomsPerFill,
+          );
+          final txid = await core.xchainSeqBroadcast(seqEsplora: Backend.esplora, txHex: built.rawHex);
+          txids.add(txid);
+          await TradeReceipts.log(id: 'take:$txid', title: 'Bought $recvTk with $payTk', status: 'Filled', txid: txid);
+          // Reflect the spent UTXOs (+ the fill's change) before building the next level's spend, so a
+          // multi-level sweep never tries to re-spend a coin the previous level already consumed.
+          if (i + 1 < fills.length) {
+            setState(() => _status = 'Updating balances…');
+            try {
+              await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
+            } catch (_) {/* transient; the next build re-fetches UTXOs from esplora regardless */}
+          }
+        } catch (e) {
+          // A single level failing (covenant already taken, transient) must NOT abort the sweep — skip it
+          // and walk on. Nothing is committed for a failed fill (build+broadcast is atomic), so skipping
+          // strands nothing.
+          lastErr = e;
+        }
+      }
+      if (txids.isEmpty) {
+        throw Exception(lastErr == null
+            ? 'Nothing on the book could be filled — switch to Limit to rest an order.'
+            : lastErr.toString().replaceFirst('Exception: ', ''));
+      }
+      if (mounted) Navigator.pop(context, txids.first);
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -2512,19 +2854,28 @@ class _TakeReviewSheetState extends State<_TakeReviewSheet> {
 
   @override
   Widget build(BuildContext context) {
+    final p = widget.plan;
+    final n = p.fills.length;
+    final feePerFill = _feeWithApprox(widget.feeAsset, widget.feeAtomsPerFill);
     return SafeArea(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
         child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          const Text('Review · take offer', style: AmbraText.h1),
+          const Text('Review · market order', style: AmbraText.h1),
           const SizedBox(height: 18),
           AmbraCard(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             child: Column(children: [
-              _Row('You pay', _amt(widget.payAsset, widget.payAtoms)),
-              _Row('You receive', _amt(widget.recvAsset, widget.recvAtoms)),
-              _Row('Network fee', _feeWithApprox(widget.feeAsset, widget.feeAtoms)),
-              _Row('Settlement', 'Permissionless covenant fill; settles in full or not at all.'),
+              _Row('You pay', 'up to ${_amt(widget.payAsset, p.totalPay)}'),
+              _Row('You receive', '~${_amt(widget.recvAsset, p.totalRecv)}'),
+              _Row('Price', _priceLine()),
+              if (p.slippageFraction > 0.0001)
+                _Row('Slippage', 'up to ${(p.slippageFraction * 100).toStringAsFixed(p.slippageFraction < 0.01 ? 2 : 1)}% across ${n == 1 ? '1 level' : '$n levels'}'),
+              _Row('Fills', n == 1 ? '1 resting offer' : 'walks $n resting offers, best price first'),
+              if (p.partial)
+                _Row('Partial only', 'The book has less than your size; the rest is CANCELLED, not rested (switch to Limit to rest it).'),
+              _Row('Network fee', '$feePerFill  (per level)'),
+              _Row('Settlement', 'Permissionless covenant fill; each level settles in full or not at all.'),
               _Row('Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'),
             ]),
           ),
@@ -2533,7 +2884,8 @@ class _TakeReviewSheetState extends State<_TakeReviewSheet> {
             Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_status, style: AmbraText.muted)),
           if (_error != null)
             Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
-          PrimaryButton(label: 'Confirm & take', busy: _busy, icon: Icons.fingerprint, onPressed: _busy ? null : _confirm),
+          PrimaryButton(
+              label: 'Place market order', busy: _busy, icon: Icons.fingerprint, onPressed: _busy ? null : _confirm),
           const SizedBox(height: 6),
           GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
         ]),

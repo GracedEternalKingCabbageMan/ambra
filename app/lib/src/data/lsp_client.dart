@@ -299,6 +299,7 @@ class LspClient {
     String? offerId,
     String? makerPubkey,
     String? swapNonce,
+    String? quoteAsset,
   }) async {
     final body = <String, dynamic>{
       'side': side,
@@ -307,6 +308,10 @@ class LspClient {
       'payRail': payRail,
       'recvRail': recvRail,
     };
+    // Same-chain asset<->asset pure-LN swap (priority D): the COUNTER asset the base is priced against
+    // takes BTC's structural place, so the LSP settles both legs asset-over-LN. Serialized ONLY when
+    // present, so the asset<->BTC pure-LN, sub-asset BUY, and submarine SELL bodies are untouched.
+    if (quoteAsset != null && quoteAsset.isNotEmpty) body['quote_asset'] = quoteAsset;
     if (amount != null) body['amount'] = amount;
     if (hodl) body['hodl'] = true;
     if (paymentHash != null) body['payment_hash'] = paymentHash;
