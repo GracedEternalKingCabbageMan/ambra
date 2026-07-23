@@ -98,4 +98,53 @@ void main() {
     final none = railAvailability(channels: const [], payTarget: btcT, recvTarget: goldT);
     expect(none.payLn.ok || none.recvLn.ok || none.pureLnOk, isFalse);
   });
+
+  // --- LSP JIT-fronting (spec §5, web D): a channel-less wallet can STILL trade over Lightning --------
+
+  test('Frontable.fromStatus parses btc in/out + per-asset inventory; absent -> null', () {
+    expect(Frontable.fromStatus({'node_id': 'x'}), isNull, reason: 'no frontable key -> null (do not pessimise)');
+    final f = Frontable.fromStatus({
+      'frontable': {
+        'btc': {'in_sat': 200000, 'out_sat': 0},
+        'assets': {gold.toUpperCase(): '5000000', usdx: 0},
+      }
+    });
+    expect(f, isNotNull);
+    expect(f!.btcInSat, BigInt.from(200000));
+    expect(f.btcOutSat, BigInt.zero);
+    expect(f.assets[gold], BigInt.from(5000000), reason: 'asset keys are lowercased');
+    expect(f.hasAnyAssetInventory, isTrue);
+  });
+
+  test('lspCanFront is leg- and direction-aware', () {
+    final f = Frontable(btcInSat: BigInt.from(200000), btcOutSat: BigInt.zero, assets: {gold: BigInt.from(5000000)});
+    expect(lspCanFront(btcT, 'pay', f), isTrue, reason: 'in_sat>0 -> LSP can RECEIVE the user\'s BTC');
+    expect(lspCanFront(btcT, 'recv', f), isFalse, reason: 'out_sat==0 -> LSP cannot DELIVER BTC over LN');
+    expect(lspCanFront(goldT, 'recv', f), isTrue, reason: 'GOLD inventory -> can front INBOUND');
+    expect(lspCanFront(usdxT, 'recv', f), isFalse, reason: 'no USDX inventory -> cannot front USDX inbound');
+    expect(lspCanFront(usdxT, 'pay', f), isTrue, reason: 'pay-asset only needs the LP up (any inventory)');
+    expect(lspCanFront(goldT, 'pay', null), isFalse, reason: 'no frontable snapshot -> lspCanFront is false');
+  });
+
+  test('legOption: frontable data distinguishes provisionable (near-instant) from unfrontable', () {
+    final f = Frontable(btcInSat: BigInt.zero, btcOutSat: BigInt.zero, assets: {gold: BigInt.from(5000000)});
+    // No own USDX channel, and the LSP has no USDX inventory to front inbound -> honestly unavailable.
+    final unfront = legOption(channels, usdxT, 'recv', null, f);
+    expect(unfront.ok, isFalse);
+    expect(unfront.unfrontable, isTrue);
+    expect(unfront.provisionable, isFalse);
+    expect(unfront.reason, contains('isn\'t available'));
+
+    // No own USDX channel, but pay-asset only needs the LP up (GOLD inventory present) -> provisionable.
+    final prov = legOption(channels, usdxT, 'pay', null, f);
+    expect(prov.ok, isFalse);
+    expect(prov.provisionable, isTrue);
+    expect(prov.unfrontable, isFalse);
+    expect(prov.hint, contains('near-instant'));
+
+    // With NO frontable snapshot at all, a channel-less leg stays provisionable (never pessimise).
+    final noSnap = legOption(channels, usdxT, 'recv', null, null);
+    expect(noSnap.provisionable, isTrue);
+    expect(noSnap.unfrontable, isFalse);
+  });
 }
