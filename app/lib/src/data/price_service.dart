@@ -72,6 +72,20 @@ class PriceService extends ChangeNotifier {
     return amt * p / rp;
   }
 
+  /// The atom amount of [ticker] worth [refAmount] units of the reference currency — the INVERSE of
+  /// [refValue]. Lets a user enter size in their chosen reference currency (USD / BTC / chosen) and have it
+  /// converted to the asset amount (spec §6.2, priority A). Rounds to the nearest atom; returns null when
+  /// the asset can't be priced or the input is non-positive / non-finite.
+  BigInt? atomsForRef(String ticker, double refAmount, int precision) {
+    if (!refAmount.isFinite || refAmount <= 0) return null;
+    final p = _priceUsd(ticker);
+    final rp = _refPriceUsd();
+    if (p == null || rp == null || p == 0) return null;
+    final amt = refAmount * rp / p; // whole units of the asset
+    final atoms = (amt * math.pow(10, precision)).round();
+    return atoms > 0 ? BigInt.from(atoms) : null;
+  }
+
   /// "≈ 1.23 USD" for an asset amount, or null if it can't be priced.
   String? approx(String ticker, String atoms, int precision) {
     final v = refValue(ticker, atoms, precision);

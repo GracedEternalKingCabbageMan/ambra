@@ -63,4 +63,50 @@ void main() {
     expect(validateCrossTerms(offer: offer(), terms: terms(fee: BigInt.from(2000))), contains('fee is too high'));
     expect(validateCrossTerms(offer: offer(), terms: terms(fee: BigInt.from(1500))), isNull);
   });
+
+  group('partial fill (priority C, forward CEIL proportional BTC)', () {
+    CrossOffer o43() => CrossOffer(
+          offerId: 'x1',
+          seqAsset: 'gold',
+          makerSellsAsset: true,
+          assetAtoms: BigInt.from(43),
+          btcSats: BigInt.from(4300),
+          makerPubkey: '03aa',
+        );
+    CrossTerms t({required int asset, required int btc}) => terms(asset: BigInt.from(asset), btc: BigInt.from(btc));
+
+    test('buy 10 of a 43 binds 10 asset at the proportional CEIL BTC, never the whole 43', () {
+      // ceil(4300*10/43) = ceil(1000.0) = 1000.
+      expect(proportionalBtcForwardCeil(BigInt.from(4300), BigInt.from(43), BigInt.from(10)), BigInt.from(1000));
+      expect(validateCrossTerms(offer: o43(), terms: t(asset: 10, btc: 1000), requestedAtoms: BigInt.from(10)), isNull);
+      // The whole-offer amounts must NOT validate for a partial request.
+      expect(validateCrossTerms(offer: o43(), terms: t(asset: 43, btc: 4300), requestedAtoms: BigInt.from(10)),
+          isNotNull);
+    });
+
+    test('forward CEIL rounds up; a maker quoting the floor is refused', () {
+      final o = CrossOffer(
+          offerId: 'x', seqAsset: 'g', makerSellsAsset: true,
+          assetAtoms: BigInt.from(43), btcSats: BigInt.from(4307), makerPubkey: '03aa');
+      expect(proportionalBtcForwardCeil(BigInt.from(4307), BigInt.from(43), BigInt.from(10)), BigInt.from(1002));
+      expect(validateCrossTerms(offer: o, terms: t(asset: 10, btc: 1002), requestedAtoms: BigInt.from(10)), isNull);
+      expect(validateCrossTerms(offer: o, terms: t(asset: 10, btc: 1001), requestedAtoms: BigInt.from(10)), isNotNull);
+    });
+
+    test('overcharging a partial slice is refused (never overpay)', () {
+      expect(validateCrossTerms(offer: o43(), terms: t(asset: 10, btc: 1500), requestedAtoms: BigInt.from(10)),
+          isNotNull);
+    });
+
+    test('a slice below a known min_fill is refused before any BTC locks', () {
+      expect(
+          validateCrossTerms(
+              offer: o43(), terms: t(asset: 2, btc: 200), requestedAtoms: BigInt.from(2), minFill: BigInt.from(5)),
+          contains('minimum fillable'));
+    });
+
+    test('a requested size >= the offer falls back to the strict whole-offer check', () {
+      expect(validateCrossTerms(offer: o43(), terms: t(asset: 43, btc: 4300), requestedAtoms: BigInt.from(100)), isNull);
+    });
+  });
 }

@@ -36,6 +36,8 @@ class SwapRoute {
     this.pay,
     this.recv,
     this.seqAsset,
+    this.quoteAsset,
+    this.assetAsset = false,
     this.payIsBtc = false,
     this.payRail = 'chain',
     this.recvRail = 'chain',
@@ -45,8 +47,18 @@ class SwapRoute {
   final String? pay;
   final String? recv;
 
-  /// The Sequentia asset in a BTC<->asset route (null for `same` / `invalid`).
+  /// The Sequentia asset in a BTC<->asset route, OR the BASE asset in a same-chain pure-LN route
+  /// ([assetAsset] true) — the one the counter/quote leg is priced against (null for `same` / `invalid`).
   final String? seqAsset;
+
+  /// The COUNTER (quote) asset in a same-chain pure-LN route ([assetAsset] true) — it takes BTC's
+  /// structural place as the leg the base is priced in. Null for a BTC<->asset or covenant route.
+  final String? quoteAsset;
+
+  /// True when this is a SAME-CHAIN asset↔asset pair settling over pure Lightning (both legs asset-over-LN,
+  /// bound by one preimage), not a BTC<->asset LN route. The LSP `/swap` carries [quoteAsset] as the
+  /// counter asset (priority D). False for every BTC pair and the covenant book.
+  final bool assetAsset;
 
   /// True when the PAY leg is BTC (a BUY of [seqAsset] with Bitcoin); false when
   /// the pay leg is the asset (a SELL of [seqAsset] for Bitcoin).
@@ -104,6 +116,8 @@ SwapRoute route(
   bool? payRailLn, // settlement preference; NULL = unselected (no default). Treated as on-chain for
   bool? recvRailLn, // the route KIND (so the book/quote renders); the UI gates placement on both != null.
   bool lnAvailable = true,
+  String? sameChainQuote, // the canonical QUOTE asset of a same-chain pair (the composer's pairDir.quote),
+  // so a both-Lightning same-chain pair can be classified as pure-LN with the counter asset (priority D).
 }) {
   if (pay == null || recv == null || pay.isEmpty || recv.isEmpty || pay == recv) {
     return const SwapRoute(kind: SwapRouteKind.invalid);
@@ -113,6 +127,26 @@ SwapRoute route(
   }
   final btcPair = (pay == kBtcSentinel) != (recv == kBtcSentinel); // exactly one side BTC
   if (!btcPair) {
+    // Same-chain asset↔asset can settle over PURE Lightning too (two asset-LN HTLCs bound by one preimage),
+    // the counter (quote) asset taking BTC's structural place — spec §5, web findRoute. Route there ONLY
+    // when BOTH legs are set to Lightning AND Lightning is available AND we know the canonical quote;
+    // otherwise the same-chain covenant order book. A stale/unselected rail resolves to the covenant book.
+    final bothLn = lnAvailable && (payRailLn ?? false) && (recvRailLn ?? false);
+    if (bothLn && sameChainQuote != null && sameChainQuote.isNotEmpty && (pay == sameChainQuote || recv == sameChainQuote)) {
+      final quote = sameChainQuote;
+      final base = quote == pay ? recv : pay; // the base leg is priced in the quote leg
+      return SwapRoute(
+        kind: SwapRouteKind.ln,
+        pay: pay,
+        recv: recv,
+        seqAsset: base,
+        quoteAsset: quote,
+        assetAsset: true,
+        payIsBtc: pay == quote, // "paying the quote" is the structural analog of paying BTC (a BUY of base)
+        payRail: 'ln',
+        recvRail: 'ln',
+      );
+    }
     return SwapRoute(kind: SwapRouteKind.same, pay: pay, recv: recv);
   }
   final payIsBtc = pay == kBtcSentinel;
