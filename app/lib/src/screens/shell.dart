@@ -19,6 +19,7 @@ import '../data/registry_service.dart';
 import '../data/seqln_keys.dart' as lnkeys;
 import '../data/subasset_buy_service.dart';
 import '../data/subasset_sell_service.dart';
+import '../data/subswap_service.dart';
 import '../data/wallet_cache.dart';
 import '../data/wallet_repository.dart';
 import '../theme/theme.dart';
@@ -57,7 +58,14 @@ class _ShellState extends State<Shell> {
   }
 
   Future<void> _initLightning() async {
-    if (!LightningService.instance.configured) return; // LN not deployed here
+    // AUTHORITATIVE PRIMING BEFORE UI (fund-loss, Task 1): FIRST — before the LN gate, before any resume
+    // I/O, and REGARDLESS of whether Lightning is deployed — PRIME the synchronous submarine in-flight
+    // guard from the persisted record (AWAITED). Mirrors the web wallet's SYNCHRONOUS module-eval hydration
+    // of hasSubswapInFlight (swap.js): the guard is authoritative before the Swap tab is interactive, so a
+    // fresh _start / _dispatchSubmarine can never fail open and clobber a live record. Fails safe (assumes
+    // in-flight) on any read error, so priming never leaves the guard open.
+    await SubswapStore.primeInFlight();
+    if (!LightningService.instance.configured) return; // LN not deployed here (guard already primed)
     final m = await WalletRepository.instance.readMnemonic();
     if (m == null) return;
     await LightningService.instance.start(m);
@@ -66,6 +74,14 @@ class _ShellState extends State<Shell> {
     // Fire-and-forget: each loads its own persisted record and no-ops when there is nothing to resume.
     unawaited(SubassetBuyService.resume());
     unawaited(SubassetSellService.resume());
+    // Resume any in-flight P2P SUBMARINE (settle a HELD Bitcoin hold with P, re-claim a paid-but-unclaimed
+    // asset on a BUY, or fire the CLTV refund past T_seq on a SELL) — even if the user never re-opens Swap.
+    // This heavy settlement drive runs UNAWAITED, AFTER priming (Task 1). A read failure inside it must be
+    // OBSERVED, not swallowed, and must never leave the guard OPEN: load() already fails safe (guard closed),
+    // and this .catchError reaffirms it for the session so no _start / _dispatch clobbers a live record.
+    unawaited(SubswapService.resume().catchError((Object e) {
+      SubswapStore.markInFlight(true);
+    }));
   }
 
   Future<void> _initOpenamp() async {

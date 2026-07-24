@@ -72,6 +72,20 @@ class SwapRoute {
 
   bool get isValid => kind != SwapRouteKind.invalid;
 
+  /// The settlement rail of the BTC leg / the asset leg for a BTC<->asset route. On a BUY (pay BTC) the
+  /// asset is the RECEIVE leg; on a SELL (pay the asset) the asset is the PAY leg. Null-safe defaults to
+  /// 'chain' for a same-chain / invalid route (no BTC leg).
+  String get _btcRail => payIsBtc ? payRail : recvRail;
+  String get _assetRail => payIsBtc ? recvRail : payRail;
+
+  /// A SUBMARINE mixed shape: the BTC leg on Lightning + the asset leg on-chain — the one that crosses on
+  /// the BTC leg and settles via the P2P submarine taker (or the LSP leg-bridge fallback). Distinct from
+  /// [isSubAsset] (the asset leg on Lightning + the BTC leg on-chain -> the LSP asset-over-LN rail).
+  bool get isSubmarine => kind == SwapRouteKind.mixed && _btcRail == 'ln' && _assetRail == 'chain';
+
+  /// A SUB-ASSET mixed shape: the asset leg on Lightning + the BTC leg on-chain (the LSP sub-asset rail).
+  bool get isSubAsset => kind == SwapRouteKind.mixed && _assetRail == 'ln' && _btcRail == 'chain';
+
   /// A one-line, ticker-free description of HOW this route settles and its timing,
   /// for the composer's route summary (the mobile twin of the web's #swTiming banner).
   String get timing {
@@ -85,10 +99,19 @@ class SwapRoute {
       case SwapRouteKind.ln:
         return 'Instant Lightning swap. Nothing settles on-chain, so there is no Bitcoin-reorg risk.';
       case SwapRouteKind.mixed:
+        if (isSubmarine) {
+          // BTC leg over Lightning + asset leg on-chain -> the peer-to-peer submarine taker.
+          return payIsBtc
+              ? 'Submarine swap. You pay Bitcoin over Lightning and receive the asset on-chain, '
+                  'bound by one secret. Anchored to Bitcoin (reverts only if Bitcoin reverts).'
+              : 'Submarine swap. You pay the asset on-chain and receive Bitcoin over Lightning, '
+                  'bound by one secret. Anchored to Bitcoin (reverts only if Bitcoin reverts).';
+        }
+        // Asset leg over Lightning + BTC leg on-chain -> the sub-asset rail.
         return payIsBtc
-            ? 'Submarine swap. You lock Bitcoin on-chain and receive the asset over Lightning, '
+            ? 'Sub-asset swap. You lock Bitcoin on-chain and receive the asset over Lightning, '
                 'bound by one secret.'
-            : 'Submarine swap. You pay the asset over Lightning and receive Bitcoin on-chain, '
+            : 'Sub-asset swap. You pay the asset over Lightning and receive Bitcoin on-chain, '
                 'bound by one secret.';
       case SwapRouteKind.invalid:
         return '';
@@ -154,28 +177,84 @@ SwapRoute route(
   // HONEST gating: a leg may sit on 'ln' only while Lightning is available. A null (unselected) or
   // downgraded 'ln' preference resolves to 'chain' here, so the book/quote always renders and a stale
   // rail state can never route into a dead Lightning path — the proven cross rail is the fallback.
-  var p = lnAvailable && (payRailLn ?? false) ? 'ln' : 'chain';
-  var r = lnAvailable && (recvRailLn ?? false) ? 'ln' : 'chain';
-  // Ambra serves three BTC<->asset shapes: pure-LN (both legs on Lightning), sub-asset (the ASSET leg
-  // on Lightning + the BTC leg on-chain), and cross (both on-chain). The fourth shape — SUBMARINE, the
-  // BTC leg on Lightning + the ASSET leg on-chain — is not yet built on mobile, so degrade its
-  // Lightning leg to on-chain here: the pair falls back to the proven on-chain cross rail (honest — the
-  // user still gets a working swap) rather than misrouting to a sub-asset screen that does the inverse.
-  // The asset leg is the RECEIVE leg on a BUY (pay BTC), the PAY leg on a SELL (pay the asset).
-  final btcRail = payIsBtc ? p : r;
-  final assetRail = payIsBtc ? r : p;
-  if (btcRail == 'ln' && assetRail == 'chain') {
-    p = 'chain';
-    r = 'chain';
-  }
+  final p = lnAvailable && (payRailLn ?? false) ? 'ln' : 'chain';
+  final r = lnAvailable && (recvRailLn ?? false) ? 'ln' : 'chain';
+  // Ambra serves FOUR BTC<->asset shapes, and the route now returns the REAL one for BOTH directions —
+  // no silent degrade of the SUBMARINE leg to on-chain (which used to misroute a submarine into the cross
+  // rail): pure-LN (both legs on Lightning), sub-asset (the ASSET leg on Lightning + the BTC leg
+  // on-chain), SUBMARINE (the BTC leg on Lightning + the ASSET leg on-chain), and cross (both on-chain).
+  // The mixed kind covers BOTH mixed-rail shapes; [SwapRoute.isSubmarine] / [SwapRoute.isSubAsset]
+  // distinguish them off the per-leg rails so dispatch routes each correctly (submarine -> the P2P
+  // submarine taker; sub-asset -> the LSP asset-over-LN rail).
   final SwapRouteKind kind;
   if (p == 'ln' && r == 'ln') {
     kind = SwapRouteKind.ln; // both legs on Lightning -> pure-LN
   } else if (p == 'chain' && r == 'chain') {
     kind = SwapRouteKind.cross; // both legs on-chain -> cross-chain HTLC
   } else {
-    kind = SwapRouteKind.mixed; // asset leg on Lightning + BTC on-chain -> sub-asset submarine swap
+    kind = SwapRouteKind.mixed; // one leg on Lightning + one on-chain -> submarine OR sub-asset
   }
   return SwapRoute(
       kind: kind, pay: pay, recv: recv, seqAsset: seqAsset, payIsBtc: payIsBtc, payRail: p, recvRail: r);
+}
+
+/// How a rail-blind cross route settles given the resting offer's signed capabilities — the Dart twin of
+/// settlement-router.mjs `chooseSettlementPath` + subswap.js `dispatchSubswap`.
+enum SettlementPath {
+  /// Both legs settle on the rail each endpoint already wanted (no bridge, no submarine).
+  native,
+
+  /// A DIRECT peer-to-peer submarine (no LSP in the value path): the maker is interactive + accepts
+  /// BTC-LN. ln_direction 1 = BUY (reverse submarine), 0 = SELL (normal submarine).
+  p2pSubmarine,
+
+  /// The LSP leg-bridge terminates the LN end (fallback vs an on-chain-only / passive covenant maker).
+  lspBridge,
+
+  /// The crossing has no single on-chain asset HTLC to settle (the maker rests the asset over Lightning),
+  /// so neither the P2P submarine nor the LSP leg-bridge can settle it — honest-disable, never misroute.
+  unsupported,
+}
+
+/// The settlement decision for a rail-blind cross route: which [path], and for a submarine which side is
+/// on Lightning ([lnSide] 'payer' = a BUY, 'receiver' = a SELL) + the [lnDirection] the P2P submarine
+/// taker runs (1 = reverse/buy, 0 = normal/sell).
+class SettlementDispatch {
+  const SettlementDispatch({required this.path, this.lnDirection, this.lnSide, this.reason});
+  final SettlementPath path;
+  final int? lnDirection;
+  final String? lnSide;
+  final String? reason;
+}
+
+/// Route a rail-blind cross [route] to its settlement PATH given the resting offer's caps — the Dart twin
+/// of settlement-router.mjs `chooseSettlementPath` + subswap.js `dispatchSubswap`. The rail crossing is
+/// always on the BTC leg (the asset leg is Sequentia on-chain); its lnSide names who is on Lightning.
+/// An interactive maker that accepts BTC-LN settles PEER-TO-PEER (no LSP in the value path); else the LSP
+/// leg-bridge. A crossing whose asset leg ALSO crosses ([makerAssetOnchain] false — the offer rests the
+/// asset over Lightning) is 'unsupported': there is no single on-chain asset HTLC to settle. PURE.
+SettlementDispatch chooseSettlementPath(
+  SwapRoute route, {
+  required bool makerInteractive,
+  required bool makerBtcLn,
+  bool makerAssetOnchain = true,
+}) {
+  // Only a SUBMARINE mixed shape (the BTC leg on Lightning + the asset leg on-chain) crosses on the BTC
+  // leg. Every other shape is native to the composer's proven paths (cross / pure-LN / sub-asset).
+  if (route.kind != SwapRouteKind.mixed || !route.isSubmarine) {
+    return const SettlementDispatch(path: SettlementPath.native);
+  }
+  final side = route.payIsBtc ? 'buy' : 'sell';
+  final lnSide = route.payIsBtc ? 'payer' : 'receiver'; // payer = BUY pays BTC-LN, receiver = SELL
+  if (!makerAssetOnchain) {
+    return SettlementDispatch(
+        path: SettlementPath.unsupported,
+        lnSide: lnSide,
+        reason: 'the maker rests the asset over Lightning; this rail crossing needs an on-chain asset leg');
+  }
+  if (makerInteractive && makerBtcLn) {
+    return SettlementDispatch(
+        path: SettlementPath.p2pSubmarine, lnDirection: side == 'buy' ? 1 : 0, lnSide: lnSide);
+  }
+  return SettlementDispatch(path: SettlementPath.lspBridge, lnSide: lnSide);
 }
