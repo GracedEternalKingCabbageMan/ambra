@@ -179,8 +179,35 @@ class LightningService extends ChangeNotifier {
   /// seqln_keys.dart) — so `/status` also reports THIS device's per-asset channels across restarts.
   Future<LspStatus> getStatus({List<String>? nodes}) => LspClient.getStatus(nodes: nodes);
 
-  Future<LspSwapResult> swap({required String side, required String asset, required num amount}) =>
-      LspClient.swap(side: side, asset: asset, amount: amount);
+  /// Take a pure-LN offer. SELF-CUSTODY (mirror the web reviewLn): [nodeKey]/[counterNodeKey] name the
+  /// user's OWN per-asset nodes so the LSP drives the swap on THEM (the device co-signs), [quoteAsset]
+  /// carries the real counter asset for a same-chain asset↔asset swap, and [offerId]/[makerPubkey] PIN
+  /// the exact reviewed offer. All optional, so the plain asset↔BTC call is unchanged.
+  Future<LspSwapResult> swap({
+    required String side,
+    required String asset,
+    required num amount,
+    String? nodeKey,
+    String? counterNodeKey,
+    String? quoteAsset,
+    String? offerId,
+    String? makerPubkey,
+  }) =>
+      LspClient.swap(
+        side: side,
+        asset: asset,
+        amount: amount,
+        nodeKey: nodeKey,
+        counterNodeKey: counterNodeKey,
+        quoteAsset: quoteAsset,
+        offerId: offerId,
+        makerPubkey: makerPubkey,
+      );
+
+  /// The pure-LN order book for (base [asset], [quoteAsset]) — a best-effort pre-check so the composer
+  /// pins the reviewed offer and never enables-then-fails. Empty when the LSP is unreachable / predates
+  /// `/lnbook`. Mirrors the web wallet's `L.lnBook`.
+  Future<LnBook> lnBook(String asset, {String? quoteAsset}) => LspClient.lnBook(asset, quoteAsset: quoteAsset);
 
   // -- sub-asset swap rail delegates (asset over Lightning <-> BTC on-chain HTLC) ---------------
   // Thin pass-throughs to the [LspClient] sub-asset methods, plus [assetNodeKey] which brings the
@@ -236,6 +263,17 @@ class LightningService extends ChangeNotifier {
     if (m == null) throw Exception('Your wallet is locked; unlock it and try again.');
     final key = await connectNode(m, asset: asset);
     return key.isNotEmpty ? key : ownNodeKey(m, asset: asset);
+  }
+
+  /// Bring the user's OWN hosted BTC node online (provision + device signer) and return its LSP node_key —
+  /// the node that pays / receives Bitcoin over Lightning (the submarine taker's BTC leg + the asset↔BTC
+  /// pure-LN counter leg). Mirrors the web wallet's `btcNodeKey`. Falls back to the deterministic
+  /// [ownNodeKey] if the connect returns no key.
+  Future<String> btcNodeKey() async {
+    final m = await WalletRepository.instance.readMnemonic();
+    if (m == null) throw Exception('Your wallet is locked; unlock it and try again.');
+    final key = await connectNode(m, chain: 'btc');
+    return key.isNotEmpty ? key : ownNodeKey(m, chain: 'btc');
   }
 
   // -- per-asset OWN-node signers: general Lightning pay / receive + Move-to-Lightning ----------

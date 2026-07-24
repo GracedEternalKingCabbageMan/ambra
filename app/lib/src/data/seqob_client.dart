@@ -85,6 +85,9 @@ class CrossOffer {
     required this.btcSats,
     required this.makerPubkey,
     this.verified = false,
+    this.interactive = false,
+    this.btcLn = false,
+    this.assetOnchain = true,
   });
   final String offerId;
   final String seqAsset;
@@ -93,6 +96,18 @@ class CrossOffer {
   final BigInt btcSats;
   final String makerPubkey;
   final bool verified; // maker signature checked in Rust; crossBook only returns verified offers
+
+  /// The maker's SIGNED settlement capabilities (unified-book meta.caps), read by [chooseSettlementPath]
+  /// to route a rail crossing: [interactive] = the maker is online + speaks the courier — this defaults
+  /// FALSE when the signed caps OMIT it, so a P2P submarine is routed ONLY when interactive is EXPLICITLY
+  /// signed true (mirror the web, where caps.interactive undefined routes to the honest-disabled LSP
+  /// leg-bridge, NEVER to a P2P submarine); [btcLn] = the maker can itself accept BTC over Lightning (the
+  /// signal that promotes a submarine crossing to a DIRECT peer-to-peer path instead of the LSP leg-bridge
+  /// fallback); [assetOnchain] = the asset leg is a single on-chain HTLC (false when the maker rests the
+  /// asset over Lightning, which makes a submarine crossing unsupported).
+  final bool interactive;
+  final bool btcLn;
+  final bool assetOnchain;
 
   /// BTC sats per 1 asset atom (the price). Lower = cheaper asset.
   double get btcPerAssetAtom => assetAtoms > BigInt.zero ? btcSats.toDouble() / assetAtoms.toDouble() : 0;
@@ -262,6 +277,18 @@ class SeqObClient {
             verified = false;
           }
           if (!verified) continue;
+          // The maker's SIGNED settlement caps (unified-book meta.caps), read by chooseSettlementPath to
+          // route a rail crossing. CONSERVATIVE defaults when a cap is ABSENT: interactive=FALSE and
+          // btc_ln=FALSE, so a P2P submarine is routed ONLY when BOTH are EXPLICITLY signed true — an offer
+          // with {btc_ln:true} but no interactive (or vice-versa) honest-disables to the LSP leg-bridge
+          // instead of navigating to a P2P submarine (mirror the web's caps.interactive-undefined -> lsp-
+          // bridge). asset_onchain defaults TRUE (a plain HTLC cross leg is on-chain unless signed otherwise).
+          final caps = (o['caps'] ?? (o['meta'] is Map ? (o['meta'] as Map)['caps'] : null)) as Map?;
+          bool capBool(String snake, String camel, bool dflt) {
+            if (caps == null) return dflt;
+            final v = caps[snake] ?? caps[camel];
+            return v == null ? dflt : v == true;
+          }
           out.add(CrossOffer(
             offerId: '${pick(o, ['offer_id', 'offerId']) ?? ''}',
             seqAsset: seqAsset,
@@ -270,6 +297,9 @@ class SeqObClient {
             btcSats: btcSats,
             makerPubkey: '${pick(o, ['maker_pubkey', 'makerPubkey']) ?? ''}',
             verified: true,
+            interactive: capBool('interactive', 'interactive', false),
+            btcLn: capBool('btc_ln', 'btcLn', false),
+            assetOnchain: capBool('asset_onchain', 'assetOnchain', true),
           ));
         }
       } catch (_) {/* best-effort per orientation */}

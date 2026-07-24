@@ -34,6 +34,9 @@ import 'lightning_swap_screen.dart';
 import 'my_orders_screen.dart';
 import 'subasset_buy_screen.dart';
 import 'subasset_sell_screen.dart';
+import '../data/subswap_service.dart';
+import 'submarine_swap_screen.dart';
+import 'xchain_reverse_swap_screen.dart';
 import 'xchain_swap_screen.dart';
 
 /// Estimated vByte size of a same-chain settlement tx, used to turn the optional
@@ -110,6 +113,8 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   bool? _payRailLn;
   bool? _recvRailLn;
   XchainSwapRecord? _xInFlight; // a persisted cross-swap with locked BTC needing resume/refund (banner)
+  SubswapRecord? _subInFlight; // a persisted P2P submarine mid-flight needing resume/refund/settle (banner)
+  bool _subCorrupt = false; // a persisted submarine record present but DURABLY UNDECODABLE — recovery (Task 2)
 
   // This wallet's OWN Lightning channels (node_key present), from a best-effort /status fetch. Feeds
   // ln_rail's railAvailability so the composer offers/auto-selects the Lightning rail for a leg ONLY
@@ -479,6 +484,20 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       // opens that screen directly, so without this banner a mid-flight swap (and its
       // CLTV refund) would be stranded off-screen.
       try { _xInFlight = await XchainStore.inFlightWithFunds(); } catch (_) { _xInFlight = null; }
+      // Same for an in-flight P2P SUBMARINE: without this banner a mid-flight submarine (its HELD Bitcoin
+      // hold to settle, or its CLTV asset refund past T_seq) would be reachable only by re-navigating the
+      // exact composer path. The cold-start SubswapService.resume() already fires those actions; this
+      // surfaces the record so the user is prompted (mirror the XchainStore cross in-flight surfacing).
+      try {
+        final rec = await SubswapStore.load();
+        _subInFlight = (rec != null && !rec.terminal) ? rec : null;
+        _subCorrupt = false;
+      } catch (_) {
+        _subInFlight = null;
+        // A DURABLE decode error (Task 2) surfaces a distinct recovery banner; a transient read error is left
+        // to self-heal on the next successful load (Task 1) and shows no banner.
+        _subCorrupt = SubswapStore.corrupt;
+      }
       // Own maker identity, so a MARKET book-walk never self-fills this wallet's own resting covenants.
       try { _ownMakerPub = await core.seqobMakerPubkey(mnemonic: m); } catch (_) {/* self-filter is best-effort */}
       try {
@@ -1794,22 +1813,23 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     final r = route(_payAsset, _receiveAsset,
         payRailLn: _payRailLn,
         recvRailLn: _recvRailLn,
-        lnAvailable: LightningService.instance.available,
+        // OWN-node-capable (mirror findRoute's lnDeployed()), NOT the shared-hub `available` flag: the
+        // submarine + sub-asset legs run on the user's OWN hosted nodes and the per-leg railAvail checks
+        // already require a real usable channel — so a momentarily-down shared hub must not silently degrade
+        // a submarine (BTC over Lightning + asset on-chain) into the on-chain cross rail.
+        lnAvailable: LightningService.instance.configured,
         sameChainQuote: dir?.quote);
-    // The reverse (asset -> BTC on-chain) cross courier is NOT built, so a cross SELL is a dead rail:
-    // route() still returns kind=cross/isValid=true, which would enable Review on a settlement that only
-    // yields a "coming" snack. Treat it as not-actionable and explain inline (route summary), pointing at
-    // the live sell rails (pure-LN / sub-asset), instead of an enabled button that promises settlement.
-    final crossSellDead = isCross && r.kind == SwapRouteKind.cross && !r.payIsBtc;
-    // Same-chain both-Lightning (pure-LN asset↔asset) isn't wired on mobile yet (priority D): show the CTA
-    // but keep it disabled with a reason, and an inline note — never silently settle on the covenant book.
-    final sameChainLnUnbuilt = !isCross && r.kind == SwapRouteKind.ln;
+    // A cross SELL (asset -> BTC on-chain) is now WIRED to the reverse HTLC swap ([XchainReverseSwapScreen]),
+    // and a same-chain both-Lightning pair to the pure-LN asset↔asset swap ([LightningSwapScreen]) — neither
+    // is a dead rail any more, so neither disables the CTA. A SUBMARINE mixed shape (BTC over Lightning +
+    // asset on-chain) settles peer-to-peer ([_dispatchSubmarine]); the honest-disable for a shape with no
+    // routable maker happens at dispatch, never as a priced-then-refused Place.
+    final sameChainLn = !isCross && r.kind == SwapRouteKind.ln; // same-chain asset↔asset over pure Lightning
     // The pair is tradeable (book renders, quote works) — but placement also needs both settlement rails
-    // chosen (spec §6.5, no default). canQuote gates showing the CTA; railsChosen + a built rail enable it.
-    final canQuote =
-        !_loading && _error == null && _payAsset != null && _receiveAsset != null && !crossSellDead && r.isValid;
+    // chosen (spec §6.5, no default). canQuote gates showing the CTA; railsChosen enables it.
+    final canQuote = !_loading && _error == null && _payAsset != null && _receiveAsset != null && r.isValid;
     final railsChosen = _payRailLn != null && _recvRailLn != null;
-    final placeable = railsChosen && !sameChainLnUnbuilt;
+    final placeable = railsChosen;
     return Column(children: [
       Expanded(
         child: ListView(padding: const EdgeInsets.fromLTRB(20, 20, 20, 24), children: [
@@ -1820,6 +1840,14 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           const SizedBox(height: 16),
           if (_xInFlight != null) ...[
             _inFlightCrossBanner(_xInFlight!),
+            const SizedBox(height: 14),
+          ],
+          if (_subInFlight != null) ...[
+            _inFlightSubmarineBanner(_subInFlight!),
+            const SizedBox(height: 14),
+          ],
+          if (_subCorrupt) ...[
+            _corruptSubmarineBanner(),
             const SizedBox(height: 14),
           ],
           if (_loading)
@@ -1852,8 +1880,8 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           PrimaryButton(
             label: !railsChosen
                 ? 'Choose how you pay & receive'
-                : sameChainLnUnbuilt
-                    ? 'Set a leg to On-chain to trade now'
+                : sameChainLn
+                    ? 'Swap over Lightning'
                     : isCross
                         ? 'Review swap'
                         : _confBook
@@ -1861,7 +1889,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
                             : 'Review order',
             icon: !railsChosen
                 ? Icons.alt_route
-                : sameChainLnUnbuilt
+                : sameChainLn
                     ? Icons.bolt
                     : isCross
                         ? Icons.swap_horiz
@@ -1870,9 +1898,16 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
                             : _mode == 'take'
                                 ? Icons.swap_horiz
                                 : Icons.playlist_add,
-            // Disabled (null) until both rails are chosen AND the resolved rail is actually built — no order
-            // on an unstated settlement choice, and no silent covenant fallback for a same-chain LN pair.
-            onPressed: !placeable ? null : (isCross ? () => _dispatchCross(r) : _submit),
+            // Disabled (null) until both rails are chosen (no order on an unstated settlement choice).
+            // A same-chain both-Lightning pair routes to the pure-LN asset↔asset swap; a BTC pair to the
+            // cross / submarine / sub-asset dispatch; everything else settles on the covenant book.
+            onPressed: !placeable
+                ? null
+                : isCross
+                    ? () => _dispatchCross(r)
+                    : sameChainLn
+                        ? () => _dispatchSameChainLn(r)
+                        : _submit,
           ),
         ]),
     ]);
@@ -1983,8 +2018,9 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
             const SizedBox(width: 10),
             const Expanded(
               child: Text(
-                'Pure-Lightning settlement for asset pairs (both legs over Lightning) is being finalised. '
-                'To trade this pair now, set at least one leg to On-chain — it settles on the covenant order book.',
+                'Pure-Lightning swap: both legs settle over Lightning, bound by one secret, on your own '
+                'nodes (non-custodial). Instant and final, nothing on-chain. Set a leg to On-chain to rest '
+                'a durable limit order on the covenant book instead.',
                 style: AmbraText.sub,
               ),
             ),
@@ -2196,12 +2232,29 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           : 'Settlement preference · the book matches on price, not rail.',
           style: AmbraText.sub),
       const SizedBox(height: 8),
-      leg('Pay from', _payRailLn, ra?.payLn, (v) => setState(() => _payRailLn = v)),
+      leg('Pay from', _payRailLn, ra?.payLn, _setPayRailLn),
       const SizedBox(height: 12),
-      leg('Receive to', _recvRailLn, ra?.recvLn, (v) => setState(() => _recvRailLn = v)),
+      leg('Receive to', _recvRailLn, ra?.recvLn, _setRecvRailLn),
       const SizedBox(height: 14),
     ]);
   }
+
+  /// Set the PAY leg's settlement rail, COUPLING the RECEIVE leg for a same-chain pair (port swap.js
+  /// setRail ~1605). A same-chain asset↔asset pair has NO mixed-rail settlement path: both legs go over
+  /// Lightning (pure-LN, two asset-LN HTLCs bound by one preimage) OR both on-chain (the covenant book).
+  /// A split (one LN, one chain) has no bridge, so [route] would silently fall through to the on-chain
+  /// covenant book while the composer treats one leg as Lightning — a no-op that mis-settles. Couple them:
+  /// setting one leg sets the other. BTC pairs are genuinely rail-independent (the submarine / LSP bridges
+  /// rails at settlement), so the coupling is scoped to same-chain, where no such bridge exists.
+  void _setPayRailLn(bool v) => setState(() {
+        _payRailLn = v;
+        if (!_isCrossPair) _recvRailLn = v;
+      });
+
+  void _setRecvRailLn(bool v) => setState(() {
+        _recvRailLn = v;
+        if (!_isCrossPair) _payRailLn = v;
+      });
 
   /// TRUE when the user is PAYING real Bitcoin ON-CHAIN. The "keep resting while offline" peg is
   /// relevant ONLY for this pay leg (not Lightning, not paying a Sequentia asset).
@@ -2249,13 +2302,9 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     // prompt instead of an empty route card.
     if (!r.isValid) return const SizedBox.shrink();
     var text = r.timing;
-    // Dead rail: selling an asset for BTC on-chain (reverse cross courier) isn't built. Say so plainly
-    // and point at the live sell rails, instead of the timing line that reads as a promise of settlement.
-    final crossSellDead = r.kind == SwapRouteKind.cross && !r.payIsBtc;
-    if (crossSellDead) {
-      text = 'Selling ${_tk(r.seqAsset)} for Bitcoin on-chain is not available yet. '
-          'Turn on the Lightning rail to sell over pure-LN, or use a sub-asset sell.';
-    } else if (r.kind == SwapRouteKind.ln || r.kind == SwapRouteKind.mixed) {
+    // A cross SELL (asset -> BTC on-chain) now settles via the reverse HTLC swap, so it is no longer a
+    // dead rail — the on-chain cross timing applies to both directions.
+    if (r.kind == SwapRouteKind.ln || r.kind == SwapRouteKind.mixed) {
       final ra = _railAvail();
       // A Lightning leg with no own channel: if the LSP can front it (provisionable), the channel is
       // opened AS the order is placed — near-instant, spec §5 — so say that, not "can take a moment".
@@ -2272,8 +2321,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     }
     return AmbraCard(
       child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Icon(crossSellDead ? Icons.info_outline : (r.kind == SwapRouteKind.ln ? Icons.bolt : Icons.schedule),
-            size: 18, color: AmbraColors.amber),
+        Icon(r.kind == SwapRouteKind.ln ? Icons.bolt : Icons.schedule, size: 18, color: AmbraColors.amber),
         const SizedBox(width: 10),
         Expanded(child: Text(text, style: AmbraText.sub)),
       ]),
@@ -2333,6 +2381,114 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     );
   }
 
+  /// Surface an in-flight P2P submarine so its resume/settle/refund is REACHABLE (the twin of
+  /// [_inFlightCrossBanner]). Tapping rebuilds the offer view from the persisted record and opens
+  /// [SubmarineSwapScreen], whose initState detects the live record and shows its resume surface — which
+  /// settles a HELD Bitcoin hold with P, re-claims a paid-but-unclaimed asset (BUY), or fires the CLTV
+  /// asset refund past T_seq (SELL). The cold-start auto-resume already fires these unattended; this is the
+  /// user-facing prompt so a mid-flight swap is never stranded off-screen.
+  Widget _inFlightSubmarineBanner(SubswapRecord r) {
+    final tk = SeqAssets.labelFor(r.asset).ticker;
+    // ROUND 8: a stuck SELL 'funding' record (broadcast intent set but nothing landed) can never auto-clear
+    // and is not corrupt, so it would wedge the rail on 'in progress' forever. Expose the SAME guarded, fund-safe
+    // manual abandon here (the twin of the SubmarineSwapScreen affordance) so the escape is reachable from the
+    // Swap tab too. ROUND 12 (fully clock-free): NO wall-clock age gate on the offer — the staleness/reorg margin
+    // is entirely the CLOCK-FREE tip-HEIGHT proof inside the on-chain scan ([scanHtlcForAbandon], ~240 blocks),
+    // which with the fresh reload in [confirmAbandonUnfundedSell] / [abandonUnfundedSell] are the final gates.
+    final canAbandon = SubswapService.canAbandonFunding(r);
+    return InkWell(
+      borderRadius: BorderRadius.circular(AmbraRadii.card),
+      onTap: () async {
+        final offer = CrossOffer(
+          offerId: r.offerId,
+          seqAsset: r.asset,
+          makerSellsAsset: r.buy, // a BUY lifted an ask (maker sells the asset); a SELL a bid
+          assetAtoms: r.assetAtoms,
+          btcSats: r.btcSats,
+          makerPubkey: r.makerPubkey,
+        );
+        await Navigator.of(context)
+            .push(MaterialPageRoute<void>(builder: (_) => SubmarineSwapScreen(buy: r.buy, offer: offer)));
+        if (mounted) _load();
+      },
+      child: AmbraCard(
+        child: Row(children: [
+          const Icon(Icons.warning_amber_rounded, color: AmbraColors.amber, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Submarine ${r.buy ? 'buy' : 'sell'} in progress · $tk', style: AmbraText.body),
+              const SizedBox(height: 2),
+              Text(
+                  canAbandon
+                      ? 'A rail-crossing sell is still settling. Tap to resume — or, if nothing was funded, abandon it '
+                          'to free this rail.'
+                      : 'A rail-crossing swap is still settling. Tap to resume · a held Bitcoin invoice settles, '
+                          'or your asset refunds after its timeout.',
+                  style: AmbraText.sub),
+              if (canAbandon) ...[
+                const SizedBox(height: 4),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton.icon(
+                    style: TextButton.styleFrom(
+                      padding: EdgeInsets.zero,
+                      minimumSize: const Size(0, 32),
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      foregroundColor: AmbraColors.amber,
+                    ),
+                    onPressed: () async {
+                      final cleared = await confirmAbandonUnfundedSell(context, r);
+                      if (cleared && mounted) _load();
+                    },
+                    icon: const Icon(Icons.cancel_outlined, size: 16),
+                    label: const Text('Abandon (nothing was funded)'),
+                  ),
+                ),
+              ],
+            ]),
+          ),
+          const Icon(Icons.chevron_right, size: 18, color: AmbraColors.dim),
+        ]),
+      ),
+    );
+  }
+
+  /// Surface a DURABLY-CORRUPT submarine record (Task 2) so the rail is not silently blocked forever behind a
+  /// false 'in progress'. A present-but-undecodable record throws on every load, so the resume path cannot
+  /// reach it; tapping opens the SubmarineSwapScreen whose corrupt view offers the explicit guarded recovery.
+  Widget _corruptSubmarineBanner() {
+    return InkWell(
+      borderRadius: BorderRadius.circular(AmbraRadii.card),
+      onTap: () async {
+        // No decodable offer exists; pass a placeholder so the screen builds — its initState re-detects the
+        // corrupt record and shows the recover surface (the offer fields are irrelevant to that view).
+        final offer = CrossOffer(
+          offerId: '', seqAsset: kBtcSentinel, makerSellsAsset: true,
+          assetAtoms: BigInt.zero, btcSats: BigInt.zero, makerPubkey: '',
+        );
+        await Navigator.of(context)
+            .push(MaterialPageRoute<void>(builder: (_) => SubmarineSwapScreen(buy: true, offer: offer)));
+        if (mounted) _load();
+      },
+      child: AmbraCard(
+        child: Row(children: [
+          const Icon(Icons.error_outline, color: AmbraColors.red, size: 20),
+          const SizedBox(width: 10),
+          const Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Swap record unreadable — recovery needed', style: AmbraText.body),
+              SizedBox(height: 2),
+              Text('A saved rail-crossing swap record could not be read and is blocking new swaps. Tap to '
+                  'inspect and recover it.', style: AmbraText.sub),
+            ]),
+          ),
+          const Icon(Icons.chevron_right, size: 18, color: AmbraColors.dim),
+        ]),
+      ),
+    );
+  }
+
   Future<void> _dispatchCross(SwapRoute r) async {
     final asset = r.seqAsset;
     if (asset == null || !r.isValid) return;
@@ -2382,32 +2538,26 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         }
         await _liftCross(asks.first, requestedAtoms: reqAtoms);
       } else {
-        // SELL the asset for Bitcoin. The reverse HTLC courier isn't live, but the SBTC silent-peg
-        // covenants ARE fillable: pay the asset, receive SBTC, peg the SBTC out to real BTC. Lift the
-        // resting pegged covenant CLOSEST in asset size to what the user typed (tie-break cheapest asset
-        // per BTC), matching the buy path's "lift in full" selection.
-        if (_peggedOffers.isEmpty) {
-          _snack('No resting Bitcoin bid for ${_tk(asset)} yet — check back in a moment, or sell over Lightning / a sub-asset swap.');
-          return;
+        // SELL the asset for Bitcoin ON-CHAIN: the REVERSE cross-chain HTLC swap (asset -> BTC), now WIRED
+        // via [XchainReverseSwapScreen] (item 3) instead of a dead rail. That mature wizard quotes the
+        // maker, VERIFIES its BTC leg before funding the asset HTLC, claims the BTC on the maker's reveal,
+        // and refunds the asset via CLTV if the maker stalls. The SBTC silent-peg covenants stay a separate
+        // affordance (tap a resting pegged bid in the book), so no working path is lost.
+        final amt = (_payAsset == asset ? _payAmount : _recvAmount).text.trim();
+        await Navigator.of(context).push(MaterialPageRoute<void>(
+            builder: (_) => XchainReverseSwapScreen(seqAsset: asset, assetAmount: amt.isEmpty ? null : amt)));
+        if (mounted) {
+          _fetchBook();
+          _load();
         }
-        final aprec = SeqAssets.labelFor(asset).precision;
-        final reqAtoms = _typedAssetAtoms(asset, aprec);
-        final offers = List<SeqObOffer>.from(_peggedOffers);
-        if (reqAtoms != null && reqAtoms > BigInt.zero) {
-          // Prefer an offer that can COVER the typed size (partial fills of it), cheapest first; else the
-          // closest-sized one. A partial take of a big offer is fine now (sized below), so a cheap deep
-          // offer is a better fill than an exact-but-pricey one.
-          offers.sort((a, b) {
-            final aCovers = a.wantAtoms >= reqAtoms, bCovers = b.wantAtoms >= reqAtoms;
-            if (aCovers != bCovers) return aCovers ? -1 : 1;
-            final c = a.priceAtomsPerBase.compareTo(b.priceAtomsPerBase);
-            return c != 0 ? c : (a.wantAtoms - reqAtoms).abs().compareTo((b.wantAtoms - reqAtoms).abs());
-          });
-        } else {
-          offers.sort((a, b) => a.priceAtomsPerBase.compareTo(b.priceAtomsPerBase));
-        }
-        await _takePeggedCovenant(offers.first, requestedAssetAtoms: reqAtoms);
       }
+      return;
+    }
+
+    // SUBMARINE mixed shape (BTC over Lightning + asset on-chain) settles PEER-TO-PEER (or honest-disables
+    // vs an on-chain-only maker) — never falls through to the sub-asset screens below (which do the inverse).
+    if (r.isSubmarine) {
+      await _dispatchSubmarine(r);
       return;
     }
 
@@ -2430,6 +2580,163 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     if (screen == null) return;
     await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => screen));
     if (mounted) _load(); // refresh balances + markets on return
+  }
+
+  /// Dispatch a SUBMARINE mixed shape (BTC over Lightning + asset on-chain), the mobile twin of the web
+  /// wallet's onReview submarine branch (swap.js) + settlementDispatch. The rail crossing is on the BTC
+  /// leg; [chooseSettlementPath] reads the best matching offer's signed caps: a DIRECT peer-to-peer
+  /// submarine when the maker is interactive + accepts BTC-LN; else honest-DISABLE (the LSP payer
+  /// leg-bridge needs the hold-invoice node update the seqln node cannot yet mint; the receiver bridge is
+  /// not built on mobile) — never a priced-then-refused Place (item 7). Whole-offer only.
+  Future<void> _dispatchSubmarine(SwapRoute r) async {
+    final asset = r.seqAsset;
+    if (asset == null) return;
+    final tk = _tk(asset);
+    final buy = r.payIsBtc; // BUY = pay BTC over LN, receive asset on-chain; SELL = the inverse
+    // ONE submarine at a time (fund-loss, Task 1a): the taker keeps a SINGLE persisted submarine record.
+    // Refuse to open a second review while one is in flight (mirror web reviewSubmarineP2P's
+    // hasSubswapInFlight guard) — the live one resumes from its own banner/screen instead of being clobbered.
+    // Belt-and-suspenders + SELF-HEAL (Task 1): the synchronous guard is authoritative only once cold-start
+    // priming has run (shell's AWAITED SubswapStore.primeInFlight). Re-run an AUTHORITATIVE load here when the
+    // guard is UNPRIMED (fast cold start) OR the last read/decode ERRORED (SubswapStore.primeErrored). A
+    // transient cold-start read failure fails the guard SAFE (in-flight), which would otherwise leave an IDLE
+    // wallet blocked with the false 'swap in progress' until some unrelated load succeeded; re-loading at this
+    // choke point HEALS the guard the moment a read succeeds. A still-failing read fails safe again inside
+    // load() (the guard below blocks); a DURABLE decode error routes to the corrupt-recovery surface instead
+    // of an unbounded silent block.
+    if (!SubswapStore.primed || SubswapStore.primeErrored) {
+      try {
+        await SubswapStore.load();
+      } catch (_) {/* load() failed safe: _inFlight = true; the guards below handle transient vs corrupt */}
+    }
+    if (!mounted) return; // the belt-and-suspenders load above is an async gap — bail if the tab was disposed
+    // A DURABLE corrupt record never heals by retrying (Task 2): be honest and route to the recovery
+    // affordance (the SubmarineSwapScreen's corrupt view) rather than the false 'in progress' block. Any offer
+    // rebuilds the same screen; its initState re-detects the corrupt record and shows the recover surface.
+    if (SubswapStore.corrupt) {
+      _snack('Your rail-crossing swap record is unreadable · open it to recover before starting another.');
+      final rec = _subInFlight;
+      final offer = rec != null
+          ? CrossOffer(
+              offerId: rec.offerId, seqAsset: rec.asset, makerSellsAsset: rec.buy,
+              assetAtoms: rec.assetAtoms, btcSats: rec.btcSats, makerPubkey: rec.makerPubkey)
+          : CrossOffer(
+              offerId: '', seqAsset: asset, makerSellsAsset: buy,
+              assetAtoms: BigInt.zero, btcSats: BigInt.zero, makerPubkey: '');
+      await Navigator.of(context)
+          .push(MaterialPageRoute<void>(builder: (_) => SubmarineSwapScreen(buy: rec?.buy ?? buy, offer: offer)));
+      if (mounted) _load();
+      return;
+    }
+    if (SubswapStore.hasInFlight) {
+      _snack('You already have a rail-crossing swap in progress · finish it first before starting another.');
+      return;
+    }
+    final reqAtoms = _typedAssetAtoms(asset, SeqAssets.labelFor(asset).precision);
+    // A BUY lifts an ASK (maker sells the asset); a SELL lifts a BID (maker gives BTC). Size to the typed
+    // amount (submarine offers are whole-offer: prefer the cheapest offer that COVERS it, else closest).
+    final cands = _crossOffers.where((o) => buy ? o.makerSellsAsset : !o.makerSellsAsset).toList();
+    if (cands.isEmpty) {
+      _snack(buy
+          ? 'No resting BTC→$tk offer that settles over Lightning right now · this rail needs a resting maker. Try again shortly, or set the pay leg to On-chain.'
+          : 'No resting $tk→BTC offer that settles over Lightning right now · this rail needs a resting maker. Try again shortly, or set the receive leg to On-chain.');
+      return;
+    }
+    if (reqAtoms != null && reqAtoms > BigInt.zero) {
+      cands.sort((a, b) {
+        final aCov = a.assetAtoms >= reqAtoms, bCov = b.assetAtoms >= reqAtoms;
+        if (aCov != bCov) return aCov ? -1 : 1;
+        final c = a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom);
+        return c != 0 ? c : (a.assetAtoms - reqAtoms).abs().compareTo((b.assetAtoms - reqAtoms).abs());
+      });
+    } else {
+      cands.sort((a, b) => a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom));
+    }
+    final offer = cands.first;
+    // ORDER (Task 4): route on the maker's SIGNED caps FIRST, then apply the per-path gates. The BTC-LN
+    // outbound check + whole-offer guard apply ONLY to the p2pSubmarine buy — an on-chain-only maker
+    // (-> lspBridge, honest-disabled) must NOT be told to fund a BTC-LN channel that path never uses.
+    final disp = chooseSettlementPath(r,
+        makerInteractive: offer.interactive, makerBtcLn: offer.btcLn, makerAssetOnchain: offer.assetOnchain);
+    switch (disp.path) {
+      case SettlementPath.p2pSubmarine:
+        // BUY BTC-LN OUTBOUND CHECK (mirror web reviewSubmarineP2P) — ONLY on the P2P submarine buy branch.
+        // A P2P submarine BUY pays Bitcoin over the taker's OWN Lightning and does NOT JIT-provision a
+        // channel like the LSP bridge. Require REAL spendable BTC-LN outbound (a funded BTC channel —
+        // railAvailability payLn.ok, not merely provisionable); else honest-disable up front rather than
+        // starting a buy the taker cannot pay.
+        if (buy) {
+          final btcPayLn = railAvailability(
+            channels: _lnChannels,
+            payTarget: RailTarget.btc(),
+            recvTarget: RailTarget.asset(hex: asset, ticker: tk),
+            frontable: _frontable,
+          ).payLn;
+          if (!btcPayLn.ok) {
+            _snack('Paying Bitcoin over Lightning needs a funded Bitcoin Lightning channel · move Bitcoin to '
+                'Lightning first (Balance tab), then take this offer. This peer-to-peer route does not open a channel for you.');
+            return;
+          }
+        }
+        // WHOLE-OFFER OVERSHOOT guard (mirror web reviewSubmarineP2P §2.4): a submarine take is
+        // whole-offer-only — the maker locks the WHOLE offer in one HTLC, so a requested size below it can't
+        // be a partial (that is the covenant CLOB's job). On a size mismatch, surface it and do NOT navigate
+        // (fail closed) rather than silently signing the user up for the whole offer.
+        final size = sizeSubswapTake(
+          want: reqAtoms ?? BigInt.zero,
+          offerAtoms: offer.assetAtoms,
+          offerBtc: offer.btcSats,
+        );
+        if (size.wholeOnly) {
+          final aprec = SeqAssets.labelFor(asset).precision;
+          final offerStr = '${formatAtoms(offer.assetAtoms.toString(), aprec)} $tk';
+          _snack('This peer-to-peer submarine offer settles as a WHOLE — a submarine take is the whole resting '
+              'offer ($offerStr). Enter $offerStr to take it, or place a limit order to trade a different size.');
+          return;
+        }
+        await Navigator.of(context)
+            .push(MaterialPageRoute<void>(builder: (_) => SubmarineSwapScreen(buy: buy, offer: offer)));
+        if (mounted) {
+          _fetchBook();
+          _load();
+        }
+        return;
+      case SettlementPath.lspBridge:
+        // Honest-DISABLE (item 2/7): the payer leg-bridge (a BUY paying BTC over Lightning to an on-chain-
+        // only maker) needs the LSP hold-invoice the seqln node cannot yet mint; the receiver bridge (a
+        // SELL) is not built on mobile. Never a broken Place — point at an interactive maker / on-chain.
+        _snack(disp.lnSide == 'payer'
+            ? 'This $tk maker settles Bitcoin on-chain; paying Bitcoin over Lightning to it needs the hold-invoice node update · use an interactive maker for now, or set the pay leg to On-chain to post a durable limit order.'
+            : 'No resting $tk offer that settles this Lightning crossing right now · try again shortly, or set the crossed leg to On-chain.');
+        return;
+      case SettlementPath.unsupported:
+        _snack('The best $tk offer rests over Lightning, so this rail crossing has no on-chain $tk leg to '
+            'settle against right now · try again shortly, or switch the $tk leg to On-chain.');
+        return;
+      case SettlementPath.native:
+        _snack('No resting ${buy ? 'BTC→$tk' : '$tk→BTC'} offer that settles over Lightning right now · '
+            'this rail needs a resting maker. Try again shortly.');
+        return;
+    }
+  }
+
+  /// Dispatch a SAME-CHAIN pure-LN pair (asset↔asset, both legs over Lightning) to the pure-LN swap
+  /// ([LightningSwapScreen]), the twin of the web wallet's findRoute `ln` + reviewLn (item 4). The counter
+  /// (quote) asset takes BTC's structural place; the swap runs on the user's OWN per-asset nodes
+  /// (self-custody), pinning the reviewed offer. payIsBtc here means "paying the quote" = a BUY of the base.
+  Future<void> _dispatchSameChainLn(SwapRoute r) async {
+    final base = r.seqAsset;
+    if (base == null) return;
+    final amt = (_payAsset == base ? _payAmount : _recvAmount).text.trim();
+    await Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => LightningSwapScreen(
+        initialSide: r.payIsBtc ? 'buy' : 'sell',
+        initialAsset: base,
+        initialQuoteAsset: r.quoteAsset, // asset↔asset: the REAL counter asset (BTC implied when null)
+        initialAmount: r.payIsBtc ? null : (amt.isEmpty ? null : amt),
+      ),
+    ));
+    if (mounted) _load();
   }
 
   // --- SBTC silent peg (spec §5) --------------------------------------------
