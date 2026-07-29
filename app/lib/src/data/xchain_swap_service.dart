@@ -187,9 +187,11 @@ class XchainStore {
   }
 }
 
-/// Drives the cross-chain swap state machine from LOCAL state, calling the core
-/// FFI + the daemon. Each method advances one step and persists. The UI gates the
-/// reveal on [checkAnchor]'s `ok`, and only refunds when [XchainSwapRecord.refundable].
+/// Drives the cross-chain swap state machine from LOCAL state, calling the core FFI.
+/// The counterparty is reached over the relay ORDER-BOOK COURIER (see CrossLiftService),
+/// which is the ONLY caller that starts a lift. Each method advances one step and
+/// persists. The UI gates the reveal on [checkAnchor]'s `ok`, and only refunds when
+/// [XchainSwapRecord.refundable].
 class XchainSwapService {
   XchainSwapService._();
 
@@ -199,54 +201,10 @@ class XchainSwapService {
     return m;
   }
 
-  /// Quote, generate the secret + HTLC keys, build the BTC HTLC, and persist —
-  /// all before any money moves. Returns the new record (UI then funds BTC).
-  static Future<XchainSwapRecord> begin(String seqAsset, BigInt seqAmount) async {
-    final m = await _mnemonic();
-    if (await XchainStore.inFlightWithFunds() != null) {
-      throw Exception('You already have a cross-chain swap in progress with locked Bitcoin. '
-          'Finish or refund it first (open it from the Swap tab) before starting another.');
-    }
-    final q = await XchainClient.quote(seqAsset, seqAmount);
-    if (!(q.btcLocktime > q.seqLocktime)) {
-      throw Exception('quote rejected: BTC timeout must exceed the Sequentia timeout');
-    }
-    final secret = await core.xchainNewSecret();
-    final seqClaimPub = await core.xchainSeqClaimPubkey(mnemonic: m);
-    final btcRefundPub = await core.xchainBtcRefundPubkey(mnemonic: m);
-    final htlc = await core.xchainBtcHtlc(
-      hashHex: secret.hashHex,
-      claimPubHex: q.makerBtcClaimPub, // BTC leg: maker claims with the secret
-      refundPubHex: btcRefundPub, // Alice refunds via CLTV
-      locktime: q.btcLocktime,
-    );
-    final rec = XchainSwapRecord(
-      step: XStep.secretReady,
-      seqAsset: seqAsset,
-      seqAmount: q.seqAmount,
-      btcAmount: q.btcAmount,
-      feeBtc: q.feeBtc,
-      secretHex: secret.secretHex,
-      hashHex: secret.hashHex,
-      seqClaimPub: seqClaimPub,
-      btcRefundPub: btcRefundPub,
-      makerBtcClaimPub: q.makerBtcClaimPub,
-      makerSeqRefundPub: q.makerSeqRefundPub,
-      btcLocktime: q.btcLocktime,
-      seqLocktime: q.seqLocktime,
-      quoteId: q.quoteId,
-      btcRedeemScript: htlc.redeemScriptHex,
-      btcP2shAddress: htlc.p2ShAddress,
-      btcP2shSpkHex: htlc.p2ShSpkHex,
-    );
-    await XchainStore.save(rec);
-    return rec;
-  }
-
-  /// Begin a cross lift from a COURIER-validated quote (the relay order-book path, NOT the retired /dex
-  /// RFQ): generate the secret + HTLC keys, build the BTC HTLC from the maker's validated [terms], and
-  /// persist — all before any money moves. Mirrors [begin] but takes the maker's Terms + [offer] instead
-  /// of a /dex quote. The caller MUST have already run validateCrossTerms(offer, terms).
+  /// Begin a cross lift from a COURIER-validated quote (the relay order-book path): generate the secret
+  /// + HTLC keys, build the BTC HTLC from the maker's validated [terms], and persist — all before any
+  /// money moves. Takes the maker's Terms + [offer] over the courier; the caller MUST have already run
+  /// validateCrossTerms(offer, terms).
   static Future<XchainSwapRecord> beginFromCourierTerms(CrossOffer offer, CrossTerms terms) async {
     final m = await _mnemonic();
     // FUND-SAFETY: the store is single-slot, so starting a new lift would OVERWRITE an
@@ -365,29 +323,7 @@ class XchainSwapService {
     return true;
   }
 
-  /// Propose the funded BTC leg; on accept, record the maker's SEQ leg.
-  /// Throws [XchainFail] (in-band) — BTC_LEG_UNCONFIRMED means retry.
-  static Future<XchainSwapRecord> propose(XchainSwapRecord r) async {
-    final res = await XchainClient.propose(
-      quoteId: r.quoteId,
-      hashHex: r.hashHex,
-      btcTxid: r.btcFundingTxid,
-      btcVout: r.btcVout,
-      btcHeight: r.btcHp,
-      btcRedeemScript: r.btcRedeemScript,
-      btcAmount: r.btcAmount,
-      takerSeqClaimPub: r.seqClaimPub,
-      takerBtcRefundPub: r.btcRefundPub,
-    );
-    r
-      ..swapId = res.swapId
-      ..seqLeg = res.seqLeg
-      ..step = XStep.seqLocked;
-    await XchainStore.save(r);
-    return r;
-  }
-
-  /// Value-bind the SEQ leg: the daemon-reported redeemScript must equal the one
+  /// Value-bind the SEQ leg: the maker-reported redeemScript must equal the one
   /// Alice rebuilds, and the asset/amount must match the agreed terms. Throws on
   /// any mismatch (never reveal into a leg you can't claim / wrong asset).
   static Future<void> verifyLeg(XchainSwapRecord r) async {
@@ -593,20 +529,6 @@ class XchainSwapService {
     final half = amount ~/ BigInt.two;
     if (half >= BigInt.one && fee > half) fee = half;
     return fee;
-  }
-
-  /// Observe the maker sweeping the BTC (the swap completing). Tolerates a daemon
-  /// restart (404) by leaving local state as-is.
-  static Future<XchainSwapRecord> pollSettle(XchainSwapRecord r) async {
-    if (r.swapId.isEmpty) return r;
-    try {
-      final s = await XchainClient.swap(r.swapId);
-      if (s.state == 'XCHAIN_SWAP_STATE_BTC_CLAIMED' && r.step != XStep.btcClaimed) {
-        r.step = XStep.btcClaimed;
-        await XchainStore.save(r);
-      }
-    } catch (_) {/* daemon may have restarted; drive from local state */}
-    return r;
   }
 
   /// Whether the BTC refund is spendable yet (chain tip >= btcLocktime).

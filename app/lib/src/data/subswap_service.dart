@@ -33,7 +33,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
-import 'package:flutter/foundation.dart' show visibleForTesting;
+import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
@@ -346,7 +346,8 @@ SubTakeSize sizeSubswapTake({required BigInt want, required BigInt offerAtoms, r
 // ===========================================================================
 // Persisted record — one in-flight submarine at a time (whole-HTLC, resumable). The asset leg is a real
 // time-locked commitment, so a crash between the irreversible act and the claim MUST recover. P + the
-// verified leg are persisted BEFORE the claim (fund-safety), mirroring the web SUBSWAP record + RSwapStore.
+// verified leg are persisted BEFORE the claim (fund-safety), mirroring the web SUBSWAP record; [SubswapStore]
+// is the secure-storage slot that holds it here.
 // ===========================================================================
 
 /// The submarine state machine (subswap.js SUBSWAP.state). BUY: starting -> verifying -> verified ->
@@ -521,6 +522,128 @@ class SubswapStore {
   static const _key = 'ambra.subswap.active';
   static const _storage = FlutterSecureStorage();
 
+  /// The secure-storage slot the RETIRED RFQ reverse rail (its service and store, both deleted)
+  /// used for its single in-flight record. That service and its screen are gone, so NOTHING in this
+  /// build reads the key: a record left behind is an INVISIBLE orphan, and its refund UI was ALREADY
+  /// unreachable before the rail was removed. [sweepLegacyReverseRecord] is the only thing that can
+  /// ever surface it. Kept here (not in the deleted file) purely so the sweep has the literal.
+  static const _legacyReverseKey = 'ambra.xchain.reverse.active';
+
+  /// Where [sweepLegacyReverseRecord] MOVES an orphaned record. The payload is preserved verbatim
+  /// under this key so a funded leg stays recoverable by hand.
+  static const _legacyReverseOrphanKey = 'ambra.xchain.reverse.orphaned';
+
+  /// Whether the one-shot legacy sweep already ran in this process. Reset on failure so a locked
+  /// keystore at cold start does not permanently skip the sweep.
+  ///
+  /// @visibleForTesting reset via [debugResetLegacyReverseSweep]: without it this flag makes the
+  /// body run at most once per test process, so a suite could only ever assert the FIRST case.
+  static bool _legacyReverseSwept = false;
+
+  /// Test-only: forget that the sweep ran, so each case starts from a clean process state.
+  @visibleForTesting
+  static void debugResetLegacyReverseSweep() {
+    _legacyReverseSwept = false;
+  }
+
+  /// Whether an orphaned reverse-rail record is present and awaiting manual recovery. The UI reads
+  /// this to raise a banner; see [orphanedLegacyReverseDigest] for what to show.
+  static Future<bool> hasOrphanedLegacyReverse() async {
+    try {
+      final raw = await _storage.read(key: _legacyReverseOrphanKey);
+      return raw != null && raw.isNotEmpty;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// A secret-free digest of the preserved record, for the recovery surface.
+  static Future<String?> orphanedLegacyReverseDigest() async {
+    try {
+      final raw = await _storage.read(key: _legacyReverseOrphanKey);
+      if (raw == null || raw.isEmpty) return null;
+      return _legacyReverseDigest(raw);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Discard the preserved record. ONLY ever called from the recovery surface, after the user has
+  /// been shown the digest and has confirmed — never automatically.
+  static Future<void> discardOrphanedLegacyReverse() async {
+    try {
+      await _storage.delete(key: _legacyReverseOrphanKey);
+    } catch (_) {
+      // best-effort: a locked keystore just means it is still there next time
+    }
+  }
+
+  /// ONE-SHOT MIGRATION: MOVE the orphaned reverse-rail record out of the dead slot and into
+  /// [_legacyReverseOrphanKey], so the UI can raise a recovery banner for it.
+  ///
+  /// ⚠ THIS MUST NEVER DELETE. An earlier version of this migration warned via debugPrint and then
+  /// deleted the key. That destroys funds. For a record in RStep.seqFunding or RStep.seqSubmitted the
+  /// payload IS the recovery blob — it carries seqRedeemScript, seqFundTxid and seqLocktime, which is
+  /// everything needed to drive the CLTV refund of a FUNDED Sequentia HTLC, and it cannot be
+  /// reconstructed from anywhere else. Its only trace was a debugPrint, which on a release build
+  /// reaches logcat at best: a user with locked funds would lose their reclaim material silently and
+  /// never know it had happened.
+  ///
+  /// So the record is preserved verbatim and merely re-homed: write the raw payload to the orphan
+  /// key, then remove the old one, in that order so a crash between the two leaves a duplicate rather
+  /// than nothing. Best-effort by construction: any storage error leaves the key untouched for the
+  /// next cold start and never throws into startup.
+  static Future<void> sweepLegacyReverseRecord() async {
+    if (_legacyReverseSwept) return;
+    _legacyReverseSwept = true;
+    try {
+      final raw = await _storage.read(key: _legacyReverseKey);
+      if (raw == null || raw.isEmpty) return;
+      // WRITE FIRST. If this succeeds and the delete below fails, the record exists under both keys
+      // and the next cold start tidies it; if the order were reversed, the same failure loses it.
+      await _storage.write(key: _legacyReverseOrphanKey, value: raw);
+      await _storage.delete(key: _legacyReverseKey);
+      debugPrint('An orphaned cross-chain reverse-swap record was found under "$_legacyReverseKey". '
+          'It belongs to the retired RFQ rail, so nothing in this build can drive it automatically. '
+          'It has been PRESERVED under "$_legacyReverseOrphanKey" and the wallet will show a recovery '
+          'banner. Recovery details: ${_legacyReverseDigest(raw)}');
+    } catch (_) {
+      _legacyReverseSwept = false; // unreadable keystore: retry on a later cold start
+    }
+  }
+
+  /// A SECRET-FREE digest of the orphaned payload: the fields a human needs to recover the leg by hand
+  /// (phase, asset, amounts, the funded HTLC and its timelocks). Parsed by key name so it does not
+  /// depend on the deleted record class. `preimageHex` and anything else are deliberately EXCLUDED:
+  /// device logs must never carry a swap secret.
+  static String _legacyReverseDigest(String raw) {
+    const keep = [
+      'step',
+      'seqAsset',
+      'seqAmount',
+      'btcAmount',
+      'seqFundTxid',
+      'seqVout',
+      'seqP2shAddress',
+      'seqRedeemScript',
+      'seqLocktime',
+      'btcLocktime',
+      'btcClaimTxid',
+      'seqRefundTxid',
+    ];
+    try {
+      final j = jsonDecode(raw) as Map<String, dynamic>;
+      final parts = <String>[];
+      for (final k in keep) {
+        final v = j[k];
+        if (v != null && '$v'.isNotEmpty) parts.add('$k=$v');
+      }
+      return parts.isEmpty ? '(no recognisable fields, ${raw.length} bytes)' : parts.join(' ');
+    } catch (_) {
+      return '(undecodable, ${raw.length} bytes)';
+    }
+  }
+
   /// SYNCHRONOUS in-memory mirror of "a NON-TERMINAL submarine record exists" — the Dart twin of swap.js's
   /// module-level SUBSWAP + hasSubswapInFlight(). Secure-storage reads are async, so WITHOUT a synchronous
   /// flag a fresh _start could save a new record over a live one in the load() gap (destroying its
@@ -573,6 +696,9 @@ class SubswapStore {
   /// sets [primeErrored] so the first successful [load] at a dispatch choke point HEALS the guard (Task 1); a
   /// durable decode error additionally sets [corrupt] so the UI can offer recovery instead of blocking forever.
   static Future<void> primeInFlight() async {
+    // Piggyback the one-shot sweep of the retired reverse rail's orphaned slot on the single AWAITED
+    // cold-start hook. It never throws and touches a DIFFERENT key, so it cannot affect the priming below.
+    await sweepLegacyReverseRecord();
     try {
       await load(); // a definitive read sets _inFlight + _primed; a read/decode error fails safe (in-flight)
     } catch (_) {
@@ -1702,7 +1828,7 @@ class SubswapService {
     await SubswapStore.clear();
   }
 
-  // -- chain reads + per-asset fees (mirror XchainReverseSwapService / XchainSwapService) --------------
+  // -- chain reads + per-asset fees (mirror XchainSwapService) -----------------------------------------
 
   /// POLL the SEQ funding block's Bitcoin-anchor depth until buried >= [minDepth], or a deadline elapses.
   /// The funding block is derived from the ACTUAL txid's OWN confirmed status (never a maker-supplied
@@ -1759,7 +1885,8 @@ class SubswapService {
   }
 
   /// The SEQ-refund fee in atoms of the traded asset (min 1 atom, capped at half). Best-effort feed;
-  /// falls back to the reference scale when the feed omits the asset (mirror XchainReverseSwapService).
+  /// falls back to the reference scale when the feed omits the asset (same sizing as [_seqClaimFee] and
+  /// XchainSwapService._seqClaimFee, but best-effort: a refund must stay broadcastable).
   static Future<BigInt> _seqRefundFee(String assetHex, BigInt amount) async {
     final ticker = SeqAssets.labelFor(assetHex).ticker;
     Map<String, BigInt> rates;

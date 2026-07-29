@@ -3,44 +3,27 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import '../data/btc_state.dart';
 import '../data/config.dart';
 import '../data/format.dart';
 import '../data/trade_receipts.dart';
-import '../data/xchain_client.dart';
 import '../data/xchain_swap_service.dart';
 import '../rust/api.dart' as core;
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 
-/// A small BTC miner-fee headroom (sats) reserved on top of the quoted lock amount in the
-/// cross-buy affordability pre-check: locking the BTC leg also pays an on-chain fee, so a
-/// near-max buy that ignored it would pass Review then fail at btcPrepare. The exact fee is
-/// computed when the funding tx is built.
-final BigInt _kBtcMinerHeadroomSats = BigInt.from(1000);
-
-/// Cross-chain swap wizard: buy a Sequentia asset by locking Bitcoin (testnet4).
-/// The reveal of the preimage is HARD-gated on the anchor check; an in-flight
-/// swap is persisted and resumable, with a BTC refund off-ramp after the timeout.
+/// RESUME + REFUND surface for an in-flight cross-chain swap (BTC locked, Sequentia asset
+/// incoming). Lifts are STARTED by the order-book courier (CrossLiftScreen); this screen is
+/// how the persisted record is resumed and, above all, how its CLTV "Refund BTC" off-ramp
+/// stays reachable — the composer's in-flight banner opens it. The reveal of the preimage is
+/// HARD-gated on the anchor check.
 class XchainSwapScreen extends StatefulWidget {
-  const XchainSwapScreen({super.key, this.seqAsset, this.assetAmount});
-
-  /// Optional composer seed: preselect the cross-chain market for this Sequentia
-  /// asset id. Falls back to the first market when null or unmatched.
-  final String? seqAsset;
-
-  /// Optional composer seed: prefill the amount of [seqAsset] to buy (a display
-  /// string). Ignored when a swap is already in flight (never clobbers a resume).
-  final String? assetAmount;
+  const XchainSwapScreen({super.key});
 
   @override
   State<XchainSwapScreen> createState() => _XchainSwapScreenState();
 }
 
 class _XchainSwapScreenState extends State<XchainSwapScreen> {
-  final _amount = TextEditingController();
-  List<XchainMarket> _markets = [];
-  XchainMarket? _market;
   XchainSwapRecord? _rec;
   core.AnchorEvidence? _anchor;
   bool _refundReady = false;
@@ -59,7 +42,6 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
   @override
   void dispose() {
     _poll?.cancel();
-    _amount.dispose();
     super.dispose();
   }
 
@@ -69,27 +51,9 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
       // FUND-SAFETY: reconcile a funding step whose confirmed lock was never recorded (e.g. the app
       // died mid-broadcast). Safe + non-broadcasting; see XchainSwapService.resumeFunding.
       if (rec != null) rec = await XchainSwapService.resumeFunding(rec);
-      final markets = await XchainClient.markets();
       if (!mounted) return;
-      // Composer seed: preselect the requested market + prefill the amount, but only
-      // when nothing is in flight (a resumed swap owns the form).
-      var sel = markets.isNotEmpty ? markets.first : null;
-      final seed = widget.seqAsset;
-      if (seed != null && seed.isNotEmpty) {
-        for (final m in markets) {
-          if (m.seqAsset == seed) {
-            sel = m;
-            break;
-          }
-        }
-      }
-      if (rec == null && widget.assetAmount != null && widget.assetAmount!.trim().isNotEmpty) {
-        _amount.text = widget.assetAmount!.trim();
-      }
       setState(() {
         _rec = rec;
-        _markets = markets;
-        _market = sel;
         _loading = false;
       });
       _arm(); // resume polling for the current step
@@ -112,10 +76,15 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
       _poll = Timer.periodic(const Duration(seconds: 15), (_) => _checkBtcLock());
     } else if (r.step == XStep.seqLocked || r.step == XStep.seqVerified) {
       _poll = Timer.periodic(const Duration(seconds: 12), (_) => _refreshAnchor());
-    } else if (r.step == XStep.seqClaimed) {
-      _poll = Timer.periodic(const Duration(seconds: 12), (_) => _pollSettle());
     } else if (r.refundable) {
+      // btcLocked (and a failed record still holding locked BTC) has nothing this screen can drive:
+      // the maker's Sequentia leg arrives over the courier session, not from here. The one thing that
+      // DOES change under us is the CLTV maturity, so poll it on the same gentle cadence as the other
+      // waiting steps. Without the timer the refund button would sit on its startup verdict and keep
+      // reading "Refund (waiting for timeout)" until the user left the screen and came back, hiding
+      // the fund-recovery off-ramp exactly when it matures.
       _refreshRefundReady();
+      _poll = Timer.periodic(const Duration(seconds: 30), (_) => _refreshRefundReady());
     }
   }
 
@@ -149,28 +118,6 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
     }
   }
 
-  Future<void> _begin() async {
-    final m = _market;
-    if (m == null) return _snack('No cross-chain markets available');
-    final l = SeqAssets.labelFor(m.seqAsset);
-    final atoms = parseAtoms(_amount.text, l.precision);
-    if (atoms == null || atoms <= BigInt.zero) return _snack('Enter an amount of ${l.ticker} to buy');
-    await _run('Quoting…', () async {
-      final rec = await XchainSwapService.begin(m.seqAsset, atoms);
-      // Affordability pre-check: locking the BTC leg needs the quoted amount PLUS an on-chain miner
-      // fee, so require a little headroom. Block here (nothing has moved yet) instead of failing later
-      // at btcPrepare/fundBtc. Best-effort: skip when the BTC balance isn't known yet (fundBtc still
-      // fails-closed on a true shortfall). No money moved, so discard the stub before bailing.
-      final bal = BigInt.tryParse(BtcState.instance.last?.balanceSats ?? '');
-      if (bal != null && rec.btcAmount + _kBtcMinerHeadroomSats > bal) {
-        await XchainStore.clear();
-        throw Exception(
-            'You only hold ${_btc(bal)}. Locking ${_btc(rec.btcAmount)} plus an on-chain fee needs more; reduce the amount.');
-      }
-      if (mounted) setState(() => _rec = rec);
-    });
-  }
-
   Future<void> _fundBtc() => _run('Locking BTC…', () async {
         try {
           final rec = await XchainSwapService.fundBtc(_rec!);
@@ -195,28 +142,18 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
         }
       });
 
+  /// Reconcile the BTC lock's confirmation. Non-broadcasting; the maker's asset leg arrives
+  /// over the courier (CrossLiftService), so there is nothing to propose from here.
   Future<void> _checkBtcLock() async {
     if (_busy) return;
     try {
       final locked = await XchainSwapService.pollBtcLock(_rec!);
       if (locked && mounted) {
         setState(() {});
-        await _propose();
+        _arm();
       }
     } catch (_) {/* keep polling */}
   }
-
-  Future<void> _propose() => _run('Proposing to the maker…', () async {
-        try {
-          final rec = await XchainSwapService.propose(_rec!);
-          await XchainSwapService.verifyLeg(rec);
-          if (mounted) setState(() => _rec = rec);
-          await _refreshAnchor();
-        } on XchainFail catch (f) {
-          // BTC_LEG_UNCONFIRMED etc. — stay on the waiting step and retry.
-          if (mounted) setState(() => _error = 'Maker: ${f.message} (will retry)');
-        }
-      });
 
   Future<void> _refreshAnchor() async {
     if (_busy || _rec?.seqLeg == null) return;
@@ -235,16 +172,7 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
           status: 'Asset received',
           txid: rec.seqClaimTxid,
         ).ignore();
-        await _pollSettle();
       });
-
-  Future<void> _pollSettle() async {
-    if (_rec == null) return;
-    try {
-      final rec = await XchainSwapService.pollSettle(_rec!);
-      if (mounted) setState(() => _rec = rec);
-    } catch (_) {}
-  }
 
   Future<void> _refreshRefundReady() async {
     try {
@@ -271,7 +199,6 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
       setState(() {
         _rec = null;
         _anchor = null;
-        _amount.clear();
       });
     }
   }
@@ -306,40 +233,13 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
         ..add(const SizedBox(height: 14));
     }
     if (r == null) {
-      children.addAll(_quoteForm());
+      children.add(const AmbraCard(
+          child: Text('No cross-chain swap is in progress. Start one from the Swap tab by taking a resting Bitcoin offer.',
+              style: AmbraText.muted)));
     } else {
       children.addAll(_stepView(r));
     }
     return children;
-  }
-
-  List<Widget> _quoteForm() {
-    if (_markets.isEmpty) {
-      return [const AmbraCard(child: Text('No cross-chain markets are open right now.', style: AmbraText.muted))];
-    }
-    return [
-      const SectionLabel('Buy'),
-      const SizedBox(height: 8),
-      AmbraCard(
-        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          DropdownButton<XchainMarket>(
-            value: _market,
-            isExpanded: true,
-            dropdownColor: AmbraColors.panel,
-            underline: const SizedBox.shrink(),
-            items: [
-              for (final m in _markets)
-                DropdownMenuItem(value: m, child: Text(SeqAssets.labelFor(m.seqAsset).ticker, style: AmbraText.body)),
-            ],
-            onChanged: (m) => setState(() => _market = m),
-          ),
-          const SizedBox(height: 8),
-          AmbraField(label: 'Amount (${SeqAssets.labelFor(_market!.seqAsset).ticker})', controller: _amount, hint: '0.0'),
-        ]),
-      ),
-      const SizedBox(height: 16),
-      PrimaryButton(label: 'Get quote & start', busy: _busy, icon: Icons.swap_horiz, onPressed: _busy ? null : _begin),
-    ];
   }
 
   List<Widget> _stepView(XchainSwapRecord r) {
@@ -376,18 +276,27 @@ class _XchainSwapScreenState extends State<XchainSwapScreen> {
         w.add(_checkButton(_checkBtcLock));
         break;
       case XStep.btcLocked:
-        w.add(const _Waiting('BTC locked. Proposing to the maker…'));
-        w.add(_checkButton(_propose));
+        // The maker locks its Sequentia leg over the courier session (CrossLiftScreen). Nothing to
+        // drive from here; the refund off-ramp below stays available if the maker never delivers.
+        w.add(const _Waiting('BTC locked. Waiting for the maker to lock the Sequentia asset…'));
         break;
       case XStep.seqLocked:
       case XStep.seqVerified:
         w.addAll(_anchorGate(r));
         break;
       case XStep.seqClaimed:
-        w.add(const _Waiting('Asset claimed. Waiting for the maker to settle the BTC side…'));
+        w.add(const AmbraCard(
+            child: Text('You received the asset. The maker sweeps your Bitcoin with the revealed secret; nothing further is needed from you.',
+                style: AmbraText.body)));
         if (r.seqClaimTxid.isNotEmpty) w.add(_txRow('Sequentia claim', r.seqClaimTxid));
-        w.add(_checkButton(_pollSettle));
+        w.add(const SizedBox(height: 10));
+        w.add(SecondaryButton(label: 'Done', icon: Icons.check, onPressed: _reset));
         break;
+      // REACHABLE ONLY FROM A PRE-UPGRADE RECORD. Removing pollSettle left this step with no setter:
+      // nothing in this build advances a swap to btcClaimed, because the maker's BTC claim is no
+      // longer something this wallet observes. It is kept, rather than dropped from the enum, so a
+      // record persisted by an older build still decodes and still renders its true terminal state —
+      // dropping the value would need a fromJson migration and would show those users a wrong step.
       case XStep.btcClaimed:
         w.add(const AmbraCard(child: Text('Swap complete. You received the asset; the maker took the BTC.', style: AmbraText.body)));
         if (r.seqClaimTxid.isNotEmpty) w.add(_txRow('Sequentia claim', r.seqClaimTxid));
