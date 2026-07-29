@@ -306,6 +306,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         // Lightning went away: any leg the user had set to Lightning is no longer honorable, so clear it
         // back to unselected (never silently force a rail). On-chain picks stand.
         if (_payRailLn == true) _payRailLn = null;
+        _feeAsset = null; // the rail decides the fee asset; a stale pick must not survive
         if (_recvRailLn == true) _recvRailLn = null;
       }
     });
@@ -712,8 +713,19 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
 
   // --- fee asset -------------------------------------------------------------
 
+  /// An asset is acceptable for fees if, and only if, the node publishes a rate for
+  /// it. BTC is never one: it is not a Sequentia-issued asset, so no Sequentia fee
+  /// can be denominated in it.
+  ///
+  /// The policy asset used to be hardcoded as always-accepted here, on the
+  /// reasoning that the protocol took it natively. That stopped being true: the
+  /// node no longer falls back to 1:1 for an UNLISTED policy asset (no asset is
+  /// the reference unit), so an unlisted tSEQ is refused exactly like anything
+  /// else. Keeping the privilege offered the user a fee asset the mempool then
+  /// rejects with a generic "min relay fee not met". The published whitelist is
+  /// the whole truth on both sides.
   bool _acceptedFee(String hex) {
-    if (hex == SeqAssets.policy) return true;
+    if (hex == kBtcSentinel) return false;
     final t = SeqAssets.labelFor(hex).ticker;
     return _feeRates[t] != null || _feeRates[hex] != null;
   }
@@ -726,18 +738,62 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     return _feeRates[t] ?? _feeRates[hex] ?? _kScale;
   }
 
-  String _defaultFeeAsset() => (_payAsset != null && _acceptedFee(_payAsset!)) ? _payAsset! : SeqAssets.policy;
+  /// THE SINGLE AUTHORITY on which asset pays the fee, mirroring the web wallet's
+  /// feeAssetPolicy. Three rules, one place, so the picker and the display can
+  /// never disagree:
+  ///
+  ///   1. Paying BTC ON-CHAIN     -> LOCKED to BTC. A Bitcoin network fee cannot
+  ///      be denominated in a Sequentia asset.
+  ///   2. Paying over LIGHTNING   -> LOCKED to the asset being paid, BTC-LN
+  ///      included: a routing fee is paid in the routed asset. The rail is checked
+  ///      before the asset, so BTC-over-Lightning is an LN fee, not a network fee.
+  ///   3. Paying an ON-CHAIN SEQUENTIA ASSET -> the open fee market: any on-chain
+  ///      Sequentia asset the node prices AND you hold. tSEQ is one row among
+  ///      equals and BTC never appears.
+  bool get _feeAssetLocked {
+    if (_payAsset == null) return false;
+    return _payRailLn == true || _payAsset == kBtcSentinel;
+  }
 
-  String get _feeAssetHex => _feeAsset ?? _defaultFeeAsset();
+  /// The asset the fee is locked to, or null when the user may choose.
+  String? get _lockedFeeAsset {
+    if (!_feeAssetLocked) return null;
+    return _payAsset; // rule 1 and rule 2 both lock to the asset being paid
+  }
+
+  String _defaultFeeAsset() {
+    final locked = _lockedFeeAsset;
+    if (locked != null) return locked;
+    final opts = _feeOptions();
+    if (_payAsset != null && opts.contains(_payAsset)) return _payAsset!;
+    if (opts.isNotEmpty) return opts.first;
+    return SeqAssets.policy; // nothing on offer: name something rather than crash
+  }
+
+  /// FORCED from the policy: a manual pick only survives while it is still offered,
+  /// which is what stops a stale choice outliving the rail change that invalidated
+  /// it.
+  String get _feeAssetHex {
+    final locked = _lockedFeeAsset;
+    if (locked != null) return locked;
+    final chosen = _feeAsset;
+    if (chosen != null && _feeOptions().contains(chosen)) return chosen;
+    return _defaultFeeAsset();
+  }
 
   List<String> _heldAssets() =>
       _balances.where((b) => (BigInt.tryParse(b.atoms) ?? BigInt.zero) > BigInt.zero).map((b) => b.assetId).toList();
 
+  /// Rule 3's candidate list: on-chain Sequentia assets the node prices AND you
+  /// hold a positive balance of. Holding none of an asset makes it unpayable, so
+  /// tSEQ is no longer force-added — offering an unpayable row is the same defect
+  /// as leaving the picker live on a locked rail. Empty when the fee is locked.
   List<String> _feeOptions() {
+    if (_feeAssetLocked) return const [];
+    final held = _heldAssets().toSet();
     final set = <String>{};
-    if (_payAsset != null) set.add(_payAsset!);
-    set.addAll(_heldAssets());
-    set.add(SeqAssets.policy);
+    if (_payAsset != null && held.contains(_payAsset)) set.add(_payAsset!);
+    set.addAll(held);
     return set.where(_acceptedFee).toList();
   }
 
@@ -1070,7 +1126,12 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   }
 
   Future<void> _pickFee() async {
-    final picked = await _assetSheet('Pay fee in', _feeOptions(), withBalance: true);
+    // Locked rails offer no choice, so the sheet never opens — an empty sheet
+    // reads as a broken control, and a live one on a locked rail is the defect.
+    if (_feeAssetLocked) return;
+    final opts = _feeOptions();
+    if (opts.isEmpty) return;
+    final picked = await _assetSheet('Pay fee in', opts, withBalance: true);
     if (picked != null) setState(() => _feeAsset = picked);
   }
 
