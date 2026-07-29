@@ -36,7 +36,6 @@ import 'subasset_buy_screen.dart';
 import 'subasset_sell_screen.dart';
 import '../data/subswap_service.dart';
 import 'submarine_swap_screen.dart';
-import 'xchain_reverse_swap_screen.dart';
 import 'xchain_swap_screen.dart';
 
 /// Estimated vByte size of a same-chain settlement tx, used to turn the optional
@@ -115,6 +114,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   XchainSwapRecord? _xInFlight; // a persisted cross-swap with locked BTC needing resume/refund (banner)
   SubswapRecord? _subInFlight; // a persisted P2P submarine mid-flight needing resume/refund/settle (banner)
   bool _subCorrupt = false; // a persisted submarine record present but DURABLY UNDECODABLE — recovery (Task 2)
+  // An orphaned record from the RETIRED RFQ reverse rail, preserved by SubswapStore's one-shot
+  // migration. It can describe a FUNDED Sequentia HTLC, so it must be SEEN, not merely logged: a
+  // debugPrint reaches logcat at best on a release build, which is no notice at all to a user whose
+  // funds are locked.
+  String? _legacyReverseOrphan;
 
   // This wallet's OWN Lightning channels (node_key present), from a best-effort /status fetch. Feeds
   // ln_rail's railAvailability so the composer offers/auto-selects the Lightning rail for a leg ONLY
@@ -497,6 +501,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         // A DURABLE decode error (Task 2) surfaces a distinct recovery banner; a transient read error is left
         // to self-heal on the next successful load (Task 1) and shows no banner.
         _subCorrupt = SubswapStore.corrupt;
+      }
+      try {
+        _legacyReverseOrphan = await SubswapStore.orphanedLegacyReverseDigest();
+      } catch (_) {
+        _legacyReverseOrphan = null; // best-effort; the banner reappears on a later load
       }
       // Own maker identity, so a MARKET book-walk never self-fills this wallet's own resting covenants.
       try { _ownMakerPub = await core.seqobMakerPubkey(mnemonic: m); } catch (_) {/* self-filter is best-effort */}
@@ -1819,11 +1828,12 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         // a submarine (BTC over Lightning + asset on-chain) into the on-chain cross rail.
         lnAvailable: LightningService.instance.configured,
         sameChainQuote: dir?.quote);
-    // A cross SELL (asset -> BTC on-chain) is now WIRED to the reverse HTLC swap ([XchainReverseSwapScreen]),
-    // and a same-chain both-Lightning pair to the pure-LN asset↔asset swap ([LightningSwapScreen]) — neither
-    // is a dead rail any more, so neither disables the CTA. A SUBMARINE mixed shape (BTC over Lightning +
-    // asset on-chain) settles peer-to-peer ([_dispatchSubmarine]); the honest-disable for a shape with no
-    // routable maker happens at dispatch, never as a priced-then-refused Place.
+    // A same-chain both-Lightning pair is WIRED to the pure-LN asset↔asset swap ([LightningSwapScreen]),
+    // so it is not a dead rail and does not disable the CTA. A SUBMARINE mixed shape (BTC over Lightning +
+    // asset on-chain) settles peer-to-peer ([_dispatchSubmarine]). A cross SELL settling BTC ON-CHAIN has
+    // no taker rail in this build (the retired /dex RFQ reverse wizard is gone and the courier lift is
+    // BTC->asset only), so it honest-disables AT DISPATCH with the routes that do work — never a
+    // priced-then-crashing Place.
     final sameChainLn = !isCross && r.kind == SwapRouteKind.ln; // same-chain asset↔asset over pure Lightning
     // The pair is tradeable (book renders, quote works) — but placement also needs both settlement rails
     // chosen (spec §6.5, no default). canQuote gates showing the CTA; railsChosen enables it.
@@ -1848,6 +1858,10 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           ],
           if (_subCorrupt) ...[
             _corruptSubmarineBanner(),
+            const SizedBox(height: 14),
+          ],
+          if (_legacyReverseOrphan != null) ...[
+            _legacyReverseOrphanBanner(_legacyReverseOrphan!),
             const SizedBox(height: 14),
           ],
           if (_loading)
@@ -2457,6 +2471,64 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   /// Surface a DURABLY-CORRUPT submarine record (Task 2) so the rail is not silently blocked forever behind a
   /// false 'in progress'. A present-but-undecodable record throws on every load, so the resume path cannot
   /// reach it; tapping opens the SubmarineSwapScreen whose corrupt view offers the explicit guarded recovery.
+  /// An orphaned record from the retired RFQ reverse rail. Nothing in this build can drive it, but
+  /// it may hold a funded Sequentia HTLC whose CLTV refund is still claimable by hand, so the record
+  /// is preserved and surfaced here rather than discarded. Discarding is the USER's decision, taken
+  /// from the sheet below after seeing what the record contains.
+  Widget _legacyReverseOrphanBanner(String digest) {
+    return AmbraCard(
+      child: Row(children: [
+        const Icon(Icons.warning_amber_outlined, color: AmbraColors.amber, size: 20),
+        const SizedBox(width: 10),
+        const Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Older swap record needs your attention', style: AmbraText.body),
+            SizedBox(height: 2),
+            Text('A swap from a retired version was found. If it locked an asset, the details below '
+                'are what you need to reclaim it.', style: AmbraText.sub),
+          ]),
+        ),
+        const SizedBox(width: 8),
+        SecondaryButton(
+          label: 'View',
+          icon: Icons.receipt_long,
+          onPressed: () => _showLegacyReverseOrphan(digest),
+        ),
+      ]),
+    );
+  }
+
+  Future<void> _showLegacyReverseOrphan(String digest) async {
+    final discard = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AmbraColors.panel,
+        title: const Text('Older swap record', style: AmbraText.body),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('This record was made by a swap rail that no longer exists in this app, so it '
+                'cannot be resumed automatically. If it locked an asset on Sequentia, the redeem '
+                'script, funding transaction and timelock below are what a reclaim needs. Save them '
+                'before discarding.', style: AmbraText.sub),
+            const SizedBox(height: 12),
+            SelectableText(digest, style: AmbraText.mono),
+          ]),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Keep')),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Discard', style: TextStyle(color: AmbraColors.red)),
+          ),
+        ],
+      ),
+    );
+    if (discard == true) {
+      await SubswapStore.discardOrphanedLegacyReverse();
+      if (mounted) setState(() => _legacyReverseOrphan = null);
+    }
+  }
+
   Widget _corruptSubmarineBanner() {
     return InkWell(
       borderRadius: BorderRadius.circular(AmbraRadii.card),
@@ -2538,18 +2610,20 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         }
         await _liftCross(asks.first, requestedAtoms: reqAtoms);
       } else {
-        // SELL the asset for Bitcoin ON-CHAIN: the REVERSE cross-chain HTLC swap (asset -> BTC), now WIRED
-        // via [XchainReverseSwapScreen] (item 3) instead of a dead rail. That mature wizard quotes the
-        // maker, VERIFIES its BTC leg before funding the asset HTLC, claims the BTC on the maker's reveal,
-        // and refunds the asset via CLTV if the maker stalls. The SBTC silent-peg covenants stay a separate
-        // affordance (tap a resting pegged bid in the book), so no working path is lost.
-        final amt = (_payAsset == asset ? _payAmount : _recvAmount).text.trim();
-        await Navigator.of(context).push(MaterialPageRoute<void>(
-            builder: (_) => XchainReverseSwapScreen(seqAsset: asset, assetAmount: amt.isEmpty ? null : amt)));
-        if (mounted) {
-          _fetchBook();
-          _load();
-        }
+        // SELL the asset for Bitcoin ON-CHAIN: HONEST DISABLE. This shape used to open the /dex RFQ
+        // reverse wizard, which is retired (no route, no daemon) — it would have priced the trade and
+        // then failed. The courier lift is BTC->asset only, so there is no on-chain taker rail for the
+        // sell direction in this build.
+        //
+        // Name only affordances that ACTUALLY EXIST right now. The earlier wording told the user to
+        // "take a resting Bitcoin bid from the book", but ordinary cross bid rows are non-tappable by
+        // construction — the only tappable bids are the offline-resting SBTC silent-peg ones, and that
+        // section renders only while _peggedOffers is non-empty. Advertising a tap that does nothing
+        // is worse than saying less.
+        final hasPeggedBids = _peggedOffers.isNotEmpty;
+        _snack('Selling ${_tk(asset)} for on-chain Bitcoin is not available yet. Set "Receive" to Lightning to '
+            'settle it over Lightning now'
+            '${hasPeggedBids ? ', or tap one of the offline-resting Bitcoin bids for ${_tk(asset)} below.' : '.'}');
       }
       return;
     }
