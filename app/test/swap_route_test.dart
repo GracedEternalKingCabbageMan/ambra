@@ -165,17 +165,71 @@ void main() {
       expect(r.quoteAsset, seqB);
     });
 
-    test('only one leg Lightning -> stays same-chain covenant', () {
-      expect(route(seqA, seqB, payRailLn: true, recvRailLn: false, lnAvailable: true, sameChainQuote: seqB).kind,
-          SwapRouteKind.same);
-    });
-
     test('both legs LN but no known quote -> stays same-chain covenant (never guesses the frame)', () {
       expect(route(seqA, seqB, payRailLn: true, recvRailLn: true, lnAvailable: true).kind, SwapRouteKind.same);
     });
 
     test('both legs LN but Lightning unavailable -> same-chain covenant', () {
       expect(route(seqA, seqB, payRailLn: true, recvRailLn: true, lnAvailable: false, sameChainQuote: seqB).kind,
+          SwapRouteKind.same);
+    });
+  });
+
+  group('MIXED same-chain (one leg Lightning + one on-chain; the sub-asset construction with the quote '
+      'asset in BTC\'s structural place)', () {
+    test('BUY orientation: pay the QUOTE on-chain, receive the base over Lightning', () {
+      // seqB is the canonical quote. Paying it on-chain + receiving seqA over LN = a BUY of seqA.
+      final r = route(seqB, seqA, payRailLn: false, recvRailLn: true, lnAvailable: true, sameChainQuote: seqB);
+      expect(r.kind, SwapRouteKind.mixed);
+      expect(r.assetAsset, isTrue);
+      expect(r.seqAsset, seqA, reason: 'the base leg');
+      expect(r.quoteAsset, seqB, reason: 'the on-chain leg\'s REAL asset');
+      expect(r.payIsBtc, isTrue, reason: 'paying the quote = the structural analog of paying BTC');
+      expect(r.payRail, 'chain');
+      expect(r.recvRail, 'ln');
+      expect(r.isSubAsset, isTrue, reason: 'the base (asset) leg is on Lightning -> the wired shape');
+      expect(r.isSubmarine, isFalse);
+    });
+
+    test('SELL orientation: pay the base over Lightning, receive the QUOTE on-chain', () {
+      final r = route(seqA, seqB, payRailLn: true, recvRailLn: false, lnAvailable: true, sameChainQuote: seqB);
+      expect(r.kind, SwapRouteKind.mixed);
+      expect(r.assetAsset, isTrue);
+      expect(r.seqAsset, seqA);
+      expect(r.quoteAsset, seqB);
+      expect(r.payIsBtc, isFalse, reason: 'paying the base = a SELL of the base');
+      expect(r.payRail, 'ln');
+      expect(r.recvRail, 'chain');
+      expect(r.isSubAsset, isTrue);
+    });
+
+    test('the mirror orientations (QUOTE leg on Lightning) classify mixed too — refused at dispatch, '
+        'never a silent covenant fall-through', () {
+      // BUY paying the quote over LN, base on-chain.
+      final buy = route(seqB, seqA, payRailLn: true, recvRailLn: false, lnAvailable: true, sameChainQuote: seqB);
+      expect(buy.kind, SwapRouteKind.mixed);
+      expect(buy.assetAsset, isTrue);
+      expect(buy.isSubmarine, isTrue, reason: 'the quote (structural-BTC) leg is the Lightning one');
+      expect(buy.isSubAsset, isFalse);
+      // SELL paying the base on-chain, quote over LN.
+      final sell = route(seqA, seqB, payRailLn: false, recvRailLn: true, lnAvailable: true, sameChainQuote: seqB);
+      expect(sell.kind, SwapRouteKind.mixed);
+      expect(sell.isSubmarine, isTrue);
+    });
+
+    test('an unselected rail -> same-chain covenant (no default; spec §6.5)', () {
+      expect(route(seqA, seqB, payRailLn: true, recvRailLn: null, lnAvailable: true, sameChainQuote: seqB).kind,
+          SwapRouteKind.same);
+      expect(route(seqA, seqB, payRailLn: null, recvRailLn: false, lnAvailable: true, sameChainQuote: seqB).kind,
+          SwapRouteKind.same);
+    });
+
+    test('an unknown quote -> same-chain covenant (never guesses the frame)', () {
+      expect(route(seqA, seqB, payRailLn: true, recvRailLn: false, lnAvailable: true).kind, SwapRouteKind.same);
+    });
+
+    test('Lightning unavailable -> the LN preference degrades and the pair stays covenant', () {
+      expect(route(seqA, seqB, payRailLn: true, recvRailLn: false, lnAvailable: false, sameChainQuote: seqB).kind,
           SwapRouteKind.same);
     });
   });

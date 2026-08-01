@@ -1896,6 +1896,9 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     // BTC->asset only), so it honest-disables AT DISPATCH with the routes that do work — never a
     // priced-then-crashing Place.
     final sameChainLn = !isCross && r.kind == SwapRouteKind.ln; // same-chain asset↔asset over pure Lightning
+    // Same-chain asset↔asset with exactly ONE Lightning leg -> the MIXED same-chain shape (the sub-asset
+    // construction with the quote asset in BTC's structural place); dispatched via [_dispatchSameChainMixed].
+    final sameChainMixed = !isCross && r.kind == SwapRouteKind.mixed;
     // The pair is tradeable (book renders, quote works) — but placement also needs both settlement rails
     // chosen (spec §6.5, no default). canQuote gates showing the CTA; railsChosen enables it.
     final canQuote = !_loading && _error == null && _payAsset != null && _receiveAsset != null && r.isValid;
@@ -1957,7 +1960,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
                 ? 'Choose how you pay & receive'
                 : sameChainLn
                     ? 'Swap over Lightning'
-                    : isCross
+                    : sameChainMixed || isCross
                         ? 'Review swap'
                         : _confBook
                             ? 'Review order (blinded)'
@@ -1966,7 +1969,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
                 ? Icons.alt_route
                 : sameChainLn
                     ? Icons.bolt
-                    : isCross
+                    : sameChainMixed || isCross
                         ? Icons.swap_horiz
                         : _confBook
                             ? Icons.lock_outline
@@ -1974,7 +1977,8 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
                                 ? Icons.swap_horiz
                                 : Icons.playlist_add,
             // Disabled (null) until both rails are chosen (no order on an unstated settlement choice).
-            // A same-chain both-Lightning pair routes to the pure-LN asset↔asset swap; a BTC pair to the
+            // A same-chain both-Lightning pair routes to the pure-LN asset↔asset swap; a same-chain
+            // one-leg-Lightning pair to the mixed same-chain (sub-asset) dispatch; a BTC pair to the
             // cross / submarine / sub-asset dispatch; everything else settles on the covenant book.
             onPressed: !placeable
                 ? null
@@ -1982,7 +1986,9 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
                     ? () => _dispatchCross(r)
                     : sameChainLn
                         ? () => _dispatchSameChainLn(r)
-                        : _submit,
+                        : sameChainMixed
+                            ? () => _dispatchSameChainMixed(r)
+                            : _submit,
           ),
         ]),
     ]);
@@ -2037,12 +2043,16 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       // Same-chain both-Lightning (priority D): pure-LN asset↔asset settlement isn't wired on mobile yet,
       // so gate it honestly instead of silently settling on the covenant book or misrouting.
       if (!isCross && r.kind == SwapRouteKind.ln) _sameChainLnNote(),
+      if (!isCross && r.kind == SwapRouteKind.mixed) _sameChainMixedNote(r),
       _offlineRestToggle(), // on-chain-BTC-pay + LIMIT only: rest as pegged SBTC while offline (spec §5)
       // Fee: the same-chain covenant fee picker, or the honest cross note (a cross maker fee is set at lift,
-      // never a fake "0 BTC" — spec §8).
+      // never a fake "0 BTC" — spec §8). A mixed same-chain pair sizes its network fees inside the swap
+      // flow (per leg, in the transacted asset), so the covenant fee picker would be a fake control there.
       if (isCross) ...[
         _crossFeeNote(),
         _routeSummary(r),
+      ] else if (r.kind == SwapRouteKind.mixed) ...[
+        const SizedBox(height: 4),
       ] else ...[
         const SizedBox(height: 4),
         const SectionLabel('Network fee'),
@@ -2102,6 +2112,30 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           ]),
         ),
       );
+
+  /// The route note for a MIXED same-chain pair (asset↔asset, exactly one leg over Lightning): the
+  /// sub-asset construction with the pair's QUOTE asset standing in BTC's structural place — one
+  /// asset-LN HTLC + one on-chain HTLC on the quote asset, bound by one preimage. States the settlement
+  /// honestly, in the quote asset's own name (never "BTC"/"sats" here).
+  Widget _sameChainMixedNote(SwapRoute r) {
+    final qtk = r.quoteAsset != null ? _tk(r.quoteAsset) : 'the quote asset';
+    return Padding(
+      padding: const EdgeInsets.only(top: 4, bottom: 4),
+      child: AmbraCard(
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Icon(Icons.bolt, size: 18, color: AmbraColors.amber),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Mixed swap: one leg settles over Lightning, the other on-chain as an HTLC on $qtk, '
+              'bound by one secret. Review matches you against the best resting offer.',
+              style: AmbraText.sub,
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
 
   /// The honest fee note for a cross (BTC) pair (spec §8). A cross leg's maker fee is fixed at LIFT (the
   /// courier quote), and the network fee is paid in the transacted asset — never a fake "0 BTC", never
@@ -2314,22 +2348,13 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     ]);
   }
 
-  /// Set the PAY leg's settlement rail, COUPLING the RECEIVE leg for a same-chain pair (port swap.js
-  /// setRail ~1605). A same-chain asset↔asset pair has NO mixed-rail settlement path: both legs go over
-  /// Lightning (pure-LN, two asset-LN HTLCs bound by one preimage) OR both on-chain (the covenant book).
-  /// A split (one LN, one chain) has no bridge, so [route] would silently fall through to the on-chain
-  /// covenant book while the composer treats one leg as Lightning — a no-op that mis-settles. Couple them:
-  /// setting one leg sets the other. BTC pairs are genuinely rail-independent (the submarine / LSP bridges
-  /// rails at settlement), so the coupling is scoped to same-chain, where no such bridge exists.
-  void _setPayRailLn(bool v) => setState(() {
-        _payRailLn = v;
-        if (!_isCrossPair) _recvRailLn = v;
-      });
+  /// Per-leg settlement rails are INDEPENDENT on every pair (spec §2.1/§6.5) — same-chain included: a
+  /// same-chain pair with exactly one Lightning leg routes to the MIXED same-chain shape (the sub-asset
+  /// construction with the pair's quote asset standing in BTC's structural place), so the legs are
+  /// never force-coupled and [route] never silently falls through to the covenant book on a split.
+  void _setPayRailLn(bool v) => setState(() => _payRailLn = v);
 
-  void _setRecvRailLn(bool v) => setState(() {
-        _recvRailLn = v;
-        if (!_isCrossPair) _payRailLn = v;
-      });
+  void _setRecvRailLn(bool v) => setState(() => _recvRailLn = v);
 
   /// TRUE when the user is PAYING real Bitcoin ON-CHAIN. The "keep resting while offline" peg is
   /// relevant ONLY for this pay leg (not Lightning, not paying a Sequentia asset).
@@ -2874,6 +2899,42 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     if (mounted) _load();
   }
 
+  /// Dispatch a MIXED same-chain pair (asset↔asset, exactly one leg over Lightning): the sub-asset
+  /// construction with the pair's QUOTE asset standing in BTC's structural place (one asset-LN HTLC +
+  /// one on-chain HTLC ON THE QUOTE ASSET on Sequentia, bound by one preimage). The wired orientations
+  /// keep the BASE leg on Lightning ([SwapRoute.isSubAsset]): a BUY pays the quote on-chain and receives
+  /// the base over Lightning; a SELL pays the base over Lightning and claims the quote on-chain. The
+  /// mirror (the QUOTE leg on Lightning) has no settlement path yet — refuse it BY NAME, never a silent
+  /// fall-through to the covenant book (mirror web requoteMixed).
+  Future<void> _dispatchSameChainMixed(SwapRoute r) async {
+    final base = r.seqAsset, quote = r.quoteAsset;
+    if (base == null || quote == null) return;
+    final btk = _tk(base), qtk = _tk(quote);
+    // A resting order is the covenant book's job; the mixed shape is take-only in this build.
+    if (_mode == 'post') {
+      _snack('A resting limit order settles on the covenant book · set both legs to On-chain to place '
+          'it, or use Market to take a resting offer now.');
+      return;
+    }
+    if (!r.isSubAsset) {
+      _snack('Trading with the $qtk leg over Lightning isn\'t settled by this build yet · put the $btk '
+          'leg on Lightning and the $qtk leg on-chain, or set both legs the same.');
+      return;
+    }
+    if (r.payIsBtc) {
+      // BUY the base: lock the QUOTE in an on-chain Sequentia HTLC, receive the base over Lightning.
+      await Navigator.of(context)
+          .push(MaterialPageRoute<void>(builder: (_) => SubassetBuyScreen(asset: base, quoteAsset: quote)));
+    } else {
+      // SELL the base: pay it over Lightning, claim the QUOTE from the maker's on-chain HTLC.
+      final amtText = (_payAsset == base ? _payAmount : _recvAmount).text.trim();
+      await Navigator.of(context).push(MaterialPageRoute<void>(
+          builder: (_) => SubassetSellScreen(
+              asset: base, quoteAsset: quote, assetAmount: amtText.isEmpty ? null : amtText)));
+    }
+    if (mounted) _load();
+  }
+
   // --- SBTC silent peg (spec §5) --------------------------------------------
 
   /// MAKER: rest a BUY-with-on-chain-BTC LIMIT order as a pegged (SBTC) covenant advertised as BTC, so
@@ -3355,6 +3416,13 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
               Text(r.title, style: AmbraText.body),
               const SizedBox(height: 2),
               Text(r.status, style: AmbraText.sub),
+              // Enriched trades (pair/side/price — e.g. the mixed same-chain rails) show the market
+              // line: side + BASE/QUOTE at the fill price in quote units per base unit.
+              if (r.pair != null) ...[
+                const SizedBox(height: 2),
+                Text('${(r.side ?? '').toUpperCase()} ${r.pair}${r.price != null ? ' @ ${_fmtPrice(r.price!)}' : ''}',
+                    style: AmbraText.sub.copyWith(color: AmbraColors.dim)),
+              ],
             ]),
           ),
           const SizedBox(width: 10),

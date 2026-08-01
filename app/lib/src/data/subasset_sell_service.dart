@@ -3,8 +3,10 @@ import 'dart:math';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:http/http.dart' as http;
 
 import '../rust/api.dart' as core;
+import 'api_client.dart';
 import 'config.dart';
 import 'lightning_service.dart';
 import 'lsp_client.dart';
@@ -37,6 +39,7 @@ class SubSellRecord {
     required this.asset,
     required this.ticker,
     required this.expectedBtc,
+    this.quoteAsset,
     this.preimage = '',
     this.hashHex = '',
     this.btcLeg,
@@ -53,6 +56,11 @@ class SubSellRecord {
   SubSellStep step;
   final String asset; // the Sequentia asset paid over Lightning
   final String ticker;
+
+  /// MIXED same-chain: the claim leg's REAL asset — the maker's HTLC is on this Sequentia asset instead
+  /// of Bitcoin, with [expectedBtc] / [SubBtcHtlc.amount] carrying QUOTE ATOMS and [SubBtcHtlc.tBtc] a
+  /// SEQUENTIA height (the LSP contract labels them btc_* regardless). Null = the BTC shape, unchanged.
+  final String? quoteAsset;
   final String preimage; // NOT HD-derivable — the recovery-critical secret (claims the BTC); '' at 'paying'
   final String hashHex; // '' until the maker returns it (known from 'claiming' on)
   final SubBtcHtlc? btcLeg; // the maker's BTC HTLC the taker claims with [preimage]; null at 'paying'
@@ -76,6 +84,7 @@ class SubSellRecord {
         'step': step.name,
         'asset': asset,
         'ticker': ticker,
+        'quoteAsset': quoteAsset,
         'preimage': preimage,
         'hashHex': hashHex,
         'btcLeg': btcLeg?.toJson(),
@@ -94,6 +103,9 @@ class SubSellRecord {
         step: SubSellStep.values.firstWhere((s) => s.name == j['step'], orElse: () => SubSellStep.failed),
         asset: '${j['asset']}',
         ticker: '${j['ticker']}',
+        quoteAsset: (j['quoteAsset'] is String && (j['quoteAsset'] as String).isNotEmpty)
+            ? j['quoteAsset'] as String
+            : null,
         preimage: '${j['preimage'] ?? ''}',
         hashHex: '${j['hashHex'] ?? ''}',
         btcLeg: j['btcLeg'] is Map ? SubBtcHtlc.fromJson(j['btcLeg'] as Map) : null,
@@ -199,7 +211,8 @@ class SubassetSellService {
   /// claim the BTC on-chain. FUND-SAFETY: the asset is paid inside [LightningService.swapSub]; the
   /// moment it settles we hold the only recovery handle (the preimage), so we persist BEFORE the first
   /// claim and [resume] re-attempts it. Refuses to start while another sell's BTC claim is unconfirmed.
-  static Future<SubSellRecord> begin({required String asset, required num amount, SubOffer? offer}) async {
+  static Future<SubSellRecord> begin(
+      {required String asset, required num amount, SubOffer? offer, String? quoteAsset}) async {
     // FUND-SAFETY self-guard: a second sell would pay the asset again + overwrite the persisted
     // preimage/HTLC — the single handle to the claimable BTC. The sync sentinel is checked-and-set
     // atomically (no await between) so a concurrent begin can't slip through before the persist below.
@@ -214,9 +227,14 @@ class SubassetSellService {
       }
       final m = await _mnemonic();
       final ticker = SeqAssets.labelFor(asset).ticker;
-      // The device CLAIM key — only we can claim the maker's BTC HTLC. The maker embeds it as the
-      // IF/claim key so the LSP (keyless) can never take the BTC.
-      final btcClaimPub = await core.xchainBtcClaimPubkey(mnemonic: m);
+      final qh = (quoteAsset != null && quoteAsset.isNotEmpty) ? quoteAsset : null;
+      // The device CLAIM key — only we can claim the maker's on-chain HTLC. The maker embeds it as the
+      // IF/claim key so the LSP (keyless) can never take the funds. MIXED same-chain: the claim leg is
+      // the QUOTE asset on Sequentia, so the key is the wallet's canonical SEQ claim key (mirror web
+      // startSell's `qh ? seqLeg.claimKey() : btcLeg.claimKey()`).
+      final btcClaimPub = qh != null
+          ? await core.xchainSeqClaimPubkey(mnemonic: m)
+          : await core.xchainBtcClaimPubkey(mnemonic: m);
       // Bring our OWN hosted asset node's device signer online so the LSP can command the LN pay.
       final nodeKey = await LightningService.instance.connectNode(m, asset: asset);
       // FUND-SAFETY: the asset is paid INSIDE swapSub. Persist a PENDING ('paying') record carrying a
@@ -229,6 +247,7 @@ class SubassetSellService {
         asset: asset,
         ticker: ticker,
         expectedBtc: offer?.btcSats ?? BigInt.zero,
+        quoteAsset: qh,
         swapNonce: swapNonce,
         amount: amount,
         btcClaimPub: btcClaimPub,
@@ -254,6 +273,7 @@ class SubassetSellService {
           offerId: offer?.offerId,
           makerPubkey: offer?.makerPubkey,
           swapNonce: swapNonce,
+          quoteAsset: qh, // mixed same-chain: the claim leg's REAL asset (absent = BTC)
         );
         final s = resp.settle;
         if (!(s.settled && s.preimage.isNotEmpty && s.btcHtlc != null)) {
@@ -269,6 +289,7 @@ class SubassetSellService {
           hashHex: s.hashHex.isNotEmpty ? s.hashHex : s.btcHtlc!.raw['hash_h']?.toString() ?? '',
           btcLeg: s.btcHtlc!,
           expectedBtc: offer?.btcSats ?? BigInt.zero,
+          quoteAsset: qh,
           swapNonce: swapNonce,
         );
         await SubSellStore.save(rec);
@@ -297,6 +318,46 @@ class SubassetSellService {
     final m = await _mnemonic();
     final h = rec.btcLeg;
     if (h == null) throw Exception('No BTC HTLC to verify (the sell has not settled yet).');
+    // The preimage must hash to H on BOTH shapes — never claim with a secret that can't spend the leg.
+    final digest = sha256.convert(_hexBytes(rec.preimage)).toString();
+    if (digest.toLowerCase() != rec.hashHex.toLowerCase()) {
+      throw Exception('The revealed preimage does not hash to H.');
+    }
+    if (rec.quoteAsset != null) {
+      // MIXED same-chain: the claim leg is the QUOTE asset on Sequentia (mirror web claimSell's qh
+      // branch). Rebuild the forward HTLC from OUR inputs (claim = our canonical SEQ key), then bind
+      // the reported outpoint to a REAL on-chain output: script + asset + amount, from OUR esplora.
+      final ours = (await core.xchainSeqClaimPubkey(mnemonic: m)).toLowerCase();
+      if (h.takerClaimPubkey.toLowerCase() != ours) {
+        throw Exception('The on-chain lock is not bound to this wallet\'s claim key.');
+      }
+      final rebuilt = await core.xchainSeqHtlcForward(
+        mnemonic: m,
+        hashHex: rec.hashHex,
+        makerSeqRefundPubHex: h.makerRefundPubkey,
+        seqLocktime: h.tBtc,
+      );
+      if (rebuilt.redeemScriptHex.toLowerCase() != h.redeemScript.toLowerCase()) {
+        throw Exception('The on-chain lock\'s redeem script does not match H + the claim/refund keys.');
+      }
+      // A READ FAILURE IS NOT A MISMATCH: an unindexed tx is transient (the claim retries), a real
+      // disagreement is fatal. The read is explicit-only, so a blinded/absent output fails closed.
+      final out = await _seqOutput(h.txid, h.vout);
+      if (out == null) {
+        throw Exception('Could not read the counterparty\'s on-chain lock yet; retrying automatically.');
+      }
+      if ('${out['scriptpubkey'] ?? ''}'.toLowerCase() != rebuilt.p2ShSpkHex.toLowerCase()) {
+        throw Exception('The counterparty\'s on-chain lock does not match this trade; not claiming.');
+      }
+      if ('${out['asset'] ?? ''}'.toLowerCase() != rec.quoteAsset!.toLowerCase()) {
+        throw Exception('The counterparty\'s on-chain lock is in the wrong asset; not claiming.');
+      }
+      final value = BigInt.tryParse('${out['value'] ?? ''}');
+      if (value == null || value != h.amount) {
+        throw Exception('The counterparty\'s on-chain lock has the wrong amount; not claiming.');
+      }
+      return;
+    }
     final ours = (await core.xchainBtcClaimPubkey(mnemonic: m)).toLowerCase();
     if (h.takerClaimPubkey.toLowerCase() != ours) {
       throw Exception('The BTC HTLC is not locked to this wallet\'s claim key.');
@@ -309,10 +370,6 @@ class SubassetSellService {
     );
     if (rebuilt.redeemScriptHex.toLowerCase() != h.redeemScript.toLowerCase()) {
       throw Exception('The BTC HTLC redeem script does not match H + the claim/refund keys.');
-    }
-    final digest = sha256.convert(_hexBytes(rec.preimage)).toString();
-    if (digest.toLowerCase() != rec.hashHex.toLowerCase()) {
-      throw Exception('The revealed preimage does not hash to H.');
     }
     final f = await core.xchainFindBtcFunding(t4Api: Backend.testnet4, txid: h.txid, p2ShSpkHex: rebuilt.p2ShSpkHex);
     if (f.vout != h.vout) {
@@ -341,28 +398,67 @@ class SubassetSellService {
     final h = rec.btcLeg;
     if (h == null) throw Exception('No BTC HTLC to claim (the sell has not settled yet).');
     final dest = await core.receiveAddress(mnemonic: m); // our own tb1
-    final hex = await core.xchainBtcClaim(
-      mnemonic: m,
-      btcTxid: h.txid,
-      btcVout: h.vout,
-      btcAmountSats: h.amount,
-      destAddress: dest,
-      feeSats: _kClaimFeeSats,
-      redeemScriptHex: h.redeemScript,
-      preimageHex: rec.preimage,
-    );
-    final txid = await core.btcBroadcast(t4Api: Backend.testnet4, txHex: hex);
+    final String txid;
+    if (rec.quoteAsset != null) {
+      // MIXED same-chain: claim the QUOTE-asset HTLC on Sequentia with the preimage, the fee sized
+      // per-asset from the published rate and paid in the claimed asset (the HTLC holds no native
+      // tSEQ). Fail-closed fee sizing: an unmineable claim would linger while the maker's refund
+      // matures — the throw keeps the record 'claiming' and the claim retries.
+      final fee = await _seqClaimFee(rec.quoteAsset!, h.amount);
+      final hex = await core.xchainSeqClaim(
+        mnemonic: m,
+        seqTxid: h.txid,
+        seqVout: h.vout,
+        seqAmount: h.amount,
+        seqAssetId: rec.quoteAsset!,
+        destAddress: dest,
+        hashHex: rec.hashHex,
+        makerSeqRefundPubHex: h.makerRefundPubkey,
+        seqLocktime: h.tBtc,
+        fee: fee,
+        preimageHex: rec.preimage,
+      );
+      txid = await core.xchainSeqBroadcast(seqEsplora: Backend.esplora, txHex: hex);
+    } else {
+      final hex = await core.xchainBtcClaim(
+        mnemonic: m,
+        btcTxid: h.txid,
+        btcVout: h.vout,
+        btcAmountSats: h.amount,
+        destAddress: dest,
+        feeSats: _kClaimFeeSats,
+        redeemScriptHex: h.redeemScript,
+        preimageHex: rec.preimage,
+      );
+      txid = await core.btcBroadcast(t4Api: Backend.testnet4, txHex: hex);
+    }
     rec
       ..claimTxid = txid
       ..step = SubSellStep.done;
     await SubSellStore.save(rec);
+    final qtk = rec.quoteAsset != null ? SeqAssets.labelFor(rec.quoteAsset!).ticker : 'BTC';
     TradeReceipts.log(
       id: 'subsell:${rec.hashHex}',
-      title: 'Sold ${rec.ticker} for BTC',
-      status: rec.shortfall ? 'BTC claimed (below quote)' : 'BTC claimed',
+      title: 'Sold ${rec.ticker} for $qtk',
+      status: rec.shortfall ? '$qtk claimed (below quote)' : '$qtk claimed',
       txid: rec.claimTxid,
+      pair: '${rec.ticker}/$qtk',
+      side: 'sell',
+      price: _fillPrice(rec),
     ).ignore();
     return rec;
+  }
+
+  /// The fill price in quote UNITS per base UNIT (receipt display). Null when a side is unknown.
+  static double? _fillPrice(SubSellRecord rec) {
+    final qprec = rec.quoteAsset != null ? SeqAssets.labelFor(rec.quoteAsset!).precision : 8;
+    var q = 1.0;
+    for (var i = 0; i < qprec; i++) {
+      q *= 10;
+    }
+    final got = rec.gotBtc.toDouble() / q;
+    final amt = (rec.amount ?? 0).toDouble();
+    return (got > 0 && amt > 0) ? got / amt : null;
   }
 
   /// On wallet load / cold start: if a sell paid the asset but its BTC claim never confirmed, re-attempt
@@ -396,10 +492,13 @@ class SubassetSellService {
       try {
         final m = await _mnemonic();
         final asset = rec.asset;
-        // Re-derive our claim key + bring our node online the SAME way begin does (deterministic).
+        // Re-derive our claim key + bring our node online the SAME way begin does (deterministic):
+        // the SEQ claim key for a mixed same-chain sell, the BTC claim key otherwise.
         final btcClaimPub = (rec.btcClaimPub != null && rec.btcClaimPub!.isNotEmpty)
             ? rec.btcClaimPub!
-            : await core.xchainBtcClaimPubkey(mnemonic: m);
+            : (rec.quoteAsset != null
+                ? await core.xchainSeqClaimPubkey(mnemonic: m)
+                : await core.xchainBtcClaimPubkey(mnemonic: m));
         final nodeKey = await LightningService.instance.connectNode(m, asset: asset);
         final resp = await LightningService.instance.swapSub(
           side: 'sell',
@@ -412,6 +511,7 @@ class SubassetSellService {
           offerId: rec.offerId,
           makerPubkey: rec.makerPubkey,
           swapNonce: rec.swapNonce,
+          quoteAsset: rec.quoteAsset,
         );
         final s = resp.settle;
         if (!(s.settled && s.preimage.isNotEmpty && s.btcHtlc != null)) return; // not settled yet; keep for a later retry
@@ -423,6 +523,7 @@ class SubassetSellService {
           hashHex: s.hashHex.isNotEmpty ? s.hashHex : s.btcHtlc!.raw['hash_h']?.toString() ?? '',
           btcLeg: s.btcHtlc!,
           expectedBtc: rec.expectedBtc,
+          quoteAsset: rec.quoteAsset,
           swapNonce: rec.swapNonce,
         );
         await SubSellStore.save(claiming);
@@ -432,6 +533,47 @@ class SubassetSellService {
       }
       return;
     }
+  }
+
+  // -- Sequentia-side helpers (mixed same-chain claim leg) --------------------
+
+  /// Output [vout] of Sequentia tx [txid] from OUR OWN esplora: `{scriptpubkey, asset, value}`.
+  /// Null while the tx is unindexed / unreadable (transient — the caller retries), so a lagging
+  /// backend is never reported as a mismatch.
+  static Future<Map<String, dynamic>?> _seqOutput(String txid, int vout) async {
+    try {
+      final resp = await http
+          .get(Uri.parse('${Backend.esplora}/tx/$txid'), headers: Backend.authHeaders)
+          .timeout(const Duration(seconds: 20));
+      if (resp.statusCode != 200) return null;
+      final tx = jsonDecode(resp.body) as Map<String, dynamic>;
+      final vouts = (tx['vout'] as List?) ?? const [];
+      if (vout < 0 || vout >= vouts.length) return null;
+      final o = vouts[vout];
+      return o is Map ? Map<String, dynamic>.from(o) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// The claim fee in atoms of the CLAIMED quote asset: the native policy fee converted at the asset's
+  /// published rate, min 1 atom, capped at half the output. FAIL-CLOSED on a missing rate — an
+  /// under-fee'd claim sits unmined while the maker's refund matures; the throw keeps the record
+  /// 'claiming' and the claim retries (mirror XchainSwapService._seqClaimFee).
+  static Future<BigInt> _seqClaimFee(String assetHex, BigInt amount) async {
+    final ticker = SeqAssets.labelFor(assetHex).ticker;
+    final rates = await ApiClient.feeRates();
+    final scale = BigInt.from(100000000);
+    final rate = rates[ticker] ?? rates[assetHex];
+    if (rate == null || rate <= BigInt.zero) {
+      throw Exception('No Sequentia fee rate for $ticker, so the claim fee cannot be sized safely; retrying.');
+    }
+    final native = BigInt.from(400); // ~vbytes at 1 sat/vB, matching the cross-swap sizing
+    var fee = (native * scale + rate - BigInt.one) ~/ rate; // ceil(native * scale / rate)
+    if (fee < BigInt.one) fee = BigInt.one;
+    final half = amount ~/ BigInt.two;
+    if (half >= BigInt.one && fee > half) fee = half;
+    return fee;
   }
 }
 

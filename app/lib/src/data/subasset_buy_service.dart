@@ -4,14 +4,16 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
 import '../rust/api.dart' as core;
+import 'api_client.dart';
 import 'config.dart';
 import 'lightning_service.dart';
 import 'lsp_client.dart';
 import 'trade_receipts.dart';
 import 'wallet_repository.dart';
 
-/// T_btc safety delta over the current BTC tip (parent-chain blocks), matching the maker's
-/// BtcLocktimeDelta so the refund branch matures well after the swap should have settled.
+/// T safety delta over the funding chain's current tip (parent-chain blocks for the BTC shape,
+/// Sequentia blocks for the mixed same-chain shape), matching the maker's BtcLocktimeDelta so the
+/// refund branch matures well after the swap should have settled.
 const int kBuyCltvDelta = 100;
 
 /// A conservative fee (sats) for the legacy-P2SH BTC HTLC refund spend (~200 vB at ~2 sat/vB).
@@ -57,17 +59,24 @@ class SubBuyRecord {
     required this.refundPub,
     required this.offerId,
     required this.makerPubkey,
+    this.quoteAsset,
     this.fundingTxid = '',
     this.vout = -1,
     this.jobId = '',
     this.poll = '',
     this.refundTxid = '',
     this.detail = '',
+    this.emptyScans = 0,
   });
 
   SubBuyStep step;
   final String asset; // the Sequentia asset received over Lightning
   final String ticker;
+
+  /// MIXED same-chain: the on-chain leg's REAL asset — an HTLC on this Sequentia asset instead of
+  /// Bitcoin, with [btcSats]/[tBtc] carrying QUOTE ATOMS / a SEQUENTIA height (the LSP contract labels
+  /// them btc_sats/cltv regardless). Null = the BTC shape (the on-chain leg is Bitcoin, unchanged).
+  final String? quoteAsset;
   final String preimage; // P — NOT HD-derivable; only the device holds it until it settles
   final String hashHex; // H = sha256(P)
   String nodeKey; // our OWN hosted asset node that receives + settles the HODL invoice
@@ -88,6 +97,11 @@ class SubBuyRecord {
   String refundTxid;
   String detail;
 
+  /// Consecutive DEFINITIVE empty scans of the quote-HTLC P2SH while at [SubBuyStep.funding] with no
+  /// txid (the Sequentia funding txid is only known after broadcast, unlike btcPrepare's). Bounds the
+  /// lost-broadcast recovery: found -> adopt; several definitive empties -> nothing was ever locked.
+  int emptyScans;
+
   Map<String, dynamic> toJson() => {
         'step': step.name,
         'asset': asset,
@@ -105,12 +119,14 @@ class SubBuyRecord {
         'refundPub': refundPub,
         'offerId': offerId,
         'makerPubkey': makerPubkey,
+        'quoteAsset': quoteAsset,
         'fundingTxid': fundingTxid,
         'vout': vout,
         'jobId': jobId,
         'poll': poll,
         'refundTxid': refundTxid,
         'detail': detail,
+        'emptyScans': emptyScans,
       };
 
   static SubBuyRecord fromJson(Map<String, dynamic> j) => SubBuyRecord(
@@ -130,12 +146,16 @@ class SubBuyRecord {
         refundPub: '${j['refundPub'] ?? ''}',
         offerId: '${j['offerId'] ?? ''}',
         makerPubkey: '${j['makerPubkey'] ?? ''}',
+        quoteAsset: (j['quoteAsset'] is String && (j['quoteAsset'] as String).isNotEmpty)
+            ? j['quoteAsset'] as String
+            : null,
         fundingTxid: '${j['fundingTxid'] ?? ''}',
         vout: (j['vout'] as int?) ?? -1,
         jobId: '${j['jobId'] ?? ''}',
         poll: '${j['poll'] ?? ''}',
         refundTxid: '${j['refundTxid'] ?? ''}',
         detail: '${j['detail'] ?? ''}',
+        emptyScans: (j['emptyScans'] as int?) ?? 0,
       );
 
   /// The `btc_htlc` object handed to the LSP swap (the maker claims this with P). Mirrors the web's
@@ -182,6 +202,33 @@ class SubBuyStore {
   static Future<void> clear() => _storage.delete(key: _key);
 }
 
+/// The sized fill of a sub-asset BUY against one resting offer. PURE (unit-tested). `offerBtc` /
+/// `reqBtcSats` carry the offer's quote-leg atoms: sats for the BTC shape, QUOTE ATOMS for the mixed
+/// same-chain shape (the LSP labels them btc_sats regardless) — the math is precision-blind. Default =
+/// the whole offer; a smaller request takes a floor slice of the asset priced at the maker's EXACT
+/// integer ProportionalBtc(ceil), or the maker rejects the lift AFTER the on-chain leg is locked.
+class SubBuyFill {
+  const SubBuyFill({required this.assetAtoms, required this.btcSats});
+  final BigInt assetAtoms;
+  final BigInt btcSats;
+}
+
+SubBuyFill sizeSubBuyFill({required BigInt offerAtoms, required BigInt offerBtc, BigInt? reqBtcSats}) {
+  var assetAtoms = offerAtoms;
+  var btcSats = offerBtc;
+  if (reqBtcSats != null &&
+      reqBtcSats > BigInt.zero &&
+      reqBtcSats < offerBtc &&
+      offerAtoms > BigInt.zero &&
+      offerBtc > BigInt.zero) {
+    var a = (offerAtoms * reqBtcSats) ~/ offerBtc; // floor slice of the entered quote amount
+    if (a < BigInt.one) a = BigInt.one;
+    assetAtoms = a;
+    btcSats = (offerBtc * a + offerAtoms - BigInt.one) ~/ offerAtoms; // = the maker's ceil need
+  }
+  return SubBuyFill(assetAtoms: assetAtoms, btcSats: btcSats);
+}
+
 /// Drives the sub-asset BUY from LOCAL state: build P/H + the BTC HTLC, register the HODL invoice,
 /// FUND the BTC HTLC, command the maker's pay, then device-settle with P once the asset is held (or
 /// refund the BTC after T_btc). All money-moving spends are built by the audited core FFI. Each method
@@ -215,13 +262,14 @@ class SubassetBuyService {
     required String asset,
     required SubOffer offer,
     BigInt? reqBtcSats,
+    String? quoteAsset,
   }) async {
     if (_starting) {
       throw Exception('A sub-asset buy is already starting; wait for it to finish.');
     }
     _starting = true;
     try {
-      return await _begin(asset: asset, offer: offer, reqBtcSats: reqBtcSats);
+      return await _begin(asset: asset, offer: offer, reqBtcSats: reqBtcSats, quoteAsset: quoteAsset);
     } finally {
       _starting = false;
     }
@@ -231,6 +279,7 @@ class SubassetBuyService {
     required String asset,
     required SubOffer offer,
     BigInt? reqBtcSats,
+    String? quoteAsset,
   }) async {
     // FUND-SAFETY self-guard: a second buy would overwrite the persisted P + funding outpoint — the
     // single handle to the locked BTC. Refuse while one is still committed. (A prior secretReady stub,
@@ -250,32 +299,49 @@ class SubassetBuyService {
     final h = sec.hashHex, p = sec.secretHex;
     // Our OWN hosted asset node RECEIVES the asset over LN (the deterministic key; fund() connects it).
     final nodeKey = LightningService.instance.ownNodeKey(m, asset: asset);
-    // 2. Size this fill. Default to the whole offer; if the user entered LESS BTC than the offer's full
-    // price, take a proportional slice. BigInt, NOT float: btcSats MUST equal the maker's integer
-    // ProportionalBtc(ceil) or the maker rejects us AFTER the BTC is locked -> stranded until refund.
-    var assetAtoms = offer.assetAmount;
-    var btcSats = offer.btcSats;
-    if (reqBtcSats != null &&
-        reqBtcSats > BigInt.zero &&
-        reqBtcSats < offer.btcSats &&
-        offer.assetAmount > BigInt.zero &&
-        offer.btcSats > BigInt.zero) {
-      var a = (offer.assetAmount * reqBtcSats) ~/ offer.btcSats; // floor slice of the entered BTC
-      if (a < BigInt.one) a = BigInt.one;
-      assetAtoms = a;
-      btcSats = _ceilDiv(offer.btcSats * a, offer.assetAmount); // = the maker's ProportionalBtc need
+    // 2. Size this fill (pure BigInt math, [sizeSubBuyFill]): default the whole offer; a smaller
+    // request takes a floor slice priced at the maker's EXACT integer ProportionalBtc(ceil), or the
+    // maker rejects us AFTER the on-chain leg is locked -> stranded until refund.
+    final fill = sizeSubBuyFill(
+        offerAtoms: offer.assetAmount, offerBtc: offer.btcSats, reqBtcSats: reqBtcSats);
+    final assetAtoms = fill.assetAtoms;
+    final btcSats = fill.btcSats;
+    // 3. Build the on-chain HTLC on H: maker claims with P, device refunds after T = max(offer CLTV,
+    // tip + delta), the tip and the HTLC's chain chosen by the shape. MIXED same-chain: a Sequentia
+    // HTLC ON THE QUOTE ASSET, T off the SEQUENTIA tip (mirror web startBuy's `qh ? seqLeg : btcLeg`
+    // seam); xchainSeqHtlcReverse embeds the wallet's canonical SEQ key as the refund side. BTC shape:
+    // the legacy-P2SH Bitcoin HTLC, unchanged. Both refund keys are HD-derivable; P is not, hence the
+    // persist below.
+    final String refundPub, redeem, p2sh, p2shSpk;
+    final int tBtc;
+    if (quoteAsset != null && quoteAsset.isNotEmpty) {
+      final tip = await _seqTip();
+      if (tip < 0) throw Exception('The Sequentia tip is unreadable; try again shortly.');
+      tBtc = _max(offer.onchainCltv, tip + kBuyCltvDelta);
+      refundPub = await core.xchainSeqClaimPubkey(mnemonic: m);
+      final htlc = await core.xchainSeqHtlcReverse(
+        mnemonic: m,
+        hashHex: h,
+        makerSeqClaimPubHex: offer.makerClaimPub, // the maker claims with the secret
+        seqLocktime: tBtc, // we refund via CLTV (a Sequentia height)
+      );
+      redeem = htlc.redeemScriptHex;
+      p2sh = htlc.p2ShAddress;
+      p2shSpk = htlc.p2ShSpkHex;
+    } else {
+      final tip = await _btcTip();
+      tBtc = _max(offer.onchainCltv, tip + kBuyCltvDelta);
+      refundPub = await core.xchainBtcRefundPubkey(mnemonic: m);
+      final htlc = await core.xchainBtcHtlc(
+        hashHex: h,
+        claimPubHex: offer.makerClaimPub, // BTC leg: the maker claims with the secret
+        refundPubHex: refundPub, // we refund via CLTV
+        locktime: tBtc,
+      );
+      redeem = htlc.redeemScriptHex;
+      p2sh = htlc.p2ShAddress;
+      p2shSpk = htlc.p2ShSpkHex;
     }
-    // 3. Build the BTC HTLC on H: maker claims with P, device refunds after T_btc = max(offer CLTV,
-    // tip + delta). The device REFUND key is HD-derivable (recovery-safe); P is not, hence the persist.
-    final refundPub = await core.xchainBtcRefundPubkey(mnemonic: m);
-    final tip = await _btcTip();
-    final tBtc = _max(offer.onchainCltv, tip + kBuyCltvDelta);
-    final htlc = await core.xchainBtcHtlc(
-      hashHex: h,
-      claimPubHex: offer.makerClaimPub, // BTC leg: the maker claims with the secret
-      refundPubHex: refundPub, // we refund via CLTV
-      locktime: tBtc,
-    );
     final rec = SubBuyRecord(
       step: SubBuyStep.secretReady,
       asset: asset,
@@ -283,9 +349,9 @@ class SubassetBuyService {
       preimage: p,
       hashHex: h,
       nodeKey: nodeKey,
-      redeem: htlc.redeemScriptHex,
-      p2sh: htlc.p2ShAddress,
-      p2shSpk: htlc.p2ShSpkHex,
+      redeem: redeem,
+      p2sh: p2sh,
+      p2shSpk: p2shSpk,
       tBtc: tBtc,
       btcSats: btcSats,
       assetAtoms: assetAtoms,
@@ -293,6 +359,7 @@ class SubassetBuyService {
       refundPub: refundPub,
       offerId: offer.offerId,
       makerPubkey: offer.makerPubkey,
+      quoteAsset: (quoteAsset != null && quoteAsset.isNotEmpty) ? quoteAsset : null,
     );
     await SubBuyStore.save(rec); // PERSIST before any broadcast (P is the recovery-critical secret)
     return rec;
@@ -324,36 +391,98 @@ class SubassetBuyService {
     if (!(inv.hodl || (inv.paymentHash != null && inv.paymentHash!.isNotEmpty))) {
       throw Exception('Could not register the Lightning invoice on your node.');
     }
-    // Build the funding tx (signed; txid is final for segwit inputs).
-    final tx = await core.btcPrepare(
-      mnemonic: m,
-      t4Api: Backend.testnet4,
-      address: r.p2sh,
-      amountSats: r.btcSats,
-      feeRate: 0,
-    );
-    // FUND-SAFETY: persist the txid + advance the step BEFORE broadcasting.
-    r
-      ..fundingTxid = tx.txid
-      ..step = SubBuyStep.funding;
-    await SubBuyStore.save(r);
-    await core.btcBroadcast(t4Api: Backend.testnet4, txHex: tx.hex);
-    TradeReceipts.log(id: 'subbuy:${r.hashHex}', title: 'Buying ${r.ticker} with BTC', status: 'BTC locked')
+    if (r.quoteAsset != null) {
+      // MIXED same-chain: fund the QUOTE-asset HTLC on Sequentia via the wallet's own tx builder.
+      // Unlike btcPrepare, the PSET's txid is only known AFTER broadcast, so the 'funding' step is
+      // persisted BEFORE the irreversible broadcast and a lost txid is recovered by the P2SH scan in
+      // [pollFundAndSwap] (mirror web startBuy's seqLeg.fund + findFundingByAddress).
+      final pset = await core.buildSendTx(
+        mnemonic: m,
+        esploraUrl: Backend.esplora,
+        recipients: [core.Recipient(address: r.p2sh, assetId: r.quoteAsset!, satoshi: r.btcSats)],
+        feeRateSatKvb: null,
+        feeAsset: null,
+      );
+      final signed = await core.signPset(mnemonic: m, pset: pset);
+      r.step = SubBuyStep.funding;
+      await SubBuyStore.save(r);
+      final txid = await core.finalizeAndBroadcast(mnemonic: m, esploraUrl: Backend.esplora, pset: signed);
+      r.fundingTxid = txid;
+      await SubBuyStore.save(r);
+    } else {
+      // Build the funding tx (signed; txid is final for segwit inputs).
+      final tx = await core.btcPrepare(
+        mnemonic: m,
+        t4Api: Backend.testnet4,
+        address: r.p2sh,
+        amountSats: r.btcSats,
+        feeRate: 0,
+      );
+      // FUND-SAFETY: persist the txid + advance the step BEFORE broadcasting.
+      r
+        ..fundingTxid = tx.txid
+        ..step = SubBuyStep.funding;
+      await SubBuyStore.save(r);
+      await core.btcBroadcast(t4Api: Backend.testnet4, txHex: tx.hex);
+    }
+    final qtk = _quoteTicker(r);
+    TradeReceipts.log(id: 'subbuy:${r.hashHex}', title: 'Buying ${r.ticker} with $qtk', status: '$qtk locked')
         .ignore();
     return r;
   }
 
-  /// Poll until the BTC HTLC funding confirms (record its vout), then command the maker's pay over LN
-  /// (an async LSP job). Returns true once the swap is issued. Never broadcasts.
+  /// Poll until the on-chain HTLC funding is located (record its vout), then command the maker's pay
+  /// over LN (an async LSP job). Returns true once the swap is issued. Never broadcasts. BTC shape:
+  /// waits for 1 confirmation. MIXED same-chain: a 0-conf hand-off (mirror web) — the vout is adopted
+  /// the moment the funding is visible (mempool included); the maker carries its own 0-conf policy and
+  /// the CLTV refund path is unchanged.
   static Future<bool> pollFundAndSwap(SubBuyRecord r) async {
-    if (r.step != SubBuyStep.funding || r.fundingTxid.isEmpty) return r.step == SubBuyStep.funded;
-    final f = await core.xchainFindBtcFunding(t4Api: Backend.testnet4, txid: r.fundingTxid, p2ShSpkHex: r.p2shSpk);
-    if (f.confirmations < 1 || f.height < 0) return false;
-    r
-      ..vout = f.vout
-      ..step = SubBuyStep.funded;
+    if (r.step != SubBuyStep.funding) return r.step == SubBuyStep.funded;
+    if (r.quoteAsset != null) {
+      if (r.fundingTxid.isEmpty && !await _recoverSeqFundingTxid(r)) return false;
+      final v = await _findSeqVout(r.fundingTxid, r.p2shSpk);
+      if (v < 0) return false;
+      r
+        ..vout = v
+        ..step = SubBuyStep.funded;
+    } else {
+      if (r.fundingTxid.isEmpty) return false;
+      final f =
+          await core.xchainFindBtcFunding(t4Api: Backend.testnet4, txid: r.fundingTxid, p2ShSpkHex: r.p2shSpk);
+      if (f.confirmations < 1 || f.height < 0) return false;
+      r
+        ..vout = f.vout
+        ..step = SubBuyStep.funded;
+    }
     await SubBuyStore.save(r);
     await _issueSwap(r); // ask the maker to pay us the asset over LN
+    return true;
+  }
+
+  /// Recover a quote-HTLC funding whose txid never persisted (a crash between broadcast and the save):
+  /// scan the P2SH via esplora `/address/<addr>/utxo` (confirmed + mempool). Found -> adopt the txid
+  /// (true). A transient read error keeps the record resumable (false). Several consecutive DEFINITIVE
+  /// empties prove the broadcast never went out (the step is persisted BEFORE broadcasting), so nothing
+  /// was locked -> terminal `failed`, releasing the single slot (false).
+  static Future<bool> _recoverSeqFundingTxid(SubBuyRecord r) async {
+    final utxos = await _seqAddressUtxos(r.p2sh);
+    if (utxos == null) return false; // transient: never a false drop of a possibly-funded HTLC
+    if (utxos.isEmpty) {
+      r.emptyScans++;
+      if (r.emptyScans >= 3) {
+        r
+          ..step = SubBuyStep.failed
+          ..detail = 'The lock was never broadcast; nothing was locked.';
+      }
+      await SubBuyStore.save(r);
+      return false;
+    }
+    final txid = '${(utxos.first as Map)['txid'] ?? ''}';
+    if (txid.isEmpty) return false;
+    r
+      ..fundingTxid = txid
+      ..emptyScans = 0;
+    await SubBuyStore.save(r);
     return true;
   }
 
@@ -377,6 +506,7 @@ class SubassetBuyService {
         btcHtlc: r.btcHtlcJson(),
         offerId: r.offerId.isEmpty ? null : r.offerId,
         makerPubkey: r.makerPubkey.isEmpty ? null : r.makerPubkey,
+        quoteAsset: r.quoteAsset, // mixed same-chain: the on-chain leg's REAL asset (absent = BTC)
       );
       r
         ..jobId = resp.job.jobId ?? ''
@@ -401,9 +531,11 @@ class SubassetBuyService {
       await _reconcileJob(r);
     }
     if (r.step != SubBuyStep.funded && r.step != SubBuyStep.holding) return r;
+    // The refund guard is judged on the HTLC's OWN chain: the Sequentia tip for a quote-asset leg
+    // (tBtc is a Sequentia height there), the Bitcoin tip otherwise.
     var tip = 0;
     try {
-      tip = await _btcTip();
+      tip = r.quoteAsset != null ? await _seqTip() : await _btcTip();
     } catch (_) {}
     HodlInvoiceStatus? status;
     try {
@@ -451,8 +583,15 @@ class SubassetBuyService {
     await LspClient.nodeSettle(nodeKey: r.nodeKey, paymentHash: r.hashHex, preimage: r.preimage);
     r.step = SubBuyStep.settled;
     await SubBuyStore.save(r);
-    TradeReceipts.log(id: 'subbuy:${r.hashHex}', title: 'Bought ${r.ticker} with BTC', status: 'Asset received')
-        .ignore();
+    final qtk = _quoteTicker(r);
+    TradeReceipts.log(
+      id: 'subbuy:${r.hashHex}',
+      title: 'Bought ${r.ticker} with $qtk',
+      status: 'Asset received',
+      pair: '${r.ticker}/$qtk',
+      side: 'buy',
+      price: _fillPrice(r),
+    ).ignore();
     // Best-effort: record the maker-claim job status for display. Non-fatal.
     if (r.poll.isNotEmpty || r.jobId.isNotEmpty) {
       try {
@@ -470,31 +609,51 @@ class SubassetBuyService {
     if (!r.refundable) throw Exception('this buy is not refundable (nothing is locked, or it already settled)');
     final m = await _mnemonic();
     final dest = await core.receiveAddress(mnemonic: m); // our own tb1
-    final hex = await core.xchainBtcRefund(
-      mnemonic: m,
-      btcTxid: r.fundingTxid,
-      btcVout: r.vout,
-      btcAmountSats: r.btcSats,
-      destAddress: dest,
-      feeSats: _kRefundFeeSats,
-      redeemScriptHex: r.redeem,
-      locktime: r.tBtc,
-    );
-    final txid = await core.btcBroadcast(t4Api: Backend.testnet4, txHex: hex);
+    final String txid;
+    if (r.quoteAsset != null) {
+      // MIXED same-chain: reclaim the quote-asset HTLC on Sequentia via its CLTV branch, the fee sized
+      // per-asset from the published rate (the HTLC holds no native tSEQ). Mirror web refundBuy's
+      // `qh ? seqLeg.refund : btcLeg.refund` seam.
+      final hex = await core.xchainSeqRefund(
+        mnemonic: m,
+        seqTxid: r.fundingTxid,
+        seqVout: r.vout,
+        seqAmount: r.btcSats,
+        seqAssetId: r.quoteAsset!,
+        destAddress: dest,
+        feeAtoms: await _seqAssetFee(r.quoteAsset!, r.btcSats),
+        redeemScriptHex: r.redeem,
+        seqLocktime: r.tBtc,
+      );
+      txid = await core.xchainSeqBroadcast(seqEsplora: Backend.esplora, txHex: hex);
+    } else {
+      final hex = await core.xchainBtcRefund(
+        mnemonic: m,
+        btcTxid: r.fundingTxid,
+        btcVout: r.vout,
+        btcAmountSats: r.btcSats,
+        destAddress: dest,
+        feeSats: _kRefundFeeSats,
+        redeemScriptHex: r.redeem,
+        locktime: r.tBtc,
+      );
+      txid = await core.btcBroadcast(t4Api: Backend.testnet4, txHex: hex);
+    }
     r
       ..refundTxid = txid
       ..step = SubBuyStep.refunded;
     await SubBuyStore.save(r);
+    final qtk = _quoteTicker(r);
     TradeReceipts.log(
-            id: 'subbuy:${r.hashHex}', title: 'Buy refunded (${r.ticker})', status: 'BTC refunded', txid: r.refundTxid)
+            id: 'subbuy:${r.hashHex}', title: 'Buy refunded (${r.ticker})', status: '$qtk refunded', txid: r.refundTxid)
         .ignore();
     return r;
   }
 
-  /// Whether the BTC refund is spendable yet (parent-chain tip >= T_btc) and the swap is refundable.
+  /// Whether the on-chain refund is spendable yet (the HTLC chain's tip >= T) and the swap is refundable.
   static Future<bool> refundReady(SubBuyRecord r) async {
     if (!r.refundable) return false;
-    final tip = await _btcTip();
+    final tip = r.quoteAsset != null ? await _seqTip() : await _btcTip();
     return tip > 0 && tip >= r.tBtc;
   }
 
@@ -527,8 +686,93 @@ class SubassetBuyService {
     return int.tryParse(resp.body.trim()) ?? -1;
   }
 
-  static int _max(int a, int b) => a > b ? a : b;
+  /// The current Sequentia tip height — T + the refund maturity gate for a quote-asset HTLC.
+  static Future<int> _seqTip() async {
+    final resp = await http
+        .get(Uri.parse('${Backend.esplora}/blocks/tip/height'), headers: Backend.authHeaders)
+        .timeout(const Duration(seconds: 20));
+    return int.tryParse(resp.body.trim()) ?? -1;
+  }
 
-  /// ceil(a / b) for positive BigInts.
-  static BigInt _ceilDiv(BigInt a, BigInt b) => (a + b - BigInt.one) ~/ b;
+  /// The quote-HTLC vout of [txid]: the output paying [p2shSpk] (mempool visible — the 0-conf
+  /// hand-off). -1 while the tx is not yet visible / no output matches.
+  static Future<int> _findSeqVout(String txid, String p2shSpk) async {
+    try {
+      final resp = await http
+          .get(Uri.parse('${Backend.esplora}/tx/$txid'), headers: Backend.authHeaders)
+          .timeout(const Duration(seconds: 20));
+      if (resp.statusCode != 200) return -1;
+      final tx = jsonDecode(resp.body) as Map<String, dynamic>;
+      final vouts = (tx['vout'] as List?) ?? const [];
+      final want = p2shSpk.toLowerCase();
+      for (var i = 0; i < vouts.length; i++) {
+        final o = vouts[i] as Map?;
+        if ('${o?['scriptpubkey'] ?? ''}'.toLowerCase() == want) return i;
+      }
+      return -1;
+    } catch (_) {
+      return -1;
+    }
+  }
+
+  /// The confirmed + mempool UTXOs at [address] via esplora `/address/<addr>/utxo`. A DEFINITIVE read
+  /// returns the list (empty = genuinely unfunded); a transient error returns null so the caller never
+  /// drops a possibly-funded leg on an unreadable state (mirror subswap's `_seqAddressUtxos`).
+  static Future<List<dynamic>?> _seqAddressUtxos(String address) async {
+    try {
+      final resp = await http
+          .get(Uri.parse('${Backend.esplora}/address/$address/utxo'), headers: Backend.authHeaders)
+          .timeout(const Duration(seconds: 20));
+      if (resp.statusCode != 200) return null;
+      final j = jsonDecode(resp.body);
+      return j is List ? j : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// A Sequentia spend fee in atoms of [assetHex] (the HTLC holds no native tSEQ): the native policy
+  /// fee converted at the asset's published rate, min 1 atom, capped at half the output. Best-effort
+  /// feed; falls back to the reference scale when the feed omits the asset — a refund must stay
+  /// broadcastable (same sizing as subswap's `_seqRefundFee`).
+  static Future<BigInt> _seqAssetFee(String assetHex, BigInt amount) async {
+    final ticker = SeqAssets.labelFor(assetHex).ticker;
+    Map<String, BigInt> rates;
+    try {
+      rates = await ApiClient.feeRates();
+    } catch (_) {
+      rates = const {};
+    }
+    final scale = BigInt.from(100000000);
+    final rate = rates[ticker] ?? rates[assetHex] ?? scale;
+    final native = BigInt.from(400); // ~vbytes at 1 sat/vB, matching the cross-swap sizing
+    var fee = (native * scale + rate - BigInt.one) ~/ rate; // ceil(native * scale / rate)
+    if (fee < BigInt.one) fee = BigInt.one;
+    final half = amount ~/ BigInt.two;
+    if (fee > half) fee = half < BigInt.one ? BigInt.one : half;
+    return fee;
+  }
+
+  /// The quote leg's display name: the quote asset's ticker on the mixed same-chain shape, else 'BTC'.
+  static String _quoteTicker(SubBuyRecord r) =>
+      r.quoteAsset != null ? SeqAssets.labelFor(r.quoteAsset!).ticker : 'BTC';
+
+  /// The fill price in quote UNITS per base UNIT (receipt display). Null when a side is zero.
+  static double? _fillPrice(SubBuyRecord r) {
+    final qprec = r.quoteAsset != null ? SeqAssets.labelFor(r.quoteAsset!).precision : 8;
+    final aprec = SeqAssets.labelFor(r.asset).precision;
+    final q = r.btcSats.toDouble() / _pow10(qprec);
+    final a = r.assetAtoms.toDouble() / _pow10(aprec);
+    return (q > 0 && a > 0) ? q / a : null;
+  }
+
+  static double _pow10(int p) {
+    var v = 1.0;
+    for (var i = 0; i < p; i++) {
+      v *= 10;
+    }
+    return v;
+  }
+
+  static int _max(int a, int b) => a > b ? a : b;
 }
