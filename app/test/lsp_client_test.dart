@@ -216,4 +216,36 @@ void main() {
     expect(info.ready, isTrue);
     expect(polls, greaterThanOrEqualTo(2));
   });
+
+  group('BridgeJobStatus asset-side fronting fields (tolerant)', () {
+    test('front_mode + expected_wait parse from the top level', () {
+      final s = BridgeJobStatus.fromJson({'ok': true, 'status': 'held', 'front_mode': 'inventory', 'expected_wait': 'about a minute'});
+      expect(s.frontMode, 'inventory');
+      expect(s.frontedFromInventory, isTrue);
+      expect(s.expectedWait, 'about a minute');
+    });
+
+    test('front_mode parses from inside bridge_terms too, case-tolerant', () {
+      final s = BridgeJobStatus.fromJson({
+        'ok': true,
+        'status': 'held',
+        'bridge_terms': {'hash_h': 'AB', 'frontMode': 'Inventory'},
+      });
+      expect(s.frontMode, 'inventory'); // lowercased so the reader compares one spelling
+      expect(s.frontedFromInventory, isTrue);
+    });
+
+    test('ABSENT front_mode means the slow maker-first path — never assumed fast', () {
+      final s = BridgeJobStatus.fromJson({'ok': true, 'status': 'held'});
+      expect(s.frontMode, isNull);
+      expect(s.frontedFromInventory, isFalse);
+      expect(s.expectedWait, isNull);
+    });
+
+    test('an explicit maker-first is not inventory', () {
+      final s = BridgeJobStatus.fromJson({'ok': true, 'status': 'held', 'front_mode': 'maker-first'});
+      expect(s.frontMode, 'maker-first');
+      expect(s.frontedFromInventory, isFalse);
+    });
+  });
 }

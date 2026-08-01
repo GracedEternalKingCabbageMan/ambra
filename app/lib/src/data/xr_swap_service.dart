@@ -49,6 +49,7 @@ import 'api_client.dart';
 import 'config.dart';
 import 'cross_courier.dart';
 import 'seqob_client.dart' show CrossOffer;
+import 'store_log.dart';
 import 'trade_slots.dart';
 import 'tx_flow.dart';
 import 'wallet_repository.dart';
@@ -301,7 +302,8 @@ class XrSwapStore {
   static Future<void> save(XrSwapRecord r) => _list.upsert(r.toJson());
 
   /// Remove ONE record by id (after the guarded abandon / terminal cleanup) — never the whole store.
-  static Future<void> remove(String id) => _list.removeById(id);
+  static Future<void> remove(String id, {String reason = 'unspecified'}) =>
+      _list.removeById(id, reason: reason);
 
   /// The persisted swaps the store must protect: non-terminal AND holding (or possibly holding) a
   /// locked asset leg. The slot count + the composer's in-flight cards + resume iterate these.
@@ -995,9 +997,12 @@ class XrSwapService {
     List<XrSwapRecord> recs;
     try {
       recs = await XrSwapStore.loadAll();
-    } catch (_) {
+    } catch (e) {
+      storeLog('xr resume: store UNREADABLE ($e) - nothing driven, records stay persisted');
       return null;
     }
+    storeLog('xr resume: ${recs.length} record(s)'
+        '${recs.isEmpty ? '' : ' [${recs.map((r) => '${r.id}:${r.step.name}').join(', ')}]'}');
     XrSwapRecord? first;
     await Future.wait([
       for (final r in recs)
@@ -1123,7 +1128,8 @@ class XrSwapService {
     final rec = await XrSwapStore.load(id: record.id);
     if (rec == null) return true; // already gone
     if (!canAbandon(rec)) return false;
-    await XrSwapStore.remove(rec.id);
+    await XrSwapStore.remove(rec.id,
+        reason: 'user clear: abandon gate passed (step=${rec.step.name})');
     return true;
   }
 

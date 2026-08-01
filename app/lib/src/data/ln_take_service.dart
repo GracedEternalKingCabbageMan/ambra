@@ -135,7 +135,8 @@ class LnTakeStore {
   static Future<void> save(LnTakeRecord r) => _list.upsert(r.toJson());
 
   /// Remove ONE record by id.
-  static Future<void> remove(String id) => _list.removeById(id);
+  static Future<void> remove(String id, {String reason = 'unspecified'}) =>
+      _list.removeById(id, reason: reason);
 
   /// TEST-ONLY full wipe.
   static Future<void> clear() => _list.wipeAll();
@@ -257,7 +258,7 @@ class LnTakeService {
           status: 'Settled',
         );
       }
-      await LnTakeStore.remove(rec.id);
+      await LnTakeStore.remove(rec.id, reason: 'pure-LN take settled');
       return r;
     } catch (e) {
       rec
@@ -308,7 +309,7 @@ class LnTakeService {
       }
       final settled = receipts.any((r) => r.id.startsWith('ln:') && r.ts >= startedS - 2 && r.title.contains(tk));
       if (settled) {
-        await LnTakeStore.remove(rec.id);
+        await LnTakeStore.remove(rec.id, reason: 'stale check: receipt shows the take settled');
         return LnStaleVerdict(record: rec, settled: true);
       }
     }
@@ -316,7 +317,8 @@ class LnTakeService {
   }
 
   /// Dismiss ONE surfaced record (nothing was committed — pure-LN holds no client-side funds).
-  static Future<void> dismiss(LnTakeRecord rec) => LnTakeStore.remove(rec.id);
+  static Future<void> dismiss(LnTakeRecord rec) =>
+      LnTakeStore.remove(rec.id, reason: 'user dismissed (pure-LN holds no client-side funds)');
 
   static double _pow10(int n) {
     var v = 1.0;

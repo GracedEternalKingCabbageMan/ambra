@@ -40,6 +40,7 @@ import 'config.dart';
 import 'lightning_service.dart';
 import 'lsp_client.dart';
 import 'seqob_client.dart' show CrossOffer;
+import 'store_log.dart';
 import 'trade_slots.dart';
 import 'subswap_service.dart'
     show
@@ -230,8 +231,10 @@ class LspBridgeStore {
 
   static Future<void> save(LspBridgeRecord r) => _list.upsert(r.toJson());
 
-  /// Remove ONE record by id (after the CLTV-gated abandon / pre-commitment cleanup).
-  static Future<void> remove(String id) => _list.removeById(id);
+  /// Remove ONE record by id (after the CLTV-gated abandon / pre-commitment cleanup). [reason] is
+  /// logged loudly by the substrate — a bridge record removal must never be silent.
+  static Future<void> remove(String id, {String reason = 'unspecified'}) =>
+      _list.removeById(id, reason: reason);
 
   /// The records the store must protect: non-terminal AND holding (or possibly holding) a committed
   /// HELD payment keyed by that record's P. Slot count + cards + resume iterate these.
@@ -335,7 +338,8 @@ class LspBridgeService {
     if (rec == null) return true; // already gone
     final tip = await chain.seqTipHeight();
     if (!canAbandon(rec, seqTip: tip)) return false;
-    await LspBridgeStore.remove(rec.id);
+    await LspBridgeStore.remove(rec.id,
+        reason: 'user clear, CLTV-gated abandon allowed (state=${rec.state.name}, T_seq=${rec.seqLocktime}, tip=$tip)');
     return true;
   }
 
@@ -511,10 +515,17 @@ class LspBridgeService {
     // 3. Wait for the relayed leg. THE REFUND KEY IS A PROPERTY OF THE LEG WE ARE HANDED, not of the
     // handshake: the LSP may front the asset from its own inventory, and a fronted leg is refundable by
     // the LSP — so re-read maker_seq_refund_pub from the SAME response that carried the leg.
-    step('Waiting for the asset to lock to your key…');
+    step('Waiting for the asset to lock to your key… this waits on Bitcoin confirmations, typically '
+        '10-60+ minutes on testnet4. Safe to leave the app · the trade resumes from its in-flight card '
+        'on the Swap tab, and if it cannot complete every leg refunds on its own timeout.');
     BridgeLeg? leg;
     var legRefundPub = rec.makerRefundPub;
     var seqLt = rec.seqLocktime;
+    // HONEST DRIVE-TIME COPY (step strings only — the gates/ordering below are untouched): when the job
+    // reports the LSP is FRONTING the asset from its own inventory (front_mode 'inventory'), say the
+    // fast variant instead of leaving the 10-60+ minute line standing. Absent front_mode = maker-first
+    // (slow) — the default copy above stays.
+    var saidFronted = false;
     final legDeadline = DateTime.now().add(timing.legWait);
     for (;;) {
       final j = await chain.lspBridgeStatus(rec.poll.isNotEmpty ? rec.poll : rec.jobId);
@@ -524,6 +535,11 @@ class LspBridgeService {
         if (j!.makerSeqRefundPub != null && j.makerSeqRefundPub!.isNotEmpty) legRefundPub = j.makerSeqRefundPub!;
         if ((j.seqLocktime ?? 0) > 0) seqLt = j.seqLocktime!;
         break;
+      }
+      if (!saidFronted && j != null && j.frontedFromInventory) {
+        saidFronted = true;
+        step('The service is fronting your asset from its own inventory — no waiting on the maker\'s '
+            'Bitcoin confirmations · typically ${j.expectedWait ?? 'about a minute'}.');
       }
       if (j != null && j.status == 'failed') {
         throw Exception('The swap failed before the asset locked: ${j.error ?? 'unknown'} · your Bitcoin '
@@ -590,11 +606,18 @@ class LspBridgeService {
 
     // 4b. ANCHOR GATE: wait until the funding block is Bitcoin-anchor-buried — never reveal P against a
     // reorg-able asset HTLC. Fails closed on timeout (the hold refunds no-loss).
-    step('Waiting for the asset to anchor to Bitcoin…');
+    // A FRONTED leg arrived without the maker's confirmation wait, so the honest timescale here is the
+    // anchor burial alone — don't re-promise 10-60+ minutes the fast variant does not spend.
+    final anchorWait = saidFronted
+        ? 'usually quick for a fronted leg'
+        : 'typically 10-60+ minutes on testnet4';
+    step('Waiting for the asset to anchor to Bitcoin… $anchorWait. Safe to '
+        'leave the app · the trade resumes from its in-flight card.');
     final anchored = await chain.waitAnchorBuried(
       txid: leg.txid,
       minDepth: kSubMinAnchorDepth,
-      onWait: () => step('Waiting for the asset block to confirm and anchor to Bitcoin…'),
+      onWait: () => step('Waiting for the asset block to confirm and anchor to Bitcoin… $anchorWait. '
+          'Safe to leave the app · the trade resumes from its in-flight card.'),
     );
     if (!anchored) {
       throw Exception('The asset did not anchor to Bitcoin in time (NOT claiming; the hold expires no-loss).');
@@ -665,15 +688,20 @@ class LspBridgeService {
   /// targeted record when given, else the first record touched (compat).
   static Future<LspBridgeRecord?> resume({void Function(String)? onStep, LspBridgeRecord? record}) async {
     if (record != null) {
-      final fresh = await LspBridgeStore.load(id: record.id) ?? record;
-      return _resumeOne(fresh, onStep: onStep);
+      final fresh = await LspBridgeStore.load(id: record.id);
+      storeLog('bridge resume (targeted): id=${record.id} '
+          '${fresh == null ? 'NOT FOUND on disk (driving the caller\'s copy)' : 'found, state=${fresh.state.name}'}');
+      return _resumeOne(fresh ?? record, onStep: onStep);
     }
     List<LspBridgeRecord> recs;
     try {
       recs = await LspBridgeStore.loadAll();
-    } catch (_) {
+    } catch (e) {
+      storeLog('bridge resume: store UNREADABLE ($e) - nothing driven, records stay persisted');
       return null;
     }
+    storeLog('bridge resume: ${recs.length} record(s)'
+        '${recs.isEmpty ? '' : ' [${recs.map((r) => '${r.id}:${r.state.name}').join(', ')}]'}');
     LspBridgeRecord? first;
     await Future.wait([
       for (final r in recs)
@@ -684,8 +712,12 @@ class LspBridgeService {
   }
 
   static Future<LspBridgeRecord?> _resumeOne(LspBridgeRecord rec, {void Function(String)? onStep}) async {
-    if (rec.terminal) return rec;
+    if (rec.terminal) {
+      storeLog('bridge resume: id=${rec.id} terminal (state=${rec.state.name}) - nothing to drive');
+      return rec;
+    }
     if (rec.state == BridgeState.claiming && rec.legTxid.isNotEmpty && rec.legRedeem.isNotEmpty) {
+      storeLog('bridge resume: id=${rec.id} state=claiming - re-claim (window-gated)');
       // (A) Re-claim idempotently (a crash between the window re-check and the claim must never strand
       // the asset — we hold P). CLAIM-WINDOW GATE stays active (claimWindowGate:true in the web twin).
       final tip = await chain.seqTipHeight();
@@ -721,20 +753,24 @@ class LspBridgeService {
     if ((rec.state == BridgeState.held || rec.state == BridgeState.confirming || rec.state == BridgeState.unknown) &&
         (rec.jobId.isNotEmpty || rec.poll.isNotEmpty)) {
       // (C) The hold may be HELD: re-poll for the leg and run the identical verify->claim ladder.
+      storeLog('bridge resume: id=${rec.id} state=${rec.state.name} - re-polling the job (hold may be HELD)');
       try {
         return await _awaitLegVerifyAndClaim(rec, onStep: onStep);
       } catch (e) {
         rec.detail = e.toString().replaceFirst('Exception: ', '');
         await LspBridgeStore.save(rec);
+        storeLog('bridge resume: id=${rec.id} ladder paused (kept persisted): ${rec.detail}');
         return rec; // NEVER dropped — only a verified asset-in-our-key claim reveals P
       }
     }
     // Pre-commitment (no job posted, hold never paid): the session is gone and nothing moved — remove
     // exactly THIS record (never the whole store).
     if (!rec.holdsOrMightHoldValue) {
-      await LspBridgeStore.remove(rec.id);
+      await LspBridgeStore.remove(rec.id,
+          reason: 'resume: pre-commitment record (state=${rec.state.name}, no job/hold) - nothing was committed');
       return null;
     }
+    storeLog('bridge resume: id=${rec.id} state=${rec.state.name} holds value but has no job handle - kept persisted');
     return rec;
   }
 

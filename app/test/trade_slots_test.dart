@@ -32,10 +32,16 @@ const MethodChannel _channel = MethodChannel('plugins.it_nomads.com/flutter_secu
 class _FakeSecureStorage {
   final Map<String, String> data = {};
 
+  /// Simulate the Android keystore-invalidation incident's THROWING flavour: every read fails.
+  bool throwOnRead = false;
+
   Future<Object?> _handle(MethodCall call) async {
     final args = (call.arguments as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{};
     switch (call.method) {
       case 'read':
+        if (throwOnRead) {
+          throw PlatformException(code: 'keystore', message: 'javax.crypto.BadPaddingException');
+        }
         return data[args['key'] as String];
       case 'write':
         data[args['key'] as String] = args['value'] as String;
@@ -61,6 +67,25 @@ class _FakeSecureStorage {
 
   static void uninstall() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(_channel, null);
+  }
+}
+
+/// In-memory stand-in for the file mirror (the same seam pattern as the secure-storage fake above):
+/// unit tests never touch real path_provider.
+class _FakeMirror implements TradeMirrorTarget {
+  final Map<String, String> files = {};
+
+  @override
+  Future<String?> read(String listKey) async => files[listKey];
+
+  @override
+  Future<void> write(String listKey, String value) async {
+    files[listKey] = value;
+  }
+
+  @override
+  Future<void> delete(String listKey) async {
+    files.remove(listKey);
   }
 }
 
@@ -147,9 +172,12 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   late _FakeSecureStorage fake;
+  late _FakeMirror mirror;
 
   setUp(() async {
     fake = _FakeSecureStorage()..install();
+    mirror = _FakeMirror();
+    TradeListStore.mirror = mirror;
     await SubBuyStore.clear();
     await SubSellStore.clear();
     await SubswapStore.clear();
@@ -157,9 +185,13 @@ void main() {
     await LspBridgeStore.clear();
     await LnTakeStore.clear();
     fake.data.clear();
+    mirror.files.clear();
   });
 
-  tearDown(_FakeSecureStorage.uninstall);
+  tearDown(() {
+    _FakeSecureStorage.uninstall();
+    TradeListStore.mirror = FileTradeMirror();
+  });
 
   group('one-time migration (legacy adopt, never-lossy)', () {
     test('a legacy BUY record is adopted into the list, round-trips every field, and the legacy key empties', () async {
@@ -320,6 +352,102 @@ void main() {
         ),
         throwsA(predicate((e) => e.toString().contains('trades in progress'))),
       );
+    });
+  });
+
+  group('mirrored persistence (the keystore-invalidation incident)', () {
+    TradeListStore mk() => TradeListStore(listKey: 'test.mirror.list', legacyKey: 'test.mirror.legacy');
+
+    test('every successful write lands in BOTH secure storage and the mirror', () async {
+      final s = mk();
+      await s.upsert({'id': 'w1', 'state': 'held'});
+      expect(fake.data['test.mirror.list'], isNotNull);
+      expect(mirror.files['test.mirror.list'], fake.data['test.mirror.list'],
+          reason: 'the mirror rides every write, byte-identical');
+      await s.upsert({'id': 'w2', 'state': 'held'});
+      expect(mirror.files['test.mirror.list'], fake.data['test.mirror.list']);
+      // removeById keeps the mirror current too, and the empty-list tidy deletes BOTH.
+      await s.removeById('w1', reason: 'test');
+      expect(mirror.files['test.mirror.list'], fake.data['test.mirror.list']);
+      await s.removeById('w2', reason: 'test');
+      expect(fake.data.containsKey('test.mirror.list'), isFalse);
+      expect(mirror.files.containsKey('test.mirror.list'), isFalse);
+    });
+
+    test('secure storage EMPTY + mirror has records -> the mirror is ADOPTED and written back', () async {
+      // The incident shape: the keystore invalidation makes every secure read return null, so the
+      // store looks brand-new while the mirror still holds the live record.
+      mirror.files['test.mirror.list'] = jsonEncode([
+        {'id': 'a1', 'state': 'held'},
+      ]);
+      final read = await mk().readAll();
+      expect(read.entries, hasLength(1));
+      expect(read.entries.single['id'], 'a1');
+      expect(fake.data['test.mirror.list'], mirror.files['test.mirror.list'],
+          reason: 'adopted records are written back to secure storage');
+    });
+
+    test('a secure-storage read THROW falls back to the mirror', () async {
+      mirror.files['test.mirror.list'] = jsonEncode([
+        {'id': 'a2', 'state': 'claiming'},
+      ]);
+      fake.throwOnRead = true;
+      final read = await mk().readAll();
+      expect(read.entries.single['id'], 'a2');
+    });
+
+    test('a secure-storage read THROW with NO mirror copy still propagates (fail-safe unchanged)', () async {
+      fake.throwOnRead = true;
+      expect(mk().readAll(), throwsA(isA<PlatformException>()));
+    });
+
+    test('the mirror is NEVER adopted while secure storage HAS entries', () async {
+      final secureBlob = jsonEncode([
+        {'id': 'sec1', 'state': 'held'},
+      ]);
+      fake.data['test.mirror.list'] = secureBlob;
+      mirror.files['test.mirror.list'] = jsonEncode([
+        {'id': 'mir1', 'state': 'held'},
+        {'id': 'mir2', 'state': 'held'},
+      ]);
+      final read = await mk().readAll();
+      expect(read.entries.single['id'], 'sec1', reason: 'secure storage is authoritative when it yields entries');
+      expect(fake.data['test.mirror.list'], secureBlob, reason: 'no merge, no write-back');
+    });
+
+    test('a mutation on a keystore-nulled store cannot clobber the mirror (upsert adopts first)', () async {
+      // Regression guard for the write path: without the mirror-backed read-modify-write, the FIRST
+      // operation after a keystore null being an upsert would persist a 1-record list over the mirror.
+      mirror.files['test.mirror.list'] = jsonEncode([
+        {'id': 'live1', 'state': 'held'},
+      ]);
+      final s = mk();
+      await s.upsert({'id': 'new1', 'state': 'starting'});
+      final ids = (jsonDecode(mirror.files['test.mirror.list']!) as List).map((e) => (e as Map)['id']).toSet();
+      expect(ids, {'live1', 'new1'});
+    });
+
+    test('wipeAll clears BOTH targets', () async {
+      final s = mk();
+      await s.upsert({'id': 'w', 'state': 'held'});
+      expect(mirror.files.containsKey('test.mirror.list'), isTrue);
+      await s.wipeAll();
+      expect(fake.data.containsKey('test.mirror.list'), isFalse);
+      expect(mirror.files.containsKey('test.mirror.list'), isFalse);
+    });
+
+    test('END-TO-END incident replay: a HELD bridge record survives a secure-storage wipe via the mirror', () async {
+      // Persist a held bridged buy, null out secure storage (the process-restart keystore failure),
+      // and confirm the store still surfaces the record - card, slot count and resume all read it.
+      await LspBridgeStore.save(_bridge(id: 'held-1'));
+      fake.data.clear(); // the keystore invalidation: every secure read now returns null
+      final all = await LspBridgeStore.loadAll();
+      expect(all, hasLength(1));
+      expect(all.single.id, 'held-1');
+      expect(all.single.state, BridgeState.held);
+      expect(await LspBridgeStore.inFlightWithFunds(), hasLength(1),
+          reason: 'the in-flight card and slot count see the mirrored record');
+      expect(fake.data['ambra.bridges'], isNotNull, reason: 'adopted back into secure storage');
     });
   });
 }

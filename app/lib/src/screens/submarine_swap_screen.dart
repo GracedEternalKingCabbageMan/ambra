@@ -230,6 +230,8 @@ class _SubmarineSwapScreenState extends State<SubmarineSwapScreen> {
             ['Direction', 'Buy $_tk with Bitcoin over Lightning · receive $_tk on-chain'],
             ['You pay', btcStr],
             ['You receive', assetStr],
+            ['How long', 'Settles at Sequentia speed · typically about a minute. Your Lightning payment '
+                'never waits on Bitcoin confirmations to receive the $_tk.'],
             ['Fund-safety', 'Your device VERIFIES the on-chain $_tk is locked to YOUR key on the secret hash (right '
                 'asset, amount, timeout), that the invoice it pays is bound to the SAME secret hash and price, and that '
                 'the $_tk is anchor-buried under Bitcoin — ALL before it pays. The only way to learn the secret is to pay.'],
@@ -242,6 +244,7 @@ class _SubmarineSwapScreenState extends State<SubmarineSwapScreen> {
             ['Direction', 'Sell $_tk on-chain · receive Bitcoin over Lightning'],
             ['You sell', assetStr],
             ['You receive', btcStr],
+            ['How long', 'Settles at Sequentia speed · typically about a minute.'],
             ['Fund-safety', 'You receive the Bitcoin the instant you settle your held Lightning invoice with the '
                 'secret — which is also what reveals it to the maker. You never reveal the secret without capturing the Bitcoin.'],
             ['Finality', 'The Bitcoin arrives over Lightning; the $_tk leg is a single on-chain HTLC.'],
