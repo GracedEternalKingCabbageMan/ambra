@@ -2,7 +2,6 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:crypto/crypto.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
 import '../rust/api.dart' as core;
@@ -11,6 +10,7 @@ import 'config.dart';
 import 'lightning_service.dart';
 import 'lsp_client.dart';
 import 'trade_receipts.dart';
+import 'trade_slots.dart';
 import 'wallet_repository.dart';
 
 /// A conservative fee (sats) for the legacy-P2SH BTC HTLC claim spend (~200 vB at ~2 sat/vB),
@@ -35,6 +35,7 @@ enum SubSellStep {
 
 class SubSellRecord {
   SubSellRecord({
+    String? id,
     required this.step,
     required this.asset,
     required this.ticker,
@@ -51,8 +52,11 @@ class SubSellRecord {
     this.startedMs,
     this.claimTxid = '',
     this.shortfall = false,
-  });
+  }) : id = id ?? newTradeId();
 
+  /// Stable per-record id (multi-record store): every save upserts on it, so a second sell can never
+  /// overwrite this record's preimage/HTLC terms (the recovery handle).
+  final String id;
   SubSellStep step;
   final String asset; // the Sequentia asset paid over Lightning
   final String ticker;
@@ -81,6 +85,7 @@ class SubSellRecord {
   BigInt get gotBtc => btcLeg?.amount ?? BigInt.zero;
 
   Map<String, dynamic> toJson() => {
+        'id': id,
         'step': step.name,
         'asset': asset,
         'ticker': ticker,
@@ -100,6 +105,7 @@ class SubSellRecord {
       };
 
   static SubSellRecord fromJson(Map<String, dynamic> j) => SubSellRecord(
+        id: '${j['id'] ?? ''}'.isEmpty ? null : '${j['id']}',
         step: SubSellStep.values.firstWhere((s) => s.name == j['step'], orElse: () => SubSellStep.failed),
         asset: '${j['asset']}',
         ticker: '${j['ticker']}',
@@ -126,25 +132,64 @@ class SubSellRecord {
   bool get inFlight => step == SubSellStep.claiming || step == SubSellStep.paying;
 }
 
-/// Persists the single active sub-asset SELL. It carries the preimage (the only thing that claims the
-/// BTC), so it lives in secure storage. A distinct key from the BUY store so the two never clobber.
+/// Persists the active sub-asset SELLs — a MULTI-RECORD list (web SELLS array) under a NEW key, with
+/// one-time never-lossy adoption of the legacy single-slot record ('ambra.subasset.sell.active'). Each
+/// record carries the preimage (the only thing that claims the BTC), so it lives in secure storage;
+/// every save upserts by [SubSellRecord.id]. A distinct key from the BUY store so the two never mix.
 class SubSellStore {
   SubSellStore._();
-  static const _key = 'ambra.subasset.sell.active';
-  static const _storage = FlutterSecureStorage();
+  static final TradeListStore _list =
+      TradeListStore(listKey: 'ambra.subasset.sells', legacyKey: 'ambra.subasset.sell.active');
 
-  static Future<SubSellRecord?> load() async {
-    final s = await _storage.read(key: _key);
-    if (s == null || s.isEmpty) return null;
-    try {
-      return SubSellRecord.fromJson(jsonDecode(s) as Map<String, dynamic>);
-    } catch (_) {
-      return null;
+  /// Every persisted sell record. Undecodable entries are skipped here but PRESERVED on disk.
+  static Future<List<SubSellRecord>> loadAll() async {
+    final read = await _list.readAll();
+    final out = <SubSellRecord>[];
+    for (final e in read.entries) {
+      try {
+        out.add(SubSellRecord.fromJson(e));
+      } catch (_) {/* preserved on disk; not drivable by this build */}
     }
+    return out;
   }
 
-  static Future<void> save(SubSellRecord r) => _storage.write(key: _key, value: jsonEncode(r.toJson()));
-  static Future<void> clear() => _storage.delete(key: _key);
+  /// The sells still protecting a recovery handle (paying/claiming) — guard + cards + resume iterate these.
+  static Future<List<SubSellRecord>> activeAll() async =>
+      (await loadAll()).where((r) => r.inFlight).toList();
+
+  /// Compat single-record read: by [id] when given, else the first in-flight, else the most recent.
+  static Future<SubSellRecord?> load({String? id}) async {
+    final all = await loadAll();
+    if (all.isEmpty) return null;
+    if (id != null && id.isNotEmpty) {
+      for (final r in all) {
+        if (r.id == id) return r;
+      }
+      return null;
+    }
+    for (final r in all) {
+      if (r.inFlight) return r;
+    }
+    return all.first;
+  }
+
+  static Future<void> save(SubSellRecord r) => _list.upsert(r.toJson());
+
+  /// Remove ONE record by id (a finished sell, or a definitively-dead 'paying' stub).
+  static Future<void> remove(String id) => _list.removeById(id);
+
+  /// Drop terminal records before starting a new sell (bounded-list hygiene). A record still in
+  /// flight — even 'paying' (asset possibly paid) — is NEVER pruned.
+  static Future<void> pruneSettled() => _list.removeWhere((e) {
+        try {
+          return !SubSellRecord.fromJson(e).inFlight;
+        } catch (_) {
+          return false; // undecodable: keep — it may represent a live trade
+        }
+      });
+
+  /// TEST-ONLY full wipe.
+  static Future<void> clear() => _list.wipeAll();
 }
 
 /// Drives the sub-asset SELL from LOCAL state: pay the asset over Lightning, then CLAIM the maker's
@@ -200,12 +245,10 @@ class SubassetSellService {
         s.contains('connection refused');
   }
 
-  /// True while a sell is persisted with its BTC claim not yet confirmed — the single-active guard +
-  /// the screen's gating both read this so a second sell can never overwrite the recovery handle.
-  static Future<bool> hasInFlight() async {
-    final r = await SubSellStore.load();
-    return r != null && r.inFlight;
-  }
+  /// True while any sell is persisted with its BTC claim not yet confirmed. With the multi-record
+  /// store this no longer hard-blocks a second sell (records upsert by id); the shared [TradeSlots]
+  /// bound gates new dispatches.
+  static Future<bool> hasInFlight() async => (await SubSellStore.activeAll()).isNotEmpty;
 
   /// Pay the asset over Lightning, learn the preimage + the maker's BTC HTLC terms, PERSIST them, then
   /// claim the BTC on-chain. FUND-SAFETY: the asset is paid inside [LightningService.swapSub]; the
@@ -221,10 +264,12 @@ class SubassetSellService {
     }
     _starting = true;
     try {
-      if (await hasInFlight()) {
-        throw Exception('You already have a sub-asset sell in progress (claiming your BTC). '
-            'Finish or retry it first.');
-      }
+      // SHARED SLOT GATE (web buySlotsFree): a second sell can no longer overwrite the persisted
+      // preimage/HTLC (records upsert by id), so the single-slot hard refusal is replaced by the
+      // bounded concurrent-trade count. Prune finished records first so they never eat a slot.
+      await SubSellStore.pruneSettled();
+      final refusal = await TradeSlots.refusalIfFull();
+      if (refusal != null) throw Exception(refusal);
       final m = await _mnemonic();
       final ticker = SeqAssets.labelFor(asset).ticker;
       final qh = (quoteAsset != null && quoteAsset.isNotEmpty) ? quoteAsset : null;
@@ -242,7 +287,7 @@ class SubassetSellService {
       // after the LSP already paid the asset, resume() re-calls with this SAME nonce and the LSP
       // returns the settled result idempotently (it never re-pays for a stored nonce).
       final swapNonce = _newSwapNonce();
-      await SubSellStore.save(SubSellRecord(
+      final paying = SubSellRecord(
         step: SubSellStep.paying,
         asset: asset,
         ticker: ticker,
@@ -254,7 +299,8 @@ class SubassetSellService {
         offerId: offer?.offerId,
         makerPubkey: offer?.makerPubkey,
         startedMs: DateTime.now().millisecondsSinceEpoch,
-      ));
+      );
+      await SubSellStore.save(paying);
       var paidCallStarted = false;
       try {
         // Pay the asset over Lightning; on settle the maker reveals the preimage, returned WITH the BTC
@@ -280,8 +326,10 @@ class SubassetSellService {
           throw Exception('The sell did not settle over Lightning.');
         }
         // PERSIST BEFORE the on-chain claim: the asset is now paid, so the BTC claim is the fund step and
-        // MUST survive a reload — resume() re-attempts it from here.
+        // MUST survive a reload — resume() re-attempts it from here. SAME id as the 'paying' record, so
+        // the upsert REPLACES it in place (never a second record for the same trade).
         final rec = SubSellRecord(
+          id: paying.id,
           step: SubSellStep.claiming,
           asset: asset,
           ticker: ticker,
@@ -298,10 +346,11 @@ class SubassetSellService {
       } catch (e) {
         // A LOST RESPONSE (network error after we may have paid) KEEPS the 'paying' record so resume()
         // recovers via the nonce; a DEFINITIVE rejection (LSP ok:false — the sell never settled) means
-        // NO asset was paid, so discard it (else it blocks future sells + re-runs on the next resume).
+        // NO asset was paid, so discard THIS record by id (never the whole store — other sells' records
+        // are their own trades' recovery handles).
         if (paidCallStarted && !_payMayHaveCompleted(e)) {
-          final cur = await SubSellStore.load();
-          if (cur != null && cur.step == SubSellStep.paying) await SubSellStore.clear();
+          final cur = await SubSellStore.load(id: paying.id);
+          if (cur != null && cur.step == SubSellStep.paying) await SubSellStore.remove(paying.id);
         }
         rethrow;
       }
@@ -461,12 +510,22 @@ class SubassetSellService {
     return (got > 0 && amt > 0) ? got / amt : null;
   }
 
-  /// On wallet load / cold start: if a sell paid the asset but its BTC claim never confirmed, re-attempt
-  /// the claim (the preimage + HTLC terms are persisted). The fund-recovery path. Leaves the record in
-  /// place on success (terminal 'done'); a failure keeps it 'claiming' for the next retry.
+  /// On wallet load / cold start: for EVERY persisted in-flight sell, re-attempt the claim (asset paid,
+  /// preimage known) or the nonce-recovery (asset possibly paid, response lost). The fund-recovery
+  /// path. Records are driven INDEPENDENTLY (concurrently) so one stuck counterparty never blocks
+  /// another's claim (the web resumeSell over activeSells).
   static Future<void> resume() async {
-    final rec = await SubSellStore.load();
-    if (rec == null) return;
+    List<SubSellRecord> recs;
+    try {
+      recs = await SubSellStore.activeAll();
+    } catch (_) {
+      return; // unreadable store: records stay persisted for the next resume
+    }
+    await Future.wait([for (final r in recs) _resumeOne(r).catchError((Object _) {})]);
+  }
+
+  /// Resume ONE persisted sell (the old single-record resume body, per record).
+  static Future<void> _resumeOne(SubSellRecord rec) async {
     // (A) Asset paid + response received: preimage + HTLC persisted -> re-attempt the on-chain claim.
     if (rec.step == SubSellStep.claiming && rec.preimage.isNotEmpty) {
       try {
@@ -486,7 +545,7 @@ class SubassetSellService {
       // still-'paying' record this old can't complete — clear it rather than re-attempt (or re-run) forever.
       final startedMs = rec.startedMs ?? 0;
       if (startedMs > 0 && DateTime.now().millisecondsSinceEpoch - startedMs > _kPayingTtlMs) {
-        await SubSellStore.clear();
+        await SubSellStore.remove(rec.id); // only THIS dead record; others keep their handles
         return;
       }
       try {
@@ -516,6 +575,7 @@ class SubassetSellService {
         final s = resp.settle;
         if (!(s.settled && s.preimage.isNotEmpty && s.btcHtlc != null)) return; // not settled yet; keep for a later retry
         final claiming = SubSellRecord(
+          id: rec.id, // upsert REPLACES the 'paying' record in place
           step: SubSellStep.claiming,
           asset: asset,
           ticker: rec.ticker,

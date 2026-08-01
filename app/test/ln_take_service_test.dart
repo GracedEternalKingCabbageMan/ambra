@@ -168,7 +168,7 @@ void main() {
       expect(v, isNotNull);
       expect(v!.settled, isFalse);
       expect(await LnTakeStore.load(), isNotNull);
-      await LnTakeService.dismiss();
+      await LnTakeService.dismiss((await LnTakeStore.load())!);
       expect(await LnTakeStore.load(), isNull);
     });
 

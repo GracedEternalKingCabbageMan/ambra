@@ -25,10 +25,13 @@
 //      (a courier secret_revealed is only a verified fast-path hint), then claim the maker's BTC leg.
 //   6. Refund off-ramp: after T_seq, reclaim our asset via the CLTV branch if the maker never claimed.
 //
-// Persistence is a single-slot secure-storage record ('ambra.xrswap.active', the XchainStore /
-// SubswapStore idiom). The on-chain tail (settle / claim / refund) is resumable across restarts;
-// pre-funding courier state is NOT resumable by design — the WS session dies with the process, and an
-// unfunded record is safely abandonable (provably so, via the broadcast-intent flag).
+// Persistence is a MULTI-RECORD secure-storage list ('ambra.xrswaps', the TradeListStore substrate),
+// with one-time never-lossy adoption of the legacy single-slot record ('ambra.xrswap.active'). Every
+// save upserts by record id, so concurrent sells never clobber each other's reclaim material; the
+// shared TradeSlots bound gates new dispatches. The on-chain tail (settle / claim / refund) is
+// resumable across restarts, per record; pre-funding courier state is NOT resumable by design — the
+// WS session dies with the process, and an unfunded record is safely abandonable (provably so, via
+// the broadcast-intent flag).
 //
 // The chain/courier surfaces are seams ([XrChain], [XrCourier]) so the state machine is unit-testable;
 // the live implementations call the SAME ambra_core FFIs the forward flow uses (xchainBtcHtlc,
@@ -39,7 +42,6 @@ import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart' show visibleForTesting;
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
 import '../rust/api.dart' as core;
@@ -47,6 +49,7 @@ import 'api_client.dart';
 import 'config.dart';
 import 'cross_courier.dart';
 import 'seqob_client.dart' show CrossOffer;
+import 'trade_slots.dart';
 import 'tx_flow.dart';
 import 'wallet_repository.dart';
 
@@ -109,6 +112,7 @@ class XrSeqLeg {
 /// from which the CLTV refund script is re-derived, so losing it while the asset is locked strands it.
 class XrSwapRecord {
   XrSwapRecord({
+    String? id,
     required this.step,
     required this.offerId,
     required this.makerPubkey,
@@ -139,8 +143,10 @@ class XrSwapRecord {
     this.btcClaimTxid = '',
     this.seqRefundTxid = '',
     this.detail = '',
-  });
+  }) : id = id ?? newTradeId();
 
+  /// Stable per-record id (multi-record store): saves upsert on it, so records never clobber.
+  final String id;
   XrStep step;
   final String offerId;
   final String makerPubkey;
@@ -173,6 +179,7 @@ class XrSwapRecord {
   String detail;
 
   Map<String, dynamic> toJson() => {
+        'id': id,
         'step': step.name,
         'offerId': offerId,
         'makerPubkey': makerPubkey,
@@ -206,6 +213,7 @@ class XrSwapRecord {
       };
 
   static XrSwapRecord fromJson(Map<String, dynamic> j) => XrSwapRecord(
+        id: '${j['id'] ?? ''}'.isEmpty ? null : '${j['id']}',
         // An unrecognised persisted step decodes NON-terminal (never silently "done"): `failed` keeps the
         // record visible + its refund/abandon guards keyed on the funded evidence (the subswap lesson).
         step: XrStep.values.firstWhere((s) => s.name == j['step'], orElse: () => XrStep.failed),
@@ -253,34 +261,55 @@ class XrSwapRecord {
       !terminal && (seqLeg != null || seqFundTxid.isNotEmpty || broadcastAttempted);
 }
 
-/// Persists the single active reverse swap (single-slot, secure storage) — the XchainStore twin under
-/// its own key so a reverse sell never clobbers a forward buy. load() returning null NEVER deletes the
-/// stored blob; only an explicit [clear] does.
+/// Persists the active reverse swaps — a MULTI-RECORD list under a new key with one-time never-lossy
+/// adoption of the legacy single-slot record. A read NEVER deletes stored material; only an explicit
+/// per-record [remove] does. Distinct keys from the forward-cross store so the two never mix.
 class XrSwapStore {
   XrSwapStore._();
-  static const _key = 'ambra.xrswap.active';
-  static const _storage = FlutterSecureStorage();
+  static final TradeListStore _list =
+      TradeListStore(listKey: 'ambra.xrswaps', legacyKey: 'ambra.xrswap.active');
 
-  static Future<XrSwapRecord?> load() async {
-    final s = await _storage.read(key: _key);
-    if (s == null || s.isEmpty) return null;
-    try {
-      return XrSwapRecord.fromJson(jsonDecode(s) as Map<String, dynamic>);
-    } catch (_) {
+  /// Every persisted reverse-swap record. Undecodable entries are skipped but PRESERVED on disk.
+  static Future<List<XrSwapRecord>> loadAll() async {
+    final read = await _list.readAll();
+    final out = <XrSwapRecord>[];
+    for (final e in read.entries) {
+      try {
+        out.add(XrSwapRecord.fromJson(e));
+      } catch (_) {/* preserved on disk; not drivable by this build */}
+    }
+    return out;
+  }
+
+  /// Compat single-record read: by [id] when given, else the first with (possible) funds, else the
+  /// most recent record.
+  static Future<XrSwapRecord?> load({String? id}) async {
+    final all = await loadAll();
+    if (all.isEmpty) return null;
+    if (id != null && id.isNotEmpty) {
+      for (final r in all) {
+        if (r.id == id) return r;
+      }
       return null;
     }
+    for (final r in all) {
+      if (r.holdsOrMightHoldAsset) return r;
+    }
+    return all.first;
   }
 
-  static Future<void> save(XrSwapRecord r) => _storage.write(key: _key, value: jsonEncode(r.toJson()));
-  static Future<void> clear() => _storage.delete(key: _key);
+  static Future<void> save(XrSwapRecord r) => _list.upsert(r.toJson());
 
-  /// A persisted swap the single-slot store must protect: non-terminal AND holding (or possibly holding)
-  /// a locked asset leg. Callers guard on this before starting a new sell.
-  static Future<XrSwapRecord?> inFlightWithFunds() async {
-    final r = await load();
-    if (r == null) return null;
-    return r.holdsOrMightHoldAsset ? r : null;
-  }
+  /// Remove ONE record by id (after the guarded abandon / terminal cleanup) — never the whole store.
+  static Future<void> remove(String id) => _list.removeById(id);
+
+  /// The persisted swaps the store must protect: non-terminal AND holding (or possibly holding) a
+  /// locked asset leg. The slot count + the composer's in-flight cards + resume iterate these.
+  static Future<List<XrSwapRecord>> inFlightWithFunds() async =>
+      (await loadAll()).where((r) => r.holdsOrMightHoldAsset).toList();
+
+  /// TEST-ONLY full wipe.
+  static Future<void> clear() => _list.wipeAll();
 }
 
 /// The courier seam the reverse driver talks through — [CrossCourier]'s exact surface, abstracted so the
@@ -563,11 +592,13 @@ class XrSwapService {
   }) async {
     void step(String s) => onStep?.call(s);
 
-    // Single-slot guard: never overwrite a record that still protects a locked asset leg.
-    if (await XrSwapStore.inFlightWithFunds() != null) {
+    // SHARED SLOT GATE (web tradeSlotsFree): records upsert by id so a second sell can never overwrite
+    // a record protecting a locked asset leg — the single-slot hard refusal is replaced by the bounded
+    // concurrent-trade count across all rail-crossing kinds.
+    final refusal = await TradeSlots.refusalIfFull();
+    if (refusal != null) {
       await courier.close();
-      throw Exception('You already have a cross-chain sell in progress with a locked asset. '
-          'Finish or refund it first before starting another.');
+      throw Exception(refusal);
     }
 
     // Price OUR slice at the offer's OWN ratio, FLOOR (the maker's favour) — the SAME value the maker
@@ -617,6 +648,8 @@ class XrSwapService {
       throw XrNoMakerException('The maker did not lock any Bitcoin. Nothing was spent - try the next offer.');
     }
 
+    // The record id, hoisted so the post-courier settle tail can reload THIS record by id.
+    late final String recId;
     try {
       final leg = (locked['leg'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{};
       final tBtc = _int(leg['locktime']) != 0 ? _int(leg['locktime']) : _int(locked['btc_locktime']);
@@ -657,6 +690,7 @@ class XrSwapService {
         btcLegRedeemScript: '${leg['redeem_script'] ?? ''}',
         btcP2shSpkHex: rebuilt.p2ShSpkHex,
       );
+      recId = rec.id;
 
       // 2. Reject bad terms BEFORE funding — slice-vs-slice binding (mirrors xdriver_reverse.go:182-189
       //    and xrswap.js): the maker must pay exactly the proportional BTC for OUR slice, in the terms
@@ -813,12 +847,12 @@ class XrSwapService {
     }
 
     // 6. Settle on-chain (courier no longer needed): read the revealed secret from the maker's claim and
-    //    claim the BTC leg. Resumable across restarts.
-    final rec2 = await XrSwapStore.load();
+    //    claim the BTC leg. Resumable across restarts. Reload THIS record by id (multi-record store).
+    final rec2 = await XrSwapStore.load(id: recId);
     if (rec2 != null && !rec2.terminal && rec2.step != XrStep.failed && rec2.seqLeg != null) {
       return settle(rec2, onStep: onStep);
     }
-    return (await XrSwapStore.load())!;
+    return (await XrSwapStore.load(id: recId))!;
   }
 
   /// Wait for OUR asset funding to confirm to a matched HTLC output (FAIL CLOSED on an spk no-match —
@@ -952,10 +986,29 @@ class XrSwapService {
   ///   seqFundTxid persisted -> the app died in the confirm wait: re-confirm, adopt the leg, settle
   ///   broadcast intent only -> fund() threw after the node may have accepted the tx (a lost response):
   ///                            scan the HTLC address, ADOPT the found txid, then resume — never re-fund.
-  /// Returns the record (possibly advanced), or null when nothing is persisted.
-  static Future<XrSwapRecord?> resume({void Function(String)? onStep}) async {
-    final rec = await XrSwapStore.load();
-    if (rec == null || rec.terminal) return rec;
+  /// Returns the record (possibly advanced), or null when nothing is persisted. With the multi-record
+  /// store, EVERY non-terminal record is resumed INDEPENDENTLY (one stuck maker never blocks another
+  /// record's settle/refund); [record] targets a specific one (the resume sheet). The return value is
+  /// the targeted record when given, else the first record touched (compat).
+  static Future<XrSwapRecord?> resume({void Function(String)? onStep, XrSwapRecord? record}) async {
+    if (record != null) return _resumeOne(record, onStep: onStep);
+    List<XrSwapRecord> recs;
+    try {
+      recs = await XrSwapStore.loadAll();
+    } catch (_) {
+      return null;
+    }
+    XrSwapRecord? first;
+    await Future.wait([
+      for (final r in recs)
+        if (!r.terminal)
+          _resumeOne(r, onStep: onStep).then((v) => first ??= v).catchError((Object _) => null),
+    ]);
+    return first;
+  }
+
+  static Future<XrSwapRecord?> _resumeOne(XrSwapRecord rec, {void Function(String)? onStep}) async {
+    if (rec.terminal) return rec;
     if (rec.seqLeg != null) {
       if (rec.btcClaimTxid.isNotEmpty) return rec;
       return settle(rec, onStep: onStep);
@@ -1063,16 +1116,14 @@ class XrSwapService {
   /// might hold a locked asset: it carries the only copy of the terms the CLTV refund is derived from.
   static bool canAbandon(XrSwapRecord rec) => rec.terminal || !rec.holdsOrMightHoldAsset;
 
-  /// Clear the slot — refused (returns false) while the record still protects a locked (or possibly
-  /// locked) asset leg. Refund it first (after T_seq), or let [resume] resolve the strand.
-  static Future<bool> abandon() async {
-    final rec = await XrSwapStore.load();
-    if (rec == null) {
-      await XrSwapStore.clear();
-      return true;
-    }
+  /// Clear ONE record — refused (returns false) while it still protects a locked (or possibly locked)
+  /// asset leg. Refund it first (after T_seq), or let [resume] resolve the strand. Judged on the FRESH
+  /// on-disk record by id (never a stale UI copy), and removes exactly that record.
+  static Future<bool> abandon(XrSwapRecord record) async {
+    final rec = await XrSwapStore.load(id: record.id);
+    if (rec == null) return true; // already gone
     if (!canAbandon(rec)) return false;
-    await XrSwapStore.clear();
+    await XrSwapStore.remove(rec.id);
     return true;
   }
 

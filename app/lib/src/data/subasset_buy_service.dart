@@ -1,6 +1,5 @@
 import 'dart:convert';
 
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
 import '../rust/api.dart' as core;
@@ -9,6 +8,7 @@ import 'config.dart';
 import 'lightning_service.dart';
 import 'lsp_client.dart';
 import 'trade_receipts.dart';
+import 'trade_slots.dart';
 import 'wallet_repository.dart';
 
 /// T safety delta over the funding chain's current tip (parent-chain blocks for the BTC shape,
@@ -43,6 +43,7 @@ enum SubBuyStep {
 
 class SubBuyRecord {
   SubBuyRecord({
+    String? id,
     required this.step,
     required this.asset,
     required this.ticker,
@@ -67,8 +68,11 @@ class SubBuyRecord {
     this.refundTxid = '',
     this.detail = '',
     this.emptyScans = 0,
-  });
+  }) : id = id ?? newTradeId();
 
+  /// Stable per-record id (multi-record store) — every save upserts on it, so a second buy can never
+  /// clobber this record's P + funding outpoint (the recovery handle).
+  final String id;
   SubBuyStep step;
   final String asset; // the Sequentia asset received over Lightning
   final String ticker;
@@ -103,6 +107,7 @@ class SubBuyRecord {
   int emptyScans;
 
   Map<String, dynamic> toJson() => {
+        'id': id,
         'step': step.name,
         'asset': asset,
         'ticker': ticker,
@@ -130,6 +135,7 @@ class SubBuyRecord {
       };
 
   static SubBuyRecord fromJson(Map<String, dynamic> j) => SubBuyRecord(
+        id: '${j['id'] ?? ''}'.isEmpty ? null : '${j['id']}',
         step: SubBuyStep.values.firstWhere((s) => s.name == j['step'], orElse: () => SubBuyStep.failed),
         asset: '${j['asset']}',
         ticker: '${j['ticker']}',
@@ -180,26 +186,69 @@ class SubBuyRecord {
   bool get terminal => step == SubBuyStep.settled || step == SubBuyStep.refunded || step == SubBuyStep.failed;
 }
 
-/// Persists the single active sub-asset BUY. It carries P (the only thing that settles the asset +
-/// releases the BTC) and the funding outpoint, so it lives in secure storage. A distinct key from the
-/// SELL store so the two never clobber.
+/// Persists the active sub-asset BUYs — a MULTI-RECORD list (web BUYS array) under a NEW key, with
+/// one-time never-lossy adoption of the legacy single-slot record ('ambra.subasset.buy.active'). Each
+/// record carries P (the only thing that settles the asset + releases the BTC) and the funding
+/// outpoint, so it lives in secure storage; every save upserts by [SubBuyRecord.id] so records never
+/// clobber each other. A distinct key from the SELL store so the two never mix.
 class SubBuyStore {
   SubBuyStore._();
-  static const _key = 'ambra.subasset.buy.active';
-  static const _storage = FlutterSecureStorage();
+  static final TradeListStore _list =
+      TradeListStore(listKey: 'ambra.subasset.buys', legacyKey: 'ambra.subasset.buy.active');
 
-  static Future<SubBuyRecord?> load() async {
-    final s = await _storage.read(key: _key);
-    if (s == null || s.isEmpty) return null;
-    try {
-      return SubBuyRecord.fromJson(jsonDecode(s) as Map<String, dynamic>);
-    } catch (_) {
-      return null;
+  /// Every persisted buy record (terminal ones included, until pruned at the next begin). Undecodable
+  /// entries are skipped here but PRESERVED on disk (never dropped by a read).
+  static Future<List<SubBuyRecord>> loadAll() async {
+    final read = await _list.readAll();
+    final out = <SubBuyRecord>[];
+    for (final e in read.entries) {
+      try {
+        out.add(SubBuyRecord.fromJson(e));
+      } catch (_) {/* preserved on disk; not drivable by this build */}
     }
+    return out;
   }
 
-  static Future<void> save(SubBuyRecord r) => _storage.write(key: _key, value: jsonEncode(r.toJson()));
-  static Future<void> clear() => _storage.delete(key: _key);
+  /// The buys whose BTC is (or may be) locked — what the guard, the composer cards and resume iterate.
+  static Future<List<SubBuyRecord>> activeAll() async =>
+      (await loadAll()).where((r) => r.inFlight).toList();
+
+  /// Compat single-record read: the record with [id] when given, else the first in-flight record,
+  /// else the most recent record of any state (so a just-settled buy still renders its done view).
+  static Future<SubBuyRecord?> load({String? id}) async {
+    final all = await loadAll();
+    if (all.isEmpty) return null;
+    if (id != null && id.isNotEmpty) {
+      for (final r in all) {
+        if (r.id == id) return r;
+      }
+      return null;
+    }
+    for (final r in all) {
+      if (r.inFlight) return r;
+    }
+    return all.first;
+  }
+
+  static Future<void> save(SubBuyRecord r) => _list.upsert(r.toJson());
+
+  /// Remove ONE record by id (a finished/abandoned buy) — never the whole store.
+  static Future<void> remove(String id) => _list.removeById(id);
+
+  /// Drop terminal records + never-funded secretReady stubs before starting a new buy (the bounded-list
+  /// hygiene the single slot got for free). A record that is (or may be) holding funds is NEVER pruned.
+  static Future<void> pruneSettled() =>
+      _list.removeWhere((e) {
+        try {
+          final r = SubBuyRecord.fromJson(e);
+          return r.terminal || (r.step == SubBuyStep.secretReady && r.fundingTxid.isEmpty);
+        } catch (_) {
+          return false; // undecodable: keep — it may represent a live trade
+        }
+      });
+
+  /// TEST-ONLY full wipe.
+  static Future<void> clear() => _list.wipeAll();
 }
 
 /// The sized fill of a sub-asset BUY against one resting offer. PURE (unit-tested). `offerBtc` /
@@ -248,12 +297,10 @@ class SubassetBuyService {
     return m;
   }
 
-  /// True while a buy has (or may have) locked BTC that is not yet settled/refunded — the guard + the
-  /// screen's gating both read this so a second buy can never overwrite the recovery handle.
-  static Future<bool> hasInFlight() async {
-    final r = await SubBuyStore.load();
-    return r != null && r.inFlight;
-  }
+  /// True while any buy has (or may have) locked BTC that is not yet settled/refunded. With the
+  /// multi-record store this no longer hard-blocks a second buy (records upsert by id, so nothing can
+  /// be overwritten); the shared [TradeSlots] bound is what gates new dispatches.
+  static Future<bool> hasInFlight() async => (await SubBuyStore.activeAll()).isNotEmpty;
 
   /// Build P/H, size this fill (BigInt partial-fill), pick T_btc, build the BTC HTLC, and PERSIST —
   /// all BEFORE any money moves. Refuses to start while another buy's BTC is still committed (that
@@ -281,14 +328,13 @@ class SubassetBuyService {
     BigInt? reqBtcSats,
     String? quoteAsset,
   }) async {
-    // FUND-SAFETY self-guard: a second buy would overwrite the persisted P + funding outpoint — the
-    // single handle to the locked BTC. Refuse while one is still committed. (A prior secretReady stub,
-    // with nothing locked, is safe to overwrite.)
-    final existing = await SubBuyStore.load();
-    if (existing != null && existing.inFlight) {
-      throw Exception('You already have a sub-asset buy in progress (Bitcoin locked). '
-          'Finish or refund it first.');
-    }
+    // SHARED SLOT GATE (web buySlotsFree): records upsert by id so a second buy can never overwrite
+    // another's persisted P + funding outpoint — the old single-slot hard refusal is replaced by the
+    // bounded concurrent-trade count across all rail-crossing kinds. Prune finished/never-funded
+    // records first so a done trade never eats a slot.
+    await SubBuyStore.pruneSettled();
+    final refusal = await TradeSlots.refusalIfFull();
+    if (refusal != null) throw Exception(refusal);
     if (offer.makerClaimPub.isEmpty) {
       throw Exception('No resting ${SeqAssets.labelFor(asset).ticker} buy offer right now; try again shortly.');
     }
@@ -657,22 +703,34 @@ class SubassetBuyService {
     return tip > 0 && tip >= r.tBtc;
   }
 
-  /// On wallet load / cold start: if a buy locked its BTC HTLC but never completed, resume it — settle
-  /// once the asset is held, or refund the BTC once past T_btc. Fire-and-forget from the shell; loops
-  /// the idempotent [drive] step (bounded) so a locked HTLC recovers even if the user never opens the
-  /// screen. The fund-recovery path (mirrors the web's resumeBuy).
+  /// On wallet load / cold start: resume EVERY buy that locked its BTC HTLC but never completed —
+  /// settle once the asset is held, or refund the BTC once past T_btc. Fire-and-forget from the shell;
+  /// each record is driven INDEPENDENTLY (concurrently) so one stuck counterparty never blocks
+  /// another's settle/refund (the web resumeBuy over activeBuys, Promise.all).
   static Future<void> resume() async {
-    final r0 = await SubBuyStore.load();
-    if (r0 == null || !r0.inFlight || r0.preimage.isEmpty) return;
-    var r = r0; // non-null past the guard, so the drive loop reassigns cleanly
+    List<SubBuyRecord> recs;
+    try {
+      recs = await SubBuyStore.activeAll();
+    } catch (_) {
+      return; // unreadable store: nothing to drive now; records stay persisted
+    }
+    await Future.wait([
+      for (final r in recs)
+        if (r.inFlight && r.preimage.isNotEmpty) _resumeOne(r).catchError((Object _) {}),
+    ]);
+  }
+
+  /// Drive ONE persisted buy (bounded idempotent loop, mirrors the old single-record resume body).
+  static Future<void> _resumeOne(SubBuyRecord r0) async {
+    var r = r0;
     for (var i = 0; i < 240; i++) {
       try {
         await drive(r);
       } catch (_) {/* leave persisted; the BTC is still refundable at T_btc */}
       if (r.terminal) return;
       await Future<void>.delayed(const Duration(seconds: 6));
-      final fresh = await SubBuyStore.load();
-      if (fresh == null || fresh.terminal) return; // cleared / finished (e.g. by the open screen)
+      final fresh = await SubBuyStore.load(id: r.id);
+      if (fresh == null || fresh.terminal) return; // removed / finished (e.g. by the open screen)
       r = fresh;
     }
   }

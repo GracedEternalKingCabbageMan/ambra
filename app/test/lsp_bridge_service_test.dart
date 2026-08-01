@@ -277,10 +277,10 @@ void main() {
       _FakeSecureStorage().install();
       expect(await LspBridgeStore.load(), isNull);
       await LspBridgeStore.save(_record(state: BridgeState.confirming));
-      // confirming = job posted, hold NOT paid -> nothing committed -> the slot is not "with funds".
-      expect(await LspBridgeStore.inFlightWithFunds(), isNull);
+      // confirming = job posted, hold NOT paid -> nothing committed -> not "with funds".
+      expect(await LspBridgeStore.inFlightWithFunds(), isEmpty);
       await LspBridgeStore.save(_record(state: BridgeState.held));
-      expect(await LspBridgeStore.inFlightWithFunds(), isNotNull);
+      expect(await LspBridgeStore.inFlightWithFunds(), isNotEmpty);
       await LspBridgeStore.clear();
       expect(await LspBridgeStore.load(), isNull);
     });

@@ -25,7 +25,7 @@ final BigInt _kBtcMinerHeadroomSats = BigInt.from(1000);
 /// preimage (asset in + preimage revealed for the maker to claim the BTC); if the maker never pays,
 /// the BTC is refunded via its CLTV timeout. The preimage reveal happens ONLY after `held`.
 class SubassetBuyScreen extends StatefulWidget {
-  const SubassetBuyScreen({super.key, required this.asset, this.quoteAsset});
+  const SubassetBuyScreen({super.key, required this.asset, this.quoteAsset, this.recordId});
 
   /// The Sequentia asset to buy (received over Lightning).
   final String asset;
@@ -33,6 +33,10 @@ class SubassetBuyScreen extends StatefulWidget {
   /// MIXED same-chain: the pair's QUOTE asset — the on-chain leg is a Sequentia HTLC on it, standing in
   /// BTC's structural place, and every "BTC" position carries quote atoms. Null = the BTC shape.
   final String? quoteAsset;
+
+  /// A specific persisted record to open (the composer's in-flight card taps pass it). Null = the
+  /// first in-flight buy of this asset, if any (multi-record store).
+  final String? recordId;
 
   @override
   State<SubassetBuyScreen> createState() => _SubassetBuyScreenState();
@@ -70,7 +74,20 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
 
   Future<void> _load() async {
     try {
-      final rec = await SubBuyStore.load();
+      // A tapped in-flight card opens ITS record; otherwise adopt the first in-flight buy of THIS
+      // asset (multi-record store: other assets' buys are their own cards, not this screen's).
+      SubBuyRecord? rec;
+      if (widget.recordId != null && widget.recordId!.isNotEmpty) {
+        rec = await SubBuyStore.load(id: widget.recordId);
+      } else {
+        final all = await SubBuyStore.activeAll();
+        for (final r in all) {
+          if (r.asset == widget.asset) {
+            rec = r;
+            break;
+          }
+        }
+      }
       SubOffer? offer;
       try {
         // The book is keyed per (base, quote) pair: mixed same-chain reads pass the REAL quote.
@@ -153,7 +170,7 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
       if (widget.quoteAsset == null) {
         final bal = BigInt.tryParse(BtcState.instance.last?.balanceSats ?? '');
         if (bal != null && rec.btcSats + _kBtcMinerHeadroomSats > bal) {
-          await SubBuyStore.clear();
+          await SubBuyStore.remove(rec.id); // discard only THIS never-funded stub
           throw Exception(
               'You only hold ${_btc(bal)}. Locking ${_btc(rec.btcSats)} plus an on-chain fee needs more; reduce the amount.');
         }
@@ -173,7 +190,7 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
           // re-shows "Lock BTC", and a re-tap would re-fund (different UTXOs) and DOUBLE-LOCK the BTC.
           // On a pre-save throw (auth / invoice / prepare) the persisted step is unchanged, so the Lock
           // button correctly remains. Rethrow so _run surfaces the error; recovery is the poll/refund.
-          final saved = await SubBuyStore.load();
+          final saved = await SubBuyStore.load(id: _rec!.id);
           if (saved != null && mounted) setState(() => _rec = saved);
           rethrow;
         }
@@ -214,7 +231,8 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
       });
 
   Future<void> _reset() async {
-    await SubBuyStore.clear();
+    final r = _rec;
+    if (r != null) await SubBuyStore.remove(r.id); // drop only THIS record; others keep their handles
     _poll?.cancel();
     if (mounted) {
       setState(() {
