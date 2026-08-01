@@ -39,8 +39,11 @@ import 'subasset_sell_service.dart' show SubSellStore;
 import 'subswap_service.dart' show SubswapStore;
 import 'xr_swap_service.dart' show XrSwapStore;
 
-/// The shared bound on concurrently in-flight rail-crossing trades (web swap.js MAX_CONCURRENT_TRADES).
-const int kMaxConcurrentTrades = 3;
+/// NOT a product limit — a runaway backstop (web swap.js MAX_CONCURRENT_TRADES, same value).
+/// Rail-crossing trades are independent per-record state machines and there is no principled
+/// ceiling on how many a trader may run; this bound exists only so a bug that spawns trades
+/// in a loop cannot lock funds without bound. Set far above any human trading pattern.
+const int kMaxConcurrentTrades = 100;
 
 /// A fresh stable per-record id: 16 random bytes, hex. Assigned at record creation (or at legacy
 /// adoption for a pre-list record), and the key every upsert/remove matches on.

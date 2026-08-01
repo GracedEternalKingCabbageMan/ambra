@@ -252,25 +252,30 @@ void main() {
     });
   });
 
-  group('shared slot count (buys + sells + subswaps + bridge + xr < 3)', () {
+  group('shared slot count (buys + sells + subswaps + bridge + xr < ceiling)', () {
     test('counts in-flight records across kinds; terminal records never eat a slot', () async {
       expect(await TradeSlots.inFlightCount(), 0);
       expect(await TradeSlots.refusalIfFull(), isNull);
       await SubBuyStore.save(_buy());
       await SubSellStore.save(_sell());
       expect(await TradeSlots.inFlightCount(), 2);
-      expect(await TradeSlots.refusalIfFull(), isNull, reason: '2 of 3 slots used — one still free');
-      final sub = _sub();
-      await SubswapStore.save(sub);
-      expect(await TradeSlots.inFlightCount(), 3);
+      expect(await TradeSlots.refusalIfFull(), isNull, reason: '2 slots used — the ceiling leaves room');
+      // Fill the remaining slots up to the ceiling with subswaps.
+      final subs = <SubswapRecord>[];
+      for (var i = 0; i < kMaxConcurrentTrades - 2; i++) {
+        final s = _sub();
+        subs.add(s);
+        await SubswapStore.save(s);
+      }
+      expect(await TradeSlots.inFlightCount(), kMaxConcurrentTrades);
       final msg = await TradeSlots.refusalIfFull();
       expect(msg, isNotNull);
-      expect(msg, contains('3 trades in progress'));
+      expect(msg, contains('$kMaxConcurrentTrades trades in progress'));
       expect(msg, contains('in-flight cards'));
       // Settling the SAME record (upsert by id) frees its slot.
-      sub.state = SubState.settled;
-      await SubswapStore.save(sub);
-      expect(await TradeSlots.inFlightCount(), 2);
+      subs.first.state = SubState.settled;
+      await SubswapStore.save(subs.first);
+      expect(await TradeSlots.inFlightCount(), kMaxConcurrentTrades - 1);
       expect(await TradeSlots.refusalIfFull(), isNull);
     });
 
@@ -293,10 +298,13 @@ void main() {
       expect(await TradeSlots.inFlightCount(), 2);
     });
 
-    test('the sub-asset BUY begin-gate refuses at 3 in flight with the honest message', () async {
+    test('the sub-asset BUY begin-gate refuses at the ceiling with the honest message', () async {
       await SubBuyStore.save(_buy(id: 's1'));
       await SubSellStore.save(_sell(id: 's2'));
       await XrSwapStore.save(_xr(id: 's3'));
+      for (var i = 0; i < kMaxConcurrentTrades - 3; i++) {
+        await SubswapStore.save(_sub(id: 'fill-$i'));
+      }
       expect(
         () => SubassetBuyService.begin(
           asset: 'aa11',
