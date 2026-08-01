@@ -14,6 +14,9 @@ import '../data/config.dart';
 import '../data/format.dart';
 import '../data/lightning_service.dart';
 import '../data/ln_rail.dart';
+import '../data/ln_take_service.dart';
+import '../data/lsp_bridge_service.dart';
+import '../data/lsp_client.dart' show LnOffer, LspSwapResult;
 import '../data/market_walk.dart';
 import '../data/placed_orders.dart';
 import '../data/price_service.dart';
@@ -26,11 +29,11 @@ import '../data/trade_receipts.dart';
 import '../data/wallet_repository.dart';
 import '../data/xchain_client.dart';
 import '../data/xchain_swap_service.dart';
+import '../data/xr_swap_service.dart';
 import '../rust/api.dart' as core;
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 import 'cross_lift_screen.dart';
-import 'lightning_swap_screen.dart';
 import 'my_orders_screen.dart';
 import 'subasset_buy_screen.dart';
 import 'subasset_sell_screen.dart';
@@ -113,6 +116,13 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   bool? _recvRailLn;
   XchainSwapRecord? _xInFlight; // a persisted cross-swap with locked BTC needing resume/refund (banner)
   SubswapRecord? _subInFlight; // a persisted P2P submarine mid-flight needing resume/refund/settle (banner)
+  XrSwapRecord? _xrInFlight; // a persisted REVERSE cross sell with a locked asset leg (banner + resume/refund)
+  LspBridgeRecord? _bridgeInFlight; // a persisted LSP payer-bridge buy whose hold may be HELD (banner + resume)
+  LnStaleVerdict? _lnStale; // a stale pure-LN take that did not settle (honest banner; nothing was committed)
+  // Resume-on-entry once-per-session kicks (the services' resumes are idempotent, but a poll storm from
+  // repeated tab activations would still be waste; the completion reload refreshes the banner).
+  static bool _xrResumeKicked = false;
+  static bool _bridgeResumeKicked = false;
   bool _subCorrupt = false; // a persisted submarine record present but DURABLY UNDECODABLE — recovery (Task 2)
   // An orphaned record from the RETIRED RFQ reverse rail, preserved by SubswapStore's one-shot
   // migration. It can describe a FUNDED Sequentia HTLC, so it must be SEEN, not merely logged: a
@@ -508,6 +518,34 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       } catch (_) {
         _legacyReverseOrphan = null; // best-effort; the banner reappears on a later load
       }
+      // In-flight REVERSE cross sell (rail 1 SELL): surface the record whose asset leg is (or might be)
+      // locked, and RESUME its on-chain tail once per session — resume settles a leg the maker already
+      // claimed (read P off-chain -> claim the BTC), adopts a strand-recovered funding, or leaves the
+      // record for the CLTV refund. The banner is the reachable recovery surface either way.
+      try { _xrInFlight = await XrSwapStore.inFlightWithFunds(); } catch (_) { _xrInFlight = null; }
+      if (_xrInFlight != null && !_xrResumeKicked) {
+        _xrResumeKicked = true;
+        unawaited(XrSwapService.resume().catchError((Object _) => null).whenComplete(() async {
+          if (!mounted) return;
+          try { _xrInFlight = await XrSwapStore.inFlightWithFunds(); } catch (_) {}
+          if (mounted) setState(() {});
+        }));
+      }
+      // In-flight LSP payer-bridge buy: its HELD Bitcoin payment (keyed by the record's P) may still
+      // settle — resume re-polls the job, verifies the maker leg and claims with the window gate.
+      try { _bridgeInFlight = await LspBridgeStore.inFlightWithFunds(); } catch (_) { _bridgeInFlight = null; }
+      if (_bridgeInFlight != null && !_bridgeResumeKicked) {
+        _bridgeResumeKicked = true;
+        unawaited(LspBridgeService.resume().catchError((Object _) => null).whenComplete(() async {
+          if (!mounted) return;
+          try { _bridgeInFlight = await LspBridgeStore.inFlightWithFunds(); } catch (_) {}
+          if (mounted) setState(() {});
+        }));
+      }
+      // A stale pure-LN take (older than the LSP's 90s timeout): resolved off the receipt trail — a
+      // proven settle clears silently; otherwise the honest "did not settle · funds are safe" banner.
+      try { _lnStale = await LnTakeService.resolveStale(); } catch (_) { _lnStale = null; }
+      if (_lnStale != null && _lnStale!.settled) _lnStale = null; // settled: nothing to surface
       // Own maker identity, so a MARKET book-walk never self-fills this wallet's own resting covenants.
       try { _ownMakerPub = await core.seqobMakerPubkey(mnemonic: m); } catch (_) {/* self-filter is best-effort */}
       try {
@@ -1889,12 +1927,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         // a submarine (BTC over Lightning + asset on-chain) into the on-chain cross rail.
         lnAvailable: LightningService.instance.configured,
         sameChainQuote: dir?.quote);
-    // A same-chain both-Lightning pair is WIRED to the pure-LN asset↔asset swap ([LightningSwapScreen]),
-    // so it is not a dead rail and does not disable the CTA. A SUBMARINE mixed shape (BTC over Lightning +
-    // asset on-chain) settles peer-to-peer ([_dispatchSubmarine]). A cross SELL settling BTC ON-CHAIN has
-    // no taker rail in this build (the retired /dex RFQ reverse wizard is gone and the courier lift is
-    // BTC->asset only), so it honest-disables AT DISPATCH with the routes that do work — never a
-    // priced-then-crashing Place.
+    // A same-chain both-Lightning pair is WIRED to the COMPOSER-NATIVE pure-LN take ([_startLnTake]:
+    // review sheet -> pinned-offer POST), so it is not a dead rail and does not disable the CTA. A
+    // SUBMARINE mixed shape (BTC over Lightning + asset on-chain) settles peer-to-peer or over the LSP
+    // payer leg-bridge ([_dispatchSubmarine]). A cross SELL settling BTC ON-CHAIN settles via the
+    // REVERSE cross swap ([_dispatchXrSell], the web xrswap twin).
     final sameChainLn = !isCross && r.kind == SwapRouteKind.ln; // same-chain asset↔asset over pure Lightning
     // Same-chain asset↔asset with exactly ONE Lightning leg -> the MIXED same-chain shape (the sub-asset
     // construction with the quote asset in BTC's structural place); dispatched via [_dispatchSameChainMixed].
@@ -1918,6 +1955,18 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           ],
           if (_subInFlight != null) ...[
             _inFlightSubmarineBanner(_subInFlight!),
+            const SizedBox(height: 14),
+          ],
+          if (_xrInFlight != null) ...[
+            _inFlightXrBanner(_xrInFlight!),
+            const SizedBox(height: 14),
+          ],
+          if (_bridgeInFlight != null) ...[
+            _inFlightBridgeBanner(_bridgeInFlight!),
+            const SizedBox(height: 14),
+          ],
+          if (_lnStale != null) ...[
+            _lnStaleBanner(_lnStale!),
             const SizedBox(height: 14),
           ],
           if (_subCorrupt) ...[
@@ -1956,26 +2005,33 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       if (canQuote)
         BottomActionBar(children: [
           PrimaryButton(
+            // The CTA label comes from the ROUTE (never a hardcoded rail promise): a pure-LN route in
+            // Limit mode cannot rest an order (a Lightning take fills the best resting offer), so the
+            // label says so instead of promising "Swap over Lightning" — pressing it explains by name.
             label: !railsChosen
                 ? 'Choose how you pay & receive'
-                : sameChainLn
-                    ? 'Swap over Lightning'
-                    : sameChainMixed || isCross
-                        ? 'Review swap'
-                        : _confBook
-                            ? 'Review order (blinded)'
-                            : 'Review order',
+                : r.kind == SwapRouteKind.ln && _mode == 'post'
+                    ? 'Switch to Market for Lightning'
+                    : sameChainLn
+                        ? 'Swap over Lightning'
+                        : sameChainMixed || isCross
+                            ? 'Review swap'
+                            : _confBook
+                                ? 'Review order (blinded)'
+                                : 'Review order',
             icon: !railsChosen
                 ? Icons.alt_route
-                : sameChainLn
-                    ? Icons.bolt
-                    : sameChainMixed || isCross
-                        ? Icons.swap_horiz
-                        : _confBook
-                            ? Icons.lock_outline
-                            : _mode == 'take'
-                                ? Icons.swap_horiz
-                                : Icons.playlist_add,
+                : r.kind == SwapRouteKind.ln && _mode == 'post'
+                    ? Icons.info_outline
+                    : sameChainLn
+                        ? Icons.bolt
+                        : sameChainMixed || isCross
+                            ? Icons.swap_horiz
+                            : _confBook
+                                ? Icons.lock_outline
+                                : _mode == 'take'
+                                    ? Icons.swap_horiz
+                                    : Icons.playlist_add,
             // Disabled (null) until both rails are chosen (no order on an unstated settlement choice).
             // A same-chain both-Lightning pair routes to the pure-LN asset↔asset swap; a same-chain
             // one-leg-Lightning pair to the mixed same-chain (sub-asset) dispatch; a BTC pair to the
@@ -2040,8 +2096,8 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       _priceField(), // editable limit price / read-only market estimate — IDENTICAL on every pair (§6.4)
       const SizedBox(height: 4),
       _railPicks(), // both settlement rails, always present (spec §5/§6.5)
-      // Same-chain both-Lightning (priority D): pure-LN asset↔asset settlement isn't wired on mobile yet,
-      // so gate it honestly instead of silently settling on the covenant book or misrouting.
+      // Same-chain both-Lightning (priority D): the pure-LN asset↔asset route, settled composer-native
+      // ([_startLnTake]); the note states the settlement + the way to a durable limit order.
       if (!isCross && r.kind == SwapRouteKind.ln) _sameChainLnNote(),
       if (!isCross && r.kind == SwapRouteKind.mixed) _sameChainMixedNote(r),
       _offlineRestToggle(), // on-chain-BTC-pay + LIMIT only: rest as pegged SBTC while offline (spec §5)
@@ -2091,10 +2147,10 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         : 'Resting your order funds a covenant on-chain, then posts it to the relay. Cancel anytime; reclaim the funds after expiry.';
   }
 
-  /// Honest gate for a same-chain pair whose BOTH rails are set to Lightning (priority D): the route()
-  /// classifies it as a pure-LN asset↔asset swap, but that settlement path is not wired on mobile yet, so
-  /// we neither silently settle on the covenant book nor misroute. The user switches a leg to On-chain to
-  /// trade now on the covenant book.
+  /// The route note for a same-chain pair whose BOTH rails are set to Lightning (priority D): route()
+  /// classifies it as a pure-LN asset↔asset swap and the composer settles it natively ([_startLnTake]).
+  /// The note states the settlement honestly + how to rest a durable limit order instead (a Lightning
+  /// take fills the best resting offer; it never rests).
   Widget _sameChainLnNote() => Padding(
         padding: const EdgeInsets.only(top: 4, bottom: 4),
         child: AmbraCard(
@@ -2182,12 +2238,17 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           else ...[
             for (final o in offers)
               // A maker SELLING the asset (for BTC) is a BUY the taker can lift now (lock BTC -> get the
-              // asset). The reverse (maker gives BTC) is the sell direction — read-only until the reverse
-              // courier lands.
+              // asset). The reverse (maker gives BTC) is the SELL direction, driven by the reverse cross
+              // swap ([_dispatchXrSell]) — tappable when its asset leg is a single on-chain HTLC.
               InkWell(
                 // Tapping a "buy" row lifts THAT offer at the size the user typed (partial-fill, priority
-                // C): a null typed size lifts it whole; a smaller size takes just that slice.
-                onTap: o.makerSellsAsset ? () => _liftCross(o, requestedAtoms: _typedAssetAtoms(asset, aprec)) : null,
+                // C): a null typed size lifts it whole; a smaller size takes just that slice. Tapping a
+                // "sell" row sells INTO that bid (partial via proportionalBtcFloor — review == execution).
+                onTap: o.makerSellsAsset
+                    ? () => _liftCross(o, requestedAtoms: _typedAssetAtoms(asset, aprec))
+                    : o.assetOnchain
+                        ? () => _dispatchXrSell(asset, pinned: o)
+                        : null,
                 borderRadius: BorderRadius.circular(AmbraRadii.input),
                 child: Padding(
                   padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 2),
@@ -2208,7 +2269,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
                     ),
                     SizedBox(
                       width: 20,
-                      child: o.makerSellsAsset
+                      child: (o.makerSellsAsset || o.assetOnchain)
                           ? const Icon(Icons.chevron_right, size: 16, color: AmbraColors.dim)
                           : null,
                     ),
@@ -2216,7 +2277,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
                 ),
               ),
             const SizedBox(height: 6),
-            const Text('Tap a “buy” offer to lock Bitcoin and swap. Non-custodial; refundable if it does not complete.',
+            const Text('Tap a “buy” offer to lock Bitcoin and swap, or a “sell” offer to sell for Bitcoin. Non-custodial; refundable if it does not complete.',
                 style: AmbraText.sub),
           ],
           if (_peggedOffers.isNotEmpty) ...[
@@ -2554,6 +2615,115 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     );
   }
 
+  /// Surface an in-flight REVERSE cross sell (rail 1 SELL) whose asset leg is — or might be — locked
+  /// on-chain with the reclaim material living only in the record. Tapping opens the record sheet with
+  /// Resume (settle/adopt the strand), the CLTV "Refund asset" off-ramp (gated on
+  /// [XrSwapService.refundSeqReady]) and the guarded Clear ([XrSwapService.canAbandon]).
+  Widget _inFlightXrBanner(XrSwapRecord r) {
+    final tk = SeqAssets.labelFor(r.seqAsset).ticker;
+    return InkWell(
+      borderRadius: BorderRadius.circular(AmbraRadii.card),
+      onTap: () => _showXrRecordSheet(r),
+      child: AmbraCard(
+        child: Row(children: [
+          const Icon(Icons.warning_amber_rounded, color: AmbraColors.amber, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Cross-chain sell in progress · $tk', style: AmbraText.body),
+              const SizedBox(height: 2),
+              const Text('Your asset is locked for the swap. Tap to resume, or refund it after the timeout.',
+                  style: AmbraText.sub),
+            ]),
+          ),
+          const Icon(Icons.chevron_right, size: 18, color: AmbraColors.dim),
+        ]),
+      ),
+    );
+  }
+
+  /// The reverse-sell record sheet: status + the three off-ramps. Resume re-runs the persisted tail
+  /// (read the revealed secret -> claim the BTC; or adopt a strand-recovered funding); Refund fires the
+  /// CLTV branch once the Sequentia tip reaches T_seq; Clear is refused while the record still protects
+  /// a locked (or possibly locked) asset leg.
+  Future<void> _showXrRecordSheet(XrSwapRecord r) async {
+    final changed = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AmbraColors.panel,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+      builder: (_) => _XrRecordSheet(record: r),
+    );
+    if (changed == true && mounted) _load();
+  }
+
+  /// Surface an in-flight LSP payer-bridge buy: its HELD Bitcoin payment settles only when the asset is
+  /// claimed with P (which the record holds), or fails back on its own CLTV — so the honest copy is
+  /// "completes or expires back on its own". Tapping opens the record sheet (Resume / guarded Clear).
+  Widget _inFlightBridgeBanner(LspBridgeRecord r) {
+    final tk = SeqAssets.labelFor(r.asset).ticker;
+    return InkWell(
+      borderRadius: BorderRadius.circular(AmbraRadii.card),
+      onTap: () async {
+        final changed = await showModalBottomSheet<bool>(
+          context: context,
+          isScrollControlled: true,
+          backgroundColor: AmbraColors.panel,
+          shape:
+              const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+          builder: (_) => _BridgeRecordSheet(record: r),
+        );
+        if (changed == true && mounted) _load();
+      },
+      child: AmbraCard(
+        child: Row(children: [
+          const Icon(Icons.warning_amber_rounded, color: AmbraColors.amber, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Bridged buy in progress · $tk', style: AmbraText.body),
+              const SizedBox(height: 2),
+              const Text('Your Bitcoin is held for the swap. Tap to resume · it completes, or the hold expires back on its own.',
+                  style: AmbraText.sub),
+            ]),
+          ),
+          const Icon(Icons.chevron_right, size: 18, color: AmbraColors.dim),
+        ]),
+      ),
+    );
+  }
+
+  /// A stale pure-LN take that did NOT settle (no receipt in the trail after the LSP's 90s timeout).
+  /// Pure-LN commits nothing client-side, so this is informational — stated honestly, with a dismiss.
+  Widget _lnStaleBanner(LnStaleVerdict v) {
+    final tk = SeqAssets.labelFor(v.record.asset).ticker;
+    return AmbraCard(
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Icon(Icons.info_outline, color: AmbraColors.amber, size: 20),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Lightning swap did not settle · funds are safe', style: AmbraText.body),
+            const SizedBox(height: 2),
+            Text(
+                'A $tk Lightning swap was interrupted before it settled. Nothing was committed — an '
+                'unsettled Lightning take costs nothing. Take the offer again when you\'re ready.',
+                style: AmbraText.sub),
+          ]),
+        ),
+        const SizedBox(width: 8),
+        SecondaryButton(
+          label: 'Dismiss',
+          icon: Icons.close,
+          onPressed: () async {
+            await LnTakeService.dismiss();
+            if (mounted) setState(() => _lnStale = null);
+          },
+        ),
+      ]),
+    );
+  }
+
   /// Surface a DURABLY-CORRUPT submarine record (Task 2) so the rail is not silently blocked forever behind a
   /// false 'in progress'. A present-but-undecodable record throws on every load, so the resume path cannot
   /// reach it; tapping opens the SubmarineSwapScreen whose corrupt view offers the explicit guarded recovery.
@@ -2651,6 +2821,14 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     final asset = r.seqAsset;
     if (asset == null || !r.isValid) return;
 
+    // LIMIT on a PURE-LN route: refuse BY NAME (never a silent market take). A Lightning take fills the
+    // best resting offer in full; resting at your own price is the on-chain books' job.
+    if (r.kind == SwapRouteKind.ln && _mode == 'post') {
+      _snack('A Lightning take fills the best resting offer · switch to Market, or choose on-chain '
+          'rails to rest a limit order.');
+      return;
+    }
+
     // LIMIT (post) on a BTC pair.
     if (_mode == 'post') {
       // BUY-with-on-chain-BTC + "keep resting while offline" ON: the SBTC silent peg (spec §5, the ONE
@@ -2696,20 +2874,11 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         }
         await _liftCross(asks.first, requestedAtoms: reqAtoms);
       } else {
-        // SELL the asset for Bitcoin ON-CHAIN: HONEST DISABLE. This shape used to open the /dex RFQ
-        // reverse wizard, which is retired (no route, no daemon) — it would have priced the trade and
-        // then failed. The courier lift is BTC->asset only, so there is no on-chain taker rail for the
-        // sell direction in this build.
-        //
-        // Name only affordances that ACTUALLY EXIST right now. The earlier wording told the user to
-        // "take a resting Bitcoin bid from the book", but ordinary cross bid rows are non-tappable by
-        // construction — the only tappable bids are the offline-resting SBTC silent-peg ones, and that
-        // section renders only while _peggedOffers is non-empty. Advertising a tap that does nothing
-        // is worse than saying less.
-        final hasPeggedBids = _peggedOffers.isNotEmpty;
-        _snack('Selling ${_tk(asset)} for on-chain Bitcoin is not available yet. Set "Receive" to Lightning to '
-            'settle it over Lightning now'
-            '${hasPeggedBids ? ', or tap one of the offline-resting Bitcoin bids for ${_tk(asset)} below.' : '.'}');
+        // SELL the asset for Bitcoin ON-CHAIN: the REVERSE cross swap (rail 1's sell direction),
+        // driven by [XrSwapService] — the maker locks BTC first, then we fund the asset leg behind the
+        // mandatory anchor-ordering gate, and claim the BTC with the maker-revealed secret. Replaces
+        // the honest-disable that stood in for the retired /dex RFQ reverse wizard.
+        await _dispatchXrSell(asset);
       }
       return;
     }
@@ -2721,23 +2890,23 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       return;
     }
 
+    // PURE-LN (both legs over Lightning): COMPOSER-NATIVE take — pin the best resting /lnbook offer,
+    // review it (the OFFER's amounts; whole-fill on the wire), then POST /swap with the pin. No more
+    // takeover screen that re-asks side/asset/amount ([LightningSwapScreen] remains for other entry
+    // points but the composer no longer pushes it).
+    if (r.kind == SwapRouteKind.ln) {
+      await _startLnTake(r);
+      return;
+    }
+
     // The cross composer's single amount field sits on the Sequentia-asset leg (see _crossComposerChildren).
     final amtText = (_payAsset == asset ? _payAmount : _recvAmount).text.trim();
     final assetAmount = amtText.isEmpty ? null : amtText;
-    final Widget? screen = switch (r.kind) {
-      // Sub-asset submarine swap (asset over LN + BTC on-chain) — LSP-served, not /dex.
-      SwapRouteKind.mixed => r.payIsBtc
-          ? SubassetBuyScreen(asset: asset)
-          : SubassetSellScreen(asset: asset, assetAmount: assetAmount),
-      // Pure-LN: a BUY amount is BTC-to-spend (quoted in the wizard); a SELL amount is the asset.
-      SwapRouteKind.ln => LightningSwapScreen(
-          initialSide: r.payIsBtc ? 'buy' : 'sell',
-          initialAsset: asset,
-          initialAmount: r.payIsBtc ? null : assetAmount,
-        ),
-      SwapRouteKind.cross || SwapRouteKind.same || SwapRouteKind.invalid => null,
-    };
-    if (screen == null) return;
+    if (r.kind != SwapRouteKind.mixed) return;
+    // Sub-asset submarine swap (asset over LN + BTC on-chain) — LSP-served, not /dex.
+    final Widget screen = r.payIsBtc
+        ? SubassetBuyScreen(asset: asset)
+        : SubassetSellScreen(asset: asset, assetAmount: assetAmount);
     await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => screen));
     if (mounted) _load(); // refresh balances + markets on return
   }
@@ -2745,9 +2914,9 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   /// Dispatch a SUBMARINE mixed shape (BTC over Lightning + asset on-chain), the mobile twin of the web
   /// wallet's onReview submarine branch (swap.js) + settlementDispatch. The rail crossing is on the BTC
   /// leg; [chooseSettlementPath] reads the best matching offer's signed caps: a DIRECT peer-to-peer
-  /// submarine when the maker is interactive + accepts BTC-LN; else honest-DISABLE (the LSP payer
-  /// leg-bridge needs the hold-invoice node update the seqln node cannot yet mint; the receiver bridge is
-  /// not built on mobile) — never a priced-then-refused Place (item 7). Whole-offer only.
+  /// submarine when the maker is interactive + accepts BTC-LN; the LSP PAYER leg-bridge (bare-hash hold,
+  /// [LspBridgeService]) for a BUY against an on-chain-only / passive maker; the receiver bridge (a SELL)
+  /// is not built on mobile and honest-disables — never a priced-then-refused Place. Whole-offer only.
   Future<void> _dispatchSubmarine(SwapRoute r) async {
     final asset = r.seqAsset;
     if (asset == null) return;
@@ -2862,12 +3031,15 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         }
         return;
       case SettlementPath.lspBridge:
-        // Honest-DISABLE (item 2/7): the payer leg-bridge (a BUY paying BTC over Lightning to an on-chain-
-        // only maker) needs the LSP hold-invoice the seqln node cannot yet mint; the receiver bridge (a
-        // SELL) is not built on mobile. Never a broken Place — point at an interactive maker / on-chain.
-        _snack(disp.lnSide == 'payer'
-            ? 'This $tk maker settles Bitcoin on-chain; paying Bitcoin over Lightning to it needs the hold-invoice node update · use an interactive maker for now, or set the pay leg to On-chain to post a durable limit order.'
-            : 'No resting $tk offer that settles this Lightning crossing right now · try again shortly, or set the crossed leg to On-chain.');
+        // PAYER leg-bridge (a BUY paying BTC over Lightning to an on-chain-only / passive maker): the
+        // LSP terminates the LN end via a BARE-HASH hold on the taker's H — the rail-blind bridged take
+        // ([LspBridgeService], the web's runLspPayerBridge twin). The RECEIVER bridge (a SELL) is still
+        // not built on mobile: honest-disable, never a broken Place.
+        if (disp.lnSide == 'payer') {
+          await _startLspBridge(r, offer, reqAtoms);
+          return;
+        }
+        _snack('No resting $tk offer that settles this Lightning crossing right now · try again shortly, or set the crossed leg to On-chain.');
         return;
       case SettlementPath.unsupported:
         _snack('The best $tk offer rests over Lightning, so this rail crossing has no on-chain $tk leg to '
@@ -2880,23 +3052,233 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     }
   }
 
-  /// Dispatch a SAME-CHAIN pure-LN pair (asset↔asset, both legs over Lightning) to the pure-LN swap
-  /// ([LightningSwapScreen]), the twin of the web wallet's findRoute `ln` + reviewLn (item 4). The counter
-  /// (quote) asset takes BTC's structural place; the swap runs on the user's OWN per-asset nodes
-  /// (self-custody), pinning the reviewed offer. payIsBtc here means "paying the quote" = a BUY of the base.
+  /// Dispatch a SAME-CHAIN pure-LN pair (asset↔asset, both legs over Lightning) — COMPOSER-NATIVE, the
+  /// twin of the web wallet's findRoute `ln` + reviewLn. The counter (quote) asset takes BTC's
+  /// structural place; the swap runs on the user's OWN per-asset nodes (self-custody), pinning the
+  /// reviewed offer. payIsBtc here means "paying the quote" = a BUY of the base. A Limit refuses BY
+  /// NAME (a Lightning take fills the best resting offer) — never a silent market take.
   Future<void> _dispatchSameChainLn(SwapRoute r) async {
+    if (_mode == 'post') {
+      _snack('A Lightning take fills the best resting offer · switch to Market, or choose on-chain '
+          'rails to rest a limit order.');
+      return;
+    }
+    await _startLnTake(r);
+  }
+
+  /// The COMPOSER-NATIVE pure-LN take (BTC↔asset AND asset↔asset): pin the best resting offer from the
+  /// LSP's /lnbook, show the Review sheet — the OFFER's amounts as "You pay / You receive" (a pure-LN
+  /// take is WHOLE-FILL on the wire: the LSP runs xpln, which lifts the pinned offer in full), with a
+  /// loud note when the executed size differs from the typed size — then POST /swap pinning the offer
+  /// (persist-before-POST via [LnTakeService]). Honest refusals for every no-liquidity state.
+  Future<void> _startLnTake(SwapRoute r) async {
     final base = r.seqAsset;
     if (base == null) return;
-    final amt = (_payAsset == base ? _payAmount : _recvAmount).text.trim();
-    await Navigator.of(context).push(MaterialPageRoute<void>(
-      builder: (_) => LightningSwapScreen(
-        initialSide: r.payIsBtc ? 'buy' : 'sell',
-        initialAsset: base,
-        initialQuoteAsset: r.quoteAsset, // asset↔asset: the REAL counter asset (BTC implied when null)
-        initialAmount: r.payIsBtc ? null : (amt.isEmpty ? null : amt),
+    final quote = r.quoteAsset; // null = BTC implied (asset↔BTC)
+    final side = r.payIsBtc ? 'buy' : 'sell';
+    final btk = _tk(base);
+    // The local wallet's OWN asset metadata names the quote — never a server label.
+    final qtk = quote == null ? 'BTC' : _tk(quote);
+    if (!LightningService.instance.available) {
+      _snack('The Lightning signer is not connected · try again in a moment, or choose on-chain rails.');
+      return;
+    }
+    // Single-slot: a take younger than the LSP's 90s timeout may still be settling in this process.
+    try {
+      final live = await LnTakeStore.load();
+      if (live != null && !live.failed &&
+          DateTime.now().millisecondsSinceEpoch - live.startedMs < kLnLspTimeoutMs) {
+        _snack('A Lightning swap is already settling · give it a moment.');
+        return;
+      }
+    } catch (_) {/* best-effort; the take itself persists over any stale slot */}
+    final pin = await LnTakeService.pinBest(side: side, asset: base, quoteAsset: quote);
+    if (pin.offer == null) {
+      // Served-but-empty vs unreachable are DIFFERENT honest messages (mirror web requote's split).
+      _snack(pin.served
+          ? 'No resting Lightning offer for $btk/$qtk yet · choose on-chain rails to trade the book, or check back shortly.'
+          : 'The Lightning order book is unreachable right now · try again shortly, or choose on-chain rails.');
+      return;
+    }
+    if (!mounted) return;
+    final res = await showModalBottomSheet<LspSwapResult>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AmbraColors.panel,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+      builder: (_) => _LnTakeReviewSheet(
+        side: side,
+        asset: base,
+        quoteAsset: quote,
+        offer: pin.offer!,
+        payTyped: _payAmount.text,
+        recvTyped: _recvAmount.text,
       ),
-    ));
-    if (mounted) _load();
+    );
+    if (res != null && mounted) {
+      _payAmount.clear();
+      _recvAmount.clear();
+      _resetPriceField();
+      _snack('Lightning swap settled · final.');
+      _loadReceipts();
+      _load();
+    } else if (mounted) {
+      _load(); // refresh the stale-take banner state after a failed/closed sheet
+    }
+  }
+
+  // --- reverse cross sell (rail 1 SELL: asset -> on-chain BTC) ---------------
+
+  /// SELL the asset for on-chain Bitcoin against a resting reverse (maker-gives-BTC) offer, driven by
+  /// [XrSwapService] (the web xrswap twin): maker locks BTC FIRST; our asset leg funds only behind the
+  /// confirmation + mandatory anchor-ordering gate; the CLTV refund is the off-ramp. ONE consent modal
+  /// — the sheet prices the take at [XrSwapService.proportionalBtcFloor], which is EXACTLY what
+  /// settles (review == execution) — then the driver runs with a step surface mirroring the cross lift.
+  /// [pinned] (a tapped book bid) sells into THAT offer only; otherwise the resting bids are ranked and
+  /// an [XrNoMakerException] retries down them at never-worse-than-reviewed terms.
+  Future<void> _dispatchXrSell(String asset, {CrossOffer? pinned}) async {
+    final tk = _tk(asset);
+    // Single-slot: a record still protecting a locked asset leg blocks a second sell (its banner is
+    // the resume/refund surface).
+    XrSwapRecord? inFlight;
+    try {
+      inFlight = await XrSwapStore.inFlightWithFunds();
+    } catch (_) {
+      inFlight = null;
+    }
+    if (inFlight != null) {
+      if (mounted) setState(() => _xrInFlight = inFlight);
+      _snack('You already have a cross-chain sell in progress · resume or refund it from the banner above first.');
+      return;
+    }
+    final aprec = SeqAssets.labelFor(asset).precision;
+    final reqAtoms = _typedAssetAtoms(asset, aprec);
+    // Reverse offers = the maker GIVES BTC (bids). Only offers whose asset leg is a single on-chain
+    // HTLC are drivable by the reverse service (assetOnchain — an asset-over-LN bid has no on-chain
+    // leg for this driver to fund against). A pinned (tapped) bid sells into that ONE offer.
+    final bids = pinned != null && !pinned.makerSellsAsset && pinned.assetOnchain
+        ? [pinned]
+        : _crossOffers.where((o) => !o.makerSellsAsset && o.assetOnchain).toList();
+    if (bids.isEmpty) {
+      final hasPeggedBids = _peggedOffers.isNotEmpty;
+      _snack('No resting Bitcoin bid for $tk right now · the makers post continuously; check back in a moment'
+          '${hasPeggedBids ? ', or tap one of the offline-resting Bitcoin bids for $tk below.' : '.'}');
+      return;
+    }
+    // Rank: prefer bids that COVER the typed slice (the take is then a partial of ONE offer), then the
+    // BEST price for the seller (the MOST BTC per atom), then the closest size.
+    if (reqAtoms != null && reqAtoms > BigInt.zero) {
+      bids.sort((a, b) {
+        final aCov = a.assetAtoms >= reqAtoms, bCov = b.assetAtoms >= reqAtoms;
+        if (aCov != bCov) return aCov ? -1 : 1;
+        final c = b.btcPerAssetAtom.compareTo(a.btcPerAssetAtom);
+        return c != 0 ? c : (a.assetAtoms - reqAtoms).abs().compareTo((b.assetAtoms - reqAtoms).abs());
+      });
+    } else {
+      bids.sort((a, b) => b.btcPerAssetAtom.compareTo(a.btcPerAssetAtom));
+    }
+    final best = bids.first;
+    final take = (reqAtoms == null || reqAtoms <= BigInt.zero || reqAtoms >= best.assetAtoms)
+        ? best.assetAtoms
+        : reqAtoms;
+    final bal = BigInt.tryParse(_bal(asset)) ?? BigInt.zero;
+    if (take > bal) {
+      return _snack('You only hold ${formatAtoms(bal.toString(), aprec)} $tk.');
+    }
+    if (!mounted) return;
+    final rec = await showModalBottomSheet<XrSwapRecord>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AmbraColors.panel,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+      builder: (_) => _XrSellReviewSheet(asset: asset, offers: bids, requestedAtoms: reqAtoms),
+    );
+    if (rec != null && mounted) {
+      TradeReceipts.log(
+        id: 'xrsell:${rec.hashHex}',
+        title: 'Sold $tk for BTC',
+        status: 'Settled',
+        txid: rec.btcClaimTxid,
+      ).ignore();
+      _payAmount.clear();
+      _recvAmount.clear();
+      _resetPriceField();
+      _snack('Swap complete · you received Bitcoin.');
+    }
+    if (mounted) {
+      _fetchBook();
+      _load(); // refresh balances + the in-flight banner (a post-lock failure resumes from it)
+    }
+  }
+
+  // --- LSP payer leg-bridge (BUY: BTC over Lightning -> asset on-chain, passive maker) ----------
+
+  /// The rail-blind BRIDGED take for a mixed BTC→asset BUY whose maker cannot serve the taker's rails
+  /// directly (an on-chain-only / passive maker): [LspBridgeService] mints P self-custody, pays the
+  /// LSP's bare-hash hold from the user's OWN BTC node, and claims the maker's relayed asset leg behind
+  /// verify + anchor + claim-window gates. Pre-gates mirror the web reviewLspPayerBridge: a funded
+  /// BTC-LN outbound channel (the bridge does NOT JIT-provision the buyer's channel), the whole-offer
+  /// guard, and the single slot.
+  Future<void> _startLspBridge(SwapRoute r, CrossOffer offer, BigInt? reqAtoms) async {
+    final asset = r.seqAsset;
+    if (asset == null) return;
+    final tk = _tk(asset);
+    // Single-slot: a record whose hold may be HELD blocks a second bridged buy.
+    LspBridgeRecord? inFlight;
+    try {
+      inFlight = await LspBridgeStore.inFlightWithFunds();
+    } catch (_) {
+      inFlight = null;
+    }
+    if (inFlight != null) {
+      if (mounted) setState(() => _bridgeInFlight = inFlight);
+      _snack('You already have a bridged swap in progress · it resumes from the banner above.');
+      return;
+    }
+    // Paying BTC over the taker's OWN Lightning needs REAL funded outbound — the bridge only
+    // JIT-provisions the maker's on-chain BTC HTLC, never a channel for the buyer.
+    final btcPayLn = railAvailability(
+      channels: _lnChannels,
+      payTarget: RailTarget.btc(),
+      recvTarget: RailTarget.asset(hex: asset, ticker: tk),
+      frontable: _frontable,
+    ).payLn;
+    if (!btcPayLn.ok) {
+      _snack('Paying Bitcoin over Lightning needs a funded Bitcoin Lightning channel · move Bitcoin to '
+          'Lightning first (Balance tab), then take this offer.');
+      return;
+    }
+    // WHOLE-OFFER guard (the maker binds exact amounts; a partial is the covenant CLOB's job).
+    final size = sizeSubswapTake(
+      want: reqAtoms ?? BigInt.zero,
+      offerAtoms: offer.assetAtoms,
+      offerBtc: offer.btcSats,
+    );
+    if (size.wholeOnly) {
+      final aprec = SeqAssets.labelFor(asset).precision;
+      final offerStr = '${formatAtoms(offer.assetAtoms.toString(), aprec)} $tk';
+      _snack('This bridged offer settles as a WHOLE ($offerStr) · enter $offerStr to take it, or place '
+          'a limit order to trade a different size.');
+      return;
+    }
+    if (!mounted) return;
+    final rec = await showModalBottomSheet<LspBridgeRecord>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AmbraColors.panel,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(AmbraRadii.card))),
+      builder: (_) => _BridgeRunSheet(offer: offer),
+    );
+    if (rec != null && rec.state == BridgeState.settled && mounted) {
+      _payAmount.clear();
+      _recvAmount.clear();
+      _resetPriceField();
+      _snack('Swap settled · the asset is yours.');
+    }
+    if (mounted) {
+      _fetchBook();
+      _load(); // refresh balances + the bridge banner (a mid-flight close resumes from it)
+    }
   }
 
   /// Dispatch a MIXED same-chain pair (asset↔asset, exactly one leg over Lightning): the sub-asset
@@ -4506,4 +4888,559 @@ class _Row extends StatelessWidget {
           Expanded(child: Text(v, textAlign: TextAlign.right, style: AmbraText.body)),
         ]),
       );
+}
+
+/// Review + execute a COMPOSER-NATIVE pure-LN take. The sheet states the PINNED OFFER's amounts as
+/// "You pay / You receive" — a pure-LN take is WHOLE-FILL on the wire (the LSP runs xpln, which lifts
+/// the pinned offer in full), so the offer's legs are what actually move, never the typed amount — with
+/// a loud note whenever a typed size differs from the executed leg by more than 5% (mirror web
+/// reviewLn). Confirm runs [LnTakeService.take] (persist-before-POST, self-custody node keys, the
+/// offer pinned on the wire) and pops with the settle.
+class _LnTakeReviewSheet extends StatefulWidget {
+  const _LnTakeReviewSheet({
+    required this.side,
+    required this.asset,
+    required this.quoteAsset,
+    required this.offer,
+    required this.payTyped,
+    required this.recvTyped,
+  });
+  final String side; // 'buy' (quote -> base) | 'sell' (base -> quote)
+  final String asset; // base asset hex
+  final String? quoteAsset; // null = BTC implied
+  final LnOffer offer;
+  final String payTyped; // the composer's typed amounts (display strings; may be empty)
+  final String recvTyped;
+  @override
+  State<_LnTakeReviewSheet> createState() => _LnTakeReviewSheetState();
+}
+
+class _LnTakeReviewSheetState extends State<_LnTakeReviewSheet> {
+  bool _busy = false;
+  String? _error;
+
+  String get _btk => SeqAssets.labelFor(widget.asset).ticker;
+  int get _aprec => SeqAssets.labelFor(widget.asset).precision;
+  // The QUOTE label comes from the wallet's OWN asset metadata (never a server label).
+  String get _qtk => widget.quoteAsset == null ? 'BTC' : SeqAssets.labelFor(widget.quoteAsset!).ticker;
+  int get _qprec => widget.quoteAsset == null ? 8 : SeqAssets.labelFor(widget.quoteAsset!).precision;
+
+  String get _assetStr => '${formatAtoms(widget.offer.assetAtoms.toString(), _aprec)} $_btk';
+  String get _quoteStr => '${formatAtoms(widget.offer.btcAtoms.toString(), _qprec)} $_qtk';
+
+  /// The loud offer-vs-typed note, or null when the typed sizes track the executed legs (<= 5% off).
+  /// Each composer field is judged against ITS OWN leg with its own precision.
+  String? get _sizeNote {
+    final buy = widget.side == 'buy';
+    // pay leg: buy -> quote; sell -> base. recv leg is the inverse.
+    final payExec = buy ? widget.offer.btcAtoms : widget.offer.assetAtoms;
+    final payPrec = buy ? _qprec : _aprec;
+    final payLegStr = buy ? _quoteStr : _assetStr;
+    final recvExec = buy ? widget.offer.assetAtoms : widget.offer.btcAtoms;
+    final recvPrec = buy ? _aprec : _qprec;
+    final recvLegStr = buy ? _assetStr : _quoteStr;
+    if (LnTakeService.needsSizeNote(execAtoms: payExec, precision: payPrec, typed: widget.payTyped)) {
+      return 'This fills $payLegStr (the resting offer\'s size), which differs from the '
+          '${widget.payTyped.trim()} ${buy ? _qtk : _btk} you entered.';
+    }
+    if (LnTakeService.needsSizeNote(execAtoms: recvExec, precision: recvPrec, typed: widget.recvTyped)) {
+      return 'This pays you $recvLegStr (the resting offer\'s size), which differs from the '
+          '${widget.recvTyped.trim()} ${buy ? _btk : _qtk} you entered.';
+    }
+    return null;
+  }
+
+  Future<void> _confirm() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final r = await LnTakeService.take(
+        side: widget.side,
+        asset: widget.asset,
+        quoteAsset: widget.quoteAsset,
+        offer: widget.offer,
+        typedAmount: widget.payTyped,
+      );
+      if (mounted) Navigator.pop(context, r);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = e.toString().replaceFirst('Exception: ', '');
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final buy = widget.side == 'buy';
+    final note = _sizeNote;
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          const Text('Review · Lightning swap', style: AmbraText.h1),
+          const SizedBox(height: 18),
+          AmbraCard(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Column(children: [
+              _Row('Route', 'Instant over Lightning · non-custodial, your keys stay on this device'),
+              _Row('Direction', buy ? 'Buy $_btk with $_qtk' : 'Sell $_btk for $_qtk'),
+              // WHOLE-FILL truth: the OFFER's amounts, never the typed amount.
+              _Row('You pay', buy ? _quoteStr : _assetStr),
+              _Row('You receive', buy ? _assetStr : _quoteStr),
+              _Row('Pricing', 'Fills the best resting Lightning offer in full · the rate includes the spread (no separate network fee)'),
+              _Row('Finality', LightningService.instance.finalityCopy()),
+              _Row('If it stalls', 'Nothing moves · an unsettled Lightning take costs nothing.'),
+            ]),
+          ),
+          if (note != null) ...[
+            const SizedBox(height: 12),
+            Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Icon(Icons.warning_amber_rounded, size: 16, color: AmbraColors.amber),
+              const SizedBox(width: 8),
+              Expanded(child: Text(note, style: AmbraText.sub.copyWith(color: AmbraColors.amber))),
+            ]),
+          ],
+          const SizedBox(height: 14),
+          if (_error != null)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
+          PrimaryButton(
+              label: 'Swap over Lightning', busy: _busy, icon: Icons.bolt, onPressed: _busy ? null : _confirm),
+          const SizedBox(height: 6),
+          GhostButton(label: 'Cancel', onPressed: _busy ? null : () => Navigator.pop(context)),
+        ]),
+      ),
+    );
+  }
+}
+
+/// ONE consent + the step surface for a REVERSE cross sell (asset -> on-chain BTC). The sheet prices
+/// the take at [XrSwapService.proportionalBtcFloor] of the BEST offer — exactly what settles (review ==
+/// execution) — and on confirm drives [XrSwapService.sellForBtc]. An [XrNoMakerException] (no maker
+/// committed any BTC — nothing spent, nothing persisted) retries down the book, but ONLY onto offers
+/// that settle the SAME asset amount for AT LEAST the consented BTC, so no retry can execute worse
+/// terms than the sheet showed. Any post-lock failure is terminal here and the persisted record (the
+/// composer banner) drives recovery.
+class _XrSellReviewSheet extends StatefulWidget {
+  const _XrSellReviewSheet({required this.asset, required this.offers, required this.requestedAtoms});
+  final String asset;
+  final List<CrossOffer> offers; // ranked candidates; first = the consented terms
+  final BigInt? requestedAtoms; // the typed slice (null = whole offer)
+  @override
+  State<_XrSellReviewSheet> createState() => _XrSellReviewSheetState();
+}
+
+class _XrSellReviewSheetState extends State<_XrSellReviewSheet> {
+  bool _busy = false;
+  String _status = '';
+  String? _error;
+
+  String get _tk => SeqAssets.labelFor(widget.asset).ticker;
+  int get _aprec => SeqAssets.labelFor(widget.asset).precision;
+
+  BigInt _takeOf(CrossOffer o) {
+    final req = widget.requestedAtoms;
+    return (req == null || req <= BigInt.zero || req >= o.assetAtoms) ? o.assetAtoms : req;
+  }
+
+  CrossOffer get _best => widget.offers.first;
+  BigInt get _consentTake => _takeOf(_best);
+  BigInt get _consentBtc => XrSwapService.proportionalBtcFloor(_best.btcSats, _consentTake, _best.assetAtoms);
+
+  Future<void> _confirm() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    final consentTake = _consentTake, consentBtc = _consentBtc;
+    Object? lastRetriable;
+    for (final o in widget.offers) {
+      // REVIEW == EXECUTION: a retry may only run on terms AT LEAST as good as consented — the same
+      // asset amount for no less BTC. (The first offer trivially qualifies; a differently-sized
+      // whole-offer candidate is skipped rather than silently resizing the trade.)
+      final t = _takeOf(o);
+      if (t != consentTake) continue;
+      final btc = XrSwapService.proportionalBtcFloor(o.btcSats, t, o.assetAtoms);
+      if (btc < consentBtc) continue;
+      try {
+        final rec = await XrSwapService.sellForBtc(
+          o,
+          requestedAtoms: widget.requestedAtoms,
+          onStep: (s) {
+            if (mounted) setState(() => _status = s);
+          },
+        );
+        if (mounted) Navigator.pop(context, rec);
+        return;
+      } on XrNoMakerException catch (e) {
+        lastRetriable = e; // nothing spent, nothing persisted — the next resting offer may serve
+        continue;
+      } catch (e) {
+        // Post-lock (or otherwise terminal for THIS swap): the persisted record drives the UI — the
+        // composer banner is the resume/refund surface. Do NOT retry another maker over it.
+        if (mounted) {
+          setState(() {
+            _busy = false;
+            _status = '';
+            _error = '${e.toString().replaceFirst('Exception: ', '')}\n'
+                'If anything was locked, the swap resumes from the banner on the Swap tab.';
+          });
+        }
+        return;
+      }
+    }
+    if (mounted) {
+      setState(() {
+        _busy = false;
+        _status = '';
+        _error = lastRetriable != null
+            ? '$lastRetriable'.replaceFirst('XrNoMakerException: ', '').replaceFirst('Exception: ', '')
+            : 'No maker could serve this sell at the reviewed terms - nothing was spent. Try again shortly.';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Text('Review · sell $_tk for Bitcoin', style: AmbraText.h1),
+          const SizedBox(height: 18),
+          AmbraCard(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Column(children: [
+              _Row('You pay', '${formatAtoms(_consentTake.toString(), _aprec)} $_tk'),
+              // proportionalBtcFloor of the slice IS what settles — review == execution.
+              _Row('You receive', '${formatAtoms(_consentBtc.toString(), 8)} BTC'),
+              _Row('Order', 'The maker locks its Bitcoin FIRST; your asset funds only after that lock is confirmed and anchor-ordered.'),
+              _Row('Settles', 'On-chain HTLC on each side, anchor-bound to Bitcoin (about one block each leg).'),
+              _Row('If it stalls', 'Your asset refunds to you after its timeout; nothing is spent before the maker\'s Bitcoin is locked.'),
+            ]),
+          ),
+          const SizedBox(height: 14),
+          if (_busy) ...[
+            AmbraCard(
+              child: Row(children: [
+                const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: AmbraColors.amber)),
+                const SizedBox(width: 12),
+                Expanded(child: Text(_status.isEmpty ? 'Working…' : _status, style: AmbraText.sub)),
+              ]),
+            ),
+            const SizedBox(height: 10),
+          ],
+          if (_error != null)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
+          if (!_busy)
+            PrimaryButton(label: 'Sell for Bitcoin', icon: Icons.swap_horiz, onPressed: _confirm),
+          const SizedBox(height: 6),
+          GhostButton(label: _busy ? 'Close (the swap keeps running)' : 'Cancel', onPressed: () => Navigator.pop(context)),
+        ]),
+      ),
+    );
+  }
+}
+
+/// The reverse-sell RECORD sheet (banner tap): status + the off-ramps, following the record-screen
+/// idiom. Resume re-runs the persisted on-chain tail; "Refund asset" fires the CLTV branch (shown only
+/// once [XrSwapService.refundSeqReady] — the tip reached T_seq and the maker never claimed); "Clear"
+/// is offered only when [XrSwapService.canAbandon] proves nothing is (or might be) locked.
+class _XrRecordSheet extends StatefulWidget {
+  const _XrRecordSheet({required this.record});
+  final XrSwapRecord record;
+  @override
+  State<_XrRecordSheet> createState() => _XrRecordSheetState();
+}
+
+class _XrRecordSheetState extends State<_XrRecordSheet> {
+  bool _busy = false;
+  bool _refundReady = false;
+  String _status = '';
+  String? _error;
+
+  String get _tk => SeqAssets.labelFor(widget.record.seqAsset).ticker;
+  int get _aprec => SeqAssets.labelFor(widget.record.seqAsset).precision;
+
+  @override
+  void initState() {
+    super.initState();
+    _checkRefund();
+  }
+
+  Future<void> _checkRefund() async {
+    bool ready;
+    try {
+      ready = await XrSwapService.refundSeqReady(widget.record);
+    } catch (_) {
+      ready = false; // unreadable tip: the button stays hidden; the on-chain CLTV is the real gate
+    }
+    if (mounted) setState(() => _refundReady = ready);
+  }
+
+  Future<void> _run(Future<void> Function() act) async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await act();
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _status = '';
+          _error = e.toString().replaceFirst('Exception: ', '');
+        });
+      }
+      _checkRefund();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final r = widget.record;
+    final canClear = XrSwapService.canAbandon(r);
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Text('Cross-chain sell · $_tk', style: AmbraText.h1),
+          const SizedBox(height: 18),
+          AmbraCard(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Column(children: [
+              _Row('You sell', '${formatAtoms(r.seqAmount.toString(), _aprec)} $_tk'),
+              _Row('You receive', '${formatAtoms(r.btcAmount.toString(), 8)} BTC'),
+              _Row('Status', r.detail.isNotEmpty ? r.detail : r.step.name),
+              _Row('Refund unlocks', 'Sequentia block ${r.seqLocktime}'),
+            ]),
+          ),
+          const SizedBox(height: 14),
+          if (_busy && _status.isNotEmpty)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_status, style: AmbraText.muted)),
+          if (_error != null)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
+          PrimaryButton(
+            label: 'Resume swap',
+            busy: _busy,
+            icon: Icons.play_arrow,
+            onPressed: _busy
+                ? null
+                : () => _run(() async {
+                      await XrSwapService.resume(onStep: (s) {
+                        if (mounted) setState(() => _status = s);
+                      });
+                    }),
+          ),
+          if (_refundReady) ...[
+            const SizedBox(height: 8),
+            SecondaryButton(
+              label: 'Refund asset (timeout reached)',
+              icon: Icons.undo,
+              onPressed: _busy ? null : () => _run(() => XrSwapService.refundSeq(widget.record)),
+            ),
+          ],
+          if (canClear) ...[
+            const SizedBox(height: 8),
+            SecondaryButton(
+              label: 'Clear record (nothing locked)',
+              icon: Icons.cancel_outlined,
+              onPressed: _busy
+                  ? null
+                  : () => _run(() async {
+                        final ok = await XrSwapService.abandon();
+                        if (!ok) throw Exception('This record still protects a locked asset · refund it first.');
+                      }),
+            ),
+          ],
+          const SizedBox(height: 6),
+          GhostButton(label: 'Close', onPressed: _busy ? null : () => Navigator.pop(context)),
+        ]),
+      ),
+    );
+  }
+}
+
+/// Review + drive an LSP payer-bridge BUY. The review shows ONLY the user's own legs + a plain
+/// reassurance (mirror web reviewLspPayerBridge); confirm runs [LspBridgeService.buy] with the step
+/// surface. The record persists before anything leaves the device, so closing the sheet mid-flight is
+/// safe — the composer banner resumes it.
+class _BridgeRunSheet extends StatefulWidget {
+  const _BridgeRunSheet({required this.offer});
+  final CrossOffer offer;
+  @override
+  State<_BridgeRunSheet> createState() => _BridgeRunSheetState();
+}
+
+class _BridgeRunSheetState extends State<_BridgeRunSheet> {
+  bool _busy = false;
+  String _status = '';
+  String? _error;
+
+  String get _tk => SeqAssets.labelFor(widget.offer.seqAsset).ticker;
+  int get _aprec => SeqAssets.labelFor(widget.offer.seqAsset).precision;
+
+  Future<void> _confirm() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final rec = await LspBridgeService.buy(widget.offer, onStep: (s) {
+        if (mounted) setState(() => _status = s);
+      });
+      if (mounted) Navigator.pop(context, rec);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _status = '';
+          _error = e.toString().replaceFirst('Exception: ', '');
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final o = widget.offer;
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          const Text('Review · swap', style: AmbraText.h1),
+          const SizedBox(height: 18),
+          AmbraCard(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Column(children: [
+              _Row('Direction', 'Buy $_tk with Bitcoin over Lightning'),
+              _Row('You pay', '${formatAtoms(o.btcSats.toString(), 8)} BTC'),
+              _Row('You receive', '${formatAtoms(o.assetAtoms.toString(), _aprec)} $_tk'),
+              _Row('Your funds', 'Your funds stay in your control until this completes.'),
+              _Row('If it stalls', 'Your Bitcoin payment is held, never captured · it expires back on its own if the swap does not complete.'),
+            ]),
+          ),
+          const SizedBox(height: 14),
+          if (_busy) ...[
+            AmbraCard(
+              child: Row(children: [
+                const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: AmbraColors.amber)),
+                const SizedBox(width: 12),
+                Expanded(child: Text(_status.isEmpty ? 'Working…' : _status, style: AmbraText.sub)),
+              ]),
+            ),
+            const SizedBox(height: 10),
+            const Text('You can close this — the swap is saved and resumes from the Swap tab.', style: AmbraText.sub),
+            const SizedBox(height: 10),
+          ],
+          if (_error != null)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
+          if (!_busy) PrimaryButton(label: 'Place order', icon: Icons.bolt, onPressed: _confirm),
+          const SizedBox(height: 6),
+          GhostButton(label: _busy ? 'Close (the swap keeps running)' : 'Cancel', onPressed: () => Navigator.pop(context)),
+        ]),
+      ),
+    );
+  }
+}
+
+/// The bridge RECORD sheet (banner tap): status + Resume + the guarded Clear. Clearing is refused by
+/// [LspBridgeService.abandon] while the record still protects a possibly-HELD payment — it opens only
+/// once the swap is terminal, nothing was committed, or the Sequentia tip has passed T_seq (claiming is
+/// then forbidden anyway and the hold, whose CLTV covers T_seq, has expired back).
+class _BridgeRecordSheet extends StatefulWidget {
+  const _BridgeRecordSheet({required this.record});
+  final LspBridgeRecord record;
+  @override
+  State<_BridgeRecordSheet> createState() => _BridgeRecordSheetState();
+}
+
+class _BridgeRecordSheetState extends State<_BridgeRecordSheet> {
+  bool _busy = false;
+  String _status = '';
+  String? _error;
+
+  String get _tk => SeqAssets.labelFor(widget.record.asset).ticker;
+  int get _aprec => SeqAssets.labelFor(widget.record.asset).precision;
+
+  Future<void> _run(Future<void> Function() act) async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await act();
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _status = '';
+          _error = e.toString().replaceFirst('Exception: ', '');
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final r = widget.record;
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Text('Bridged buy · $_tk', style: AmbraText.h1),
+          const SizedBox(height: 18),
+          AmbraCard(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Column(children: [
+              _Row('You pay', '${formatAtoms(r.btcSats.toString(), 8)} BTC'),
+              _Row('You receive', '${formatAtoms(r.assetAtoms.toString(), _aprec)} $_tk'),
+              _Row('Status', r.detail.isNotEmpty ? r.detail : r.state.name),
+              _Row('If it stalls', 'Your Bitcoin payment is held, never captured · it expires back on its own.'),
+            ]),
+          ),
+          const SizedBox(height: 14),
+          if (_busy && _status.isNotEmpty)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_status, style: AmbraText.muted)),
+          if (_error != null)
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_error!, style: const TextStyle(color: AmbraColors.red))),
+          PrimaryButton(
+            label: 'Resume swap',
+            busy: _busy,
+            icon: Icons.play_arrow,
+            onPressed: _busy
+                ? null
+                : () => _run(() async {
+                      await LspBridgeService.resume(onStep: (s) {
+                        if (mounted) setState(() => _status = s);
+                      });
+                    }),
+          ),
+          const SizedBox(height: 8),
+          SecondaryButton(
+            label: 'Clear record',
+            icon: Icons.cancel_outlined,
+            onPressed: _busy
+                ? null
+                : () => _run(() async {
+                      final ok = await LspBridgeService.abandon();
+                      if (!ok) {
+                        throw Exception('This record still protects a held payment · it clears once the '
+                            'swap settles or its timeout passes.');
+                      }
+                    }),
+          ),
+          const SizedBox(height: 6),
+          GhostButton(label: 'Close', onPressed: _busy ? null : () => Navigator.pop(context)),
+        ]),
+      ),
+    );
+  }
 }

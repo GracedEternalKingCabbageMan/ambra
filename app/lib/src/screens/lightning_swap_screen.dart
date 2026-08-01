@@ -2,8 +2,8 @@ import 'package:flutter/material.dart';
 
 import '../data/config.dart';
 import '../data/lightning_service.dart';
+import '../data/ln_take_service.dart';
 import '../data/lsp_client.dart';
-import '../data/trade_receipts.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 
@@ -137,19 +137,13 @@ class _LightningSwapScreenState extends State<LightningSwapScreen> {
       _result = null;
     });
     try {
-      // SELF-CUSTODY (mirror the web reviewLn): bring the user's OWN nodes online + name them so the LSP
-      // drives the swap on THEM (the device co-signs the commitment updates over the wss link during this
-      // call), not the LSP's shared node. baseNodeKey = the base asset node; counterNodeKey = the counter
-      // asset node for asset↔asset, or the user's BTC node for asset↔BTC.
-      final baseNodeKey = await _ln.assetNodeKey(asset);
-      final counterNodeKey = _quoteAsset != null ? await _ln.assetNodeKey(_quoteAsset!) : await _ln.btcNodeKey();
       // PRE-CHECK /lnbook liquidity so we PIN the exact offer the LSP then lifts (never a relay-arbitrary
       // one at a different price) and never enable-then-fail. A served-but-empty book is an honest "no
       // liquidity"; an unreachable / older LSP without /lnbook returns an empty raw -> fall through to the
-      // LSP's own matching (no hard regression).
-      final book = await _ln.lnBook(asset, quoteAsset: _quoteAsset);
-      final best = book.best(_side);
-      if (best == null && book.raw.isNotEmpty) {
+      // LSP's own matching (no hard regression). The pin + request building live in [LnTakeService] (the
+      // ONE authority the composer uses too), so the wire shape can never drift between entry points.
+      final pin = await LnTakeService.pinBest(side: _side, asset: asset, quoteAsset: _quoteAsset);
+      if (pin.offer == null && pin.served) {
         if (mounted) {
           setState(() {
             _busy = false;
@@ -158,31 +152,21 @@ class _LightningSwapScreenState extends State<LightningSwapScreen> {
         }
         return;
       }
-      final r = await _ln.swap(
+      // The shared take persists the single-slot in-flight record BEFORE the POST, resolves the user's
+      // OWN node keys (self-custody — the device co-signs over the wss link during the call), and writes
+      // the settle receipt keyed by the preimage.
+      final r = await LnTakeService.take(
         side: _side,
         asset: asset,
-        amount: amt,
-        nodeKey: baseNodeKey,
-        counterNodeKey: counterNodeKey,
         quoteAsset: _quoteAsset,
-        offerId: best?.offerId,
-        makerPubkey: best?.makerPubkey,
+        offer: pin.offer,
+        typedAmount: _amount.text,
       );
       if (!mounted) return;
       setState(() {
         _busy = false;
         _result = r;
       });
-      // Log the settled swap to the shared DEX activity log (only a real settlement
-      // carries a preimage). Keyed by preimage so it is recorded exactly once.
-      if (r.preimage.isNotEmpty) {
-        final tk = SeqAssets.labelFor(asset).ticker;
-        TradeReceipts.log(
-          id: 'ln:${r.preimage}',
-          title: r.direction == 'sold' ? 'Sold $tk for BTC (Lightning)' : 'Bought $tk with BTC (Lightning)',
-          status: 'Settled',
-        ).ignore();
-      }
     } catch (e) {
       if (mounted) {
         setState(() {

@@ -407,6 +407,94 @@ class LspClient {
     final r = await _get(q.toString());
     return SubassetBook.fromJson(_decode(r));
   }
+
+  // -- LSP payer leg-bridge (a BUY paying BTC over Lightning vs an on-chain-only maker) ------------
+  // The Dart twins of the web's bridged /swap body (swap.js driveLspPayerBridge), seqlnBridgeHold and
+  // seqlnNodePayHash — byte-compatible bodies, so ONE hosted LSP serves both wallets. The DRIVER with
+  // its fund-safety ordering lives in lsp_bridge_service.dart; these are transport only.
+
+  /// Start a BRIDGED buy: POST /swap {bridge:true, ...} — the taker mints H (holds P self-custody) and
+  /// hands its OWN asset-claim key; the LSP secures the forward-maker terms, fronts the on-chain BTC
+  /// HTLC, and relays the maker's asset leg. Returns the 202 job handle to poll with [bridgeStatus].
+  /// Body byte-mirrors the web driver's swapBody (amounts as STRINGS; the maker binds exact amounts).
+  static Future<SubSwapJob> swapBridge({
+    required String asset,
+    required BigInt assetAtoms,
+    required BigInt btcSats,
+    required String offerId,
+    required String makerPubkey,
+    String? relayUrl,
+    required String hashH,
+    required String takerSeqClaimPub,
+  }) async {
+    final body = <String, dynamic>{
+      'side': 'buy',
+      'bridge': true,
+      'payRail': 'ln',
+      'recvRail': 'chain',
+      'asset': asset,
+      'amount': assetAtoms.toString(),
+      'asset_atoms': assetAtoms.toString(),
+      'btc_sats': btcSats.toString(),
+      'offer_id': offerId,
+      'maker_pubkey': makerPubkey,
+      // The relay HOLDING this offer (the unified book merges several); '' lets the LSP default.
+      'relay_url': relayUrl ?? '',
+      'hash_h': hashH.toLowerCase(),
+      'taker_seq_claim_pub': takerSeqClaimPub.toLowerCase(),
+      'maker_btc_rail': 'chain',
+      'maker_asset_rail': 'chain',
+      'taker_asset_inbound': false,
+      'taker_btc_inbound': false,
+    };
+    final r = await _postJson('/swap', body, timeout: const Duration(seconds: 90));
+    return SubSwapJob.fromJson(_decode(r));
+  }
+
+  /// Ask the LSP to issue the BTC-LN HOLD on the taker's H (POST /bridge/hold {job_id}) — the target the
+  /// taker then pays BY BARE HASH. The driver validates hash/amount/CLTV BEFORE paying (fail closed).
+  static Future<BridgeHold> bridgeHold({required String jobId}) async =>
+      BridgeHold.fromJson(_decode(await _postJson('/bridge/hold', {'job_id': jobId})));
+
+  /// Pay a BARE-HASH hold from the user's OWN hosted BTC node (POST /node/payhash, mirror
+  /// seqlnNodePayHash): commit an HTLC to [nodeId] on [hash] with a final-hop CLTV >= [minFinalCltv].
+  /// It lands HELD at the LSP (never captured) and settles only when the LSP recoups with P read from
+  /// the taker's on-chain asset claim. Returns the raw body ({committed}/{status}) — the driver checks
+  /// commitment; a `{ok:false}` body throws here like every other command.
+  static Future<Map<String, dynamic>> nodePayHash({
+    required String nodeKey,
+    required String nodeId,
+    required String hash,
+    required BigInt amountMsat,
+    int? minFinalCltv,
+    List<dynamic>? connectHints,
+  }) async {
+    final body = <String, dynamic>{
+      'node_key': nodeKey,
+      'node_id': nodeId.toLowerCase(),
+      'hash': hash.toLowerCase(),
+      'amount_msat': amountMsat.toInt(),
+    };
+    if (minFinalCltv != null) body['min_final_cltv'] = minFinalCltv;
+    if (connectHints != null && connectHints.isNotEmpty) body['connect_hints'] = connectHints;
+    return _decode(await _postJson('/node/payhash', body, timeout: const Duration(seconds: 90)));
+  }
+
+  /// The RICH status of a bridged job (GET `/swap/<id>`) — [jobStatus]'s tolerant transport with the
+  /// bridge fields parsed (bridge_terms / maker_seq_leg). Mirrors the web's seqlnJobStatusRaw: a
+  /// well-formed `{ok:false, status:'failed'}` body IS the answer for a status read (returned, not
+  /// thrown); a transport failure / non-2xx returns null so the poller keeps waiting.
+  static Future<BridgeJobStatus?> bridgeStatus(String pollPathOrId) async {
+    final path = pollPathOrId.startsWith('/') ? pollPathOrId : '/swap/$pollPathOrId';
+    try {
+      final r = await _get(path);
+      if (r.statusCode < 200 || r.statusCode >= 300) return null;
+      final j = r.body.isNotEmpty ? jsonDecode(r.body) as Map<String, dynamic> : <String, dynamic>{};
+      return BridgeJobStatus.fromJson(j);
+    } catch (_) {
+      return null;
+    }
+  }
 }
 
 /// One hosted channel's per-asset balances, as reported by `GET /status`.
@@ -895,4 +983,121 @@ class SubassetBook {
             .toList(),
         raw: j,
       );
+}
+
+/// The LSP's answer to `POST /bridge/hold`: the BARE-HASH hold target the taker pays. The seqln
+/// holdinvoice mints NO bolt11, so the LSP registers a hold on the taker's OWN H at its node and
+/// returns `{ node_id, payment_hash:H, amount_msat, hold_min_final_cltv, connect_hints }` (a future
+/// fork MAY mint a [bolt11] instead — it too must bind H). The DRIVER validates every field against
+/// the taker's own H / the offer price / the CLTV cap before paying — never on the LSP's word.
+class BridgeHold {
+  BridgeHold({
+    required this.nodeId,
+    required this.bolt11,
+    required this.paymentHash,
+    required this.amountMsat,
+    required this.holdMinFinalCltv,
+    required this.connectHints,
+    required this.raw,
+  });
+  final String? nodeId;
+  final String? bolt11;
+  final String? paymentHash;
+  final BigInt? amountMsat;
+  final int? holdMinFinalCltv;
+  final List<dynamic>? connectHints;
+  final Map<String, dynamic> raw;
+
+  static BridgeHold fromJson(Map<String, dynamic> j) => BridgeHold(
+        nodeId: (j['node_id'] ?? j['nodeId'])?.toString(),
+        bolt11: j['bolt11']?.toString(),
+        paymentHash: (j['payment_hash'] ?? j['paymentHash'])?.toString(),
+        amountMsat: j['amount_msat'] == null ? null : BigInt.tryParse('${j['amount_msat']}'),
+        holdMinFinalCltv: _asInt(j['hold_min_final_cltv'] ?? j['holdMinFinalCltv']),
+        connectHints: j['connect_hints'] is List ? j['connect_hints'] as List : null,
+        raw: j,
+      );
+}
+
+/// The maker's relayed Sequentia asset leg inside a bridged job poll (`maker_seq_leg`). The taker
+/// REBUILDS the redeem from its own key + H and byte-compares before trusting any of this.
+class BridgeLeg {
+  BridgeLeg({
+    required this.txid,
+    required this.vout,
+    required this.amount,
+    required this.asset,
+    required this.redeemScript,
+    required this.locktime,
+    required this.blockHash,
+  });
+  final String txid;
+  final int vout;
+  final BigInt amount;
+  final String asset;
+  final String redeemScript;
+  final int locktime;
+  final String blockHash;
+
+  static BridgeLeg? fromJson(Object? v) {
+    if (v is! Map) return null;
+    final txid = '${v['txid'] ?? ''}';
+    if (txid.isEmpty) return null;
+    return BridgeLeg(
+      txid: txid,
+      vout: _asInt(v['vout']) ?? -1,
+      amount: BigInt.tryParse('${v['amount'] ?? 0}') ?? BigInt.zero,
+      asset: '${v['asset'] ?? ''}',
+      redeemScript: '${v['redeem_script'] ?? v['redeemScript'] ?? ''}',
+      locktime: _asInt(v['locktime']) ?? 0,
+      blockHash: '${v['block_hash'] ?? v['blockHash'] ?? ''}',
+    );
+  }
+}
+
+/// One rich poll of a bridged job (`GET /swap/<id>`), the parsed fields the payer-bridge driver keys
+/// on: `bridge_terms` (the forward-maker terms the LSP secured — hash H, T_seq, the leg's refund key)
+/// and `maker_seq_leg` (the relayed asset leg, possibly nested inside bridge_terms). `failed` is a
+/// definitive verdict (the LSP stopped driving); a null poll (transport) is NOT.
+class BridgeJobStatus {
+  BridgeJobStatus({
+    required this.ok,
+    required this.status,
+    required this.error,
+    required this.termsHashH,
+    required this.seqLocktime,
+    required this.makerSeqRefundPub,
+    required this.makerSeqLeg,
+    required this.handshakeFailed,
+    required this.raw,
+  });
+  final bool ok;
+  final String status;
+  final String? error;
+  final String? termsHashH; // bridge_terms.hash_h (lowercased), null until the terms arrive
+  final int? seqLocktime; // bridge_terms.seq_locktime
+  final String? makerSeqRefundPub; // bridge_terms.maker_seq_refund_pub — re-read WITH the leg (fronted legs)
+  final BridgeLeg? makerSeqLeg;
+  final bool handshakeFailed; // bridgeHandshake.ok === false
+  final Map<String, dynamic> raw;
+
+  bool get hasTerms => termsHashH != null && termsHashH!.isNotEmpty;
+  bool get failed => status == 'failed' || handshakeFailed;
+
+  static BridgeJobStatus fromJson(Map<String, dynamic> j) {
+    final terms = j['bridge_terms'];
+    final t = terms is Map ? terms : const {};
+    final hs = j['bridgeHandshake'];
+    return BridgeJobStatus(
+      ok: j['ok'] != false,
+      status: '${j['status'] ?? ''}',
+      error: (j['error'] ?? (hs is Map ? hs['error'] : null))?.toString(),
+      termsHashH: t['hash_h']?.toString().toLowerCase(),
+      seqLocktime: _asInt(t['seq_locktime'] ?? t['seqLocktime']),
+      makerSeqRefundPub: (t['maker_seq_refund_pub'] ?? t['makerSeqRefundPub'])?.toString(),
+      makerSeqLeg: BridgeLeg.fromJson(j['maker_seq_leg'] ?? t['maker_seq_leg']),
+      handshakeFailed: hs is Map && hs['ok'] == false,
+      raw: j,
+    );
+  }
 }
