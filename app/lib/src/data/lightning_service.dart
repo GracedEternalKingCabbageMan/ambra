@@ -214,7 +214,8 @@ class LightningService extends ChangeNotifier {
   // user's OWN hosted asset node online (provision + device signer) and returns its LSP node_key —
   // the twin of the web wallet's `L.assetNodeKey`. The sub-asset SELL/BUY services drive the flow.
 
-  Future<SubassetBook> subassetBook(String asset) => LspClient.subassetBook(asset);
+  Future<SubassetBook> subassetBook(String asset, {String? quote}) =>
+      LspClient.subassetBook(asset, quote: quote);
 
   Future<HodlInvoiceStatus> invoiceStatus({required String nodeKey, required String paymentHash}) =>
       LspClient.invoiceStatus(nodeKey: nodeKey, paymentHash: paymentHash);
@@ -236,6 +237,7 @@ class LightningService extends ChangeNotifier {
     String? offerId,
     String? makerPubkey,
     String? swapNonce,
+    String? quoteAsset,
   }) =>
       LspClient.swapSub(
         side: side,
@@ -252,6 +254,7 @@ class LightningService extends ChangeNotifier {
         offerId: offerId,
         makerPubkey: makerPubkey,
         swapNonce: swapNonce,
+        quoteAsset: quoteAsset,
       );
 
   /// Bring the user's OWN hosted [asset] node online (provision + device signer) and return its LSP

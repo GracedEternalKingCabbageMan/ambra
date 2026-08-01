@@ -55,9 +55,10 @@ class SwapRoute {
   /// structural place as the leg the base is priced in. Null for a BTC<->asset or covenant route.
   final String? quoteAsset;
 
-  /// True when this is a SAME-CHAIN asset↔asset pair settling over pure Lightning (both legs asset-over-LN,
-  /// bound by one preimage), not a BTC<->asset LN route. The LSP `/swap` carries [quoteAsset] as the
-  /// counter asset (priority D). False for every BTC pair and the covenant book.
+  /// True when this is a SAME-CHAIN asset↔asset pair with the QUOTE asset standing in BTC's structural
+  /// place: pure Lightning (kind `ln` — both legs asset-over-LN, bound by one preimage) or MIXED (kind
+  /// `mixed` — one asset-LN HTLC + one ON-CHAIN HTLC on the quote asset on the Sequentia chain). The
+  /// LSP `/swap` carries [quoteAsset] as the counter asset. False for every BTC pair and the covenant book.
   final bool assetAsset;
 
   /// True when the PAY leg is BTC (a BUY of [seqAsset] with Bitcoin); false when
@@ -99,6 +100,11 @@ class SwapRoute {
       case SwapRouteKind.ln:
         return 'Instant Lightning swap. Nothing settles on-chain, so there is no Bitcoin-reorg risk.';
       case SwapRouteKind.mixed:
+        if (assetAsset) {
+          // Same-chain mixed: the on-chain leg is an HTLC on the QUOTE asset on Sequentia, not Bitcoin.
+          return 'Mixed swap. One leg settles over Lightning, the other on-chain as an HTLC on the '
+              'quote asset, bound by one secret.';
+        }
         if (isSubmarine) {
           // BTC leg over Lightning + asset leg on-chain -> the peer-to-peer submarine taker.
           return payIsBtc
@@ -169,6 +175,38 @@ SwapRoute route(
         payRail: 'ln',
         recvRail: 'ln',
       );
+    }
+    // MIXED same-chain (exactly one leg Lightning): a first-class combination (spec §5/§6.5), settled
+    // P2P as the SUB-ASSET construction with the pair's canonical QUOTE asset standing in BTC's
+    // structural place — one asset-LN HTLC (the base) + one ON-CHAIN HTLC on the QUOTE asset on the
+    // Sequentia chain, bound by one preimage (mirror web findRoute's mixedSame branch). Same honest
+    // gating as the BTC shapes: an 'ln' preference resolves only while Lightning is available (both
+    // legs then read 'chain' -> the covenant book), and an unknown quote falls through to the covenant
+    // book (never guess the frame). payIsBtc keeps its structural meaning of "paying the QUOTE side"
+    // (= a BUY of the base). The orientations whose LIGHTNING leg is the quote are classified here too
+    // ([isSubmarine]); dispatch refuses those by name — never a silent fall-through to `same`.
+    if (payRailLn != null &&
+        recvRailLn != null &&
+        sameChainQuote != null &&
+        sameChainQuote.isNotEmpty &&
+        (pay == sameChainQuote || recv == sameChainQuote)) {
+      final p = lnAvailable && payRailLn ? 'ln' : 'chain';
+      final r = lnAvailable && recvRailLn ? 'ln' : 'chain';
+      if (p != r) {
+        final quote = sameChainQuote;
+        final base = quote == pay ? recv : pay;
+        return SwapRoute(
+          kind: SwapRouteKind.mixed,
+          pay: pay,
+          recv: recv,
+          seqAsset: base,
+          quoteAsset: quote,
+          assetAsset: true,
+          payIsBtc: pay == quote,
+          payRail: p,
+          recvRail: r,
+        );
+      }
     }
     return SwapRoute(kind: SwapRouteKind.same, pay: pay, recv: recv);
   }

@@ -17,10 +17,32 @@ class TradeReceipt {
   final String status; // last-known status ("settled", "BTC locked", ...)
   final String? txid; // settling txid when known
   final int ts; // unix seconds, first seen
+  // Enriched trade fields (mirror the web's logTrade pair/side/price); all optional so
+  // plain activity rows and records written by older builds round-trip unchanged.
+  final String? pair; // "BASE/QUOTE" market label
+  final String? side; // 'buy' | 'sell' of the base
+  final double? price; // quote UNITS per base UNIT
 
-  TradeReceipt({required this.id, required this.title, required this.status, this.txid, required this.ts});
+  TradeReceipt(
+      {required this.id,
+      required this.title,
+      required this.status,
+      this.txid,
+      required this.ts,
+      this.pair,
+      this.side,
+      this.price});
 
-  Map<String, dynamic> toJson() => {'id': id, 'title': title, 'status': status, 'txid': txid, 'ts': ts};
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'status': status,
+        'txid': txid,
+        'ts': ts,
+        if (pair != null) 'pair': pair,
+        if (side != null) 'side': side,
+        if (price != null) 'price': price,
+      };
 
   factory TradeReceipt.fromJson(Map<String, dynamic> j) => TradeReceipt(
         id: '${j['id'] ?? ''}',
@@ -28,6 +50,9 @@ class TradeReceipt {
         status: '${j['status'] ?? ''}',
         txid: (j['txid'] as String?)?.isEmpty ?? true ? null : j['txid'] as String?,
         ts: (j['ts'] as num?)?.toInt() ?? 0,
+        pair: (j['pair'] as String?)?.isEmpty ?? true ? null : j['pair'] as String?,
+        side: (j['side'] as String?)?.isEmpty ?? true ? null : j['side'] as String?,
+        price: (j['price'] as num?)?.toDouble(),
       );
 }
 
@@ -52,16 +77,32 @@ class TradeReceipts {
       key: _key, value: jsonEncode(items.take(_cap).map((e) => e.toJson()).toList()));
 
   /// Upsert a receipt by [id]: a new id inserts at the front (preserving its first
-  /// [ts]); an existing id updates its title/status/txid in place, keeping the
-  /// original timestamp and list position so a progressing trade stays put.
-  static Future<void> log({required String id, required String title, required String status, String? txid}) async {
+  /// [ts]); an existing id updates its fields in place (an omitted field keeps the
+  /// previous value), keeping the original timestamp and list position so a
+  /// progressing trade stays put.
+  static Future<void> log(
+      {required String id,
+      required String title,
+      required String status,
+      String? txid,
+      String? pair,
+      String? side,
+      double? price}) async {
     final items = await list();
     final i = items.indexWhere((e) => e.id == id);
     if (i >= 0) {
       final prev = items[i];
-      items[i] = TradeReceipt(id: id, title: title, status: status, txid: txid ?? prev.txid, ts: prev.ts);
+      items[i] = TradeReceipt(
+          id: id,
+          title: title,
+          status: status,
+          txid: txid ?? prev.txid,
+          ts: prev.ts,
+          pair: pair ?? prev.pair,
+          side: side ?? prev.side,
+          price: price ?? prev.price);
     } else {
-      items.insert(0, TradeReceipt(id: id, title: title, status: status, txid: txid, ts: _nowS()));
+      items.insert(0, TradeReceipt(id: id, title: title, status: status, txid: txid, ts: _nowS(), pair: pair, side: side, price: price));
     }
     await _save(items);
   }

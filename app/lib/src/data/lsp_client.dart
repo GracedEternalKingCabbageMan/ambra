@@ -397,11 +397,14 @@ class LspClient {
     return SubSwapResult.fromJson(_decode(r));
   }
 
-  /// The sub-asset order book for [asset] (mirrors seqln.js `seqlnBook`): rail availability + the
-  /// resting offers on each side. Gates the sub-asset rail buttons and sources the best offer.
-  /// `{ sell_available, buy_available, sell_offers[], buy_offers[] }`.
-  static Future<SubassetBook> subassetBook(String asset) async {
-    final r = await _get('/book?asset=${Uri.encodeComponent(asset)}');
+  /// The sub-asset order book for [asset] (mirrors seqln.js `seqlnBook(asset, quote)`): rail
+  /// availability + the resting offers on each side. Gates the sub-asset rail buttons and sources the
+  /// best offer. `{ sell_available, buy_available, sell_offers[], buy_offers[] }`. [quote] keys the
+  /// MIXED same-chain book per (base, quote) pair — the on-chain leg's REAL asset; omitted = BTC.
+  static Future<SubassetBook> subassetBook(String asset, {String? quote}) async {
+    final q = StringBuffer('/book?asset=${Uri.encodeComponent(asset)}');
+    if (quote != null && quote.isNotEmpty) q.write('&quote=${Uri.encodeComponent(quote)}');
+    final r = await _get(q.toString());
     return SubassetBook.fromJson(_decode(r));
   }
 }
