@@ -4,10 +4,15 @@
     <uses-permission android:name="android.permission.INTERNET"/>
     <!-- QR scanning for the send recipient address. -->
     <uses-permission android:name="android.permission.CAMERA"/>
+    <!-- allowBackup=false: trade records (holding swap preimages, the only handle to in-flight
+         funds) are mirrored to app-internal files; auto-backup would (a) copy that material off the
+         device and (b) restore EncryptedSharedPreferences without the keystore key that encrypted
+         them, recreating the silent null-read failure the mirror exists to survive. -->
     <application
         android:label="Ambra"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
         android:usesCleartextTraffic="true">
         <activity
             android:name=".MainActivity"

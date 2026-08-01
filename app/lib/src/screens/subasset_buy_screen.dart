@@ -170,7 +170,8 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
       if (widget.quoteAsset == null) {
         final bal = BigInt.tryParse(BtcState.instance.last?.balanceSats ?? '');
         if (bal != null && rec.btcSats + _kBtcMinerHeadroomSats > bal) {
-          await SubBuyStore.remove(rec.id); // discard only THIS never-funded stub
+          // discard only THIS never-funded stub
+          await SubBuyStore.remove(rec.id, reason: 'affordability pre-check failed before funding (never-funded stub)');
           throw Exception(
               'You only hold ${_btc(bal)}. Locking ${_btc(rec.btcSats)} plus an on-chain fee needs more; reduce the amount.');
         }
@@ -232,7 +233,8 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
 
   Future<void> _reset() async {
     final r = _rec;
-    if (r != null) await SubBuyStore.remove(r.id); // drop only THIS record; others keep their handles
+    // drop only THIS record; others keep their handles
+    if (r != null) await SubBuyStore.remove(r.id, reason: 'user cleared the finished/abandoned buy card');
     _poll?.cancel();
     if (mounted) {
       setState(() {
@@ -296,6 +298,16 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
       AmbraCard(
         child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           Text('Best resting offer: ${_amt(o.assetAmount, widget.asset)} for ${_btc(o.btcSats)}.',
+              style: AmbraText.sub),
+          const SizedBox(height: 8),
+          // HONEST SPEED LABEL, stated BEFORE commit: the BTC shape waits on the taker's OWN on-chain
+          // Bitcoin lock confirming before the maker pays the asset; the same-chain quote shape has no
+          // Bitcoin-confirmation wait and settles at Sequentia speed.
+          Text(
+              widget.quoteAsset == null
+                  ? 'How long · your Bitcoin lock waits on Bitcoin confirmations before the $_ticker '
+                      'arrives over Lightning, typically 10-60+ minutes on testnet4.'
+                  : 'How long · settles at Sequentia speed, typically about a minute.',
               style: AmbraText.sub),
           const SizedBox(height: 10),
           AmbraField(label: '$_qtk to spend (blank = whole offer)', controller: _amount, hint: '0.0'),

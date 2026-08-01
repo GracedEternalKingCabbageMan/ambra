@@ -189,7 +189,8 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
 
   Future<void> _reset() async {
     final r = _rec;
-    if (r != null) await SubSellStore.remove(r.id); // drop only THIS record; others keep their handles
+    // drop only THIS record; others keep their handles
+    if (r != null) await SubSellStore.remove(r.id, reason: 'user cleared the finished/abandoned sell card');
     _poll?.cancel();
     if (mounted) {
       setState(() {
@@ -252,6 +253,16 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
             Text('Best resting bid locks ${_btc(_offer!.btcSats)} for ${_amt(_offer!.assetAmount, widget.asset)}.',
                 style: AmbraText.sub),
           ],
+          const SizedBox(height: 8),
+          // HONEST SPEED LABEL, stated BEFORE commit: the swap itself settles fast (you pay over
+          // Lightning against a verified lock), but on the BTC shape the claim that lands the Bitcoin in
+          // your wallet is an on-chain testnet4 transaction that still has to confirm.
+          Text(
+              widget.quoteAsset == null
+                  ? 'How long · your $_ticker pays over Lightning in about a minute; the Bitcoin then '
+                      'arrives as an on-chain claim, typically confirming in 10-60+ minutes on testnet4.'
+                  : 'How long · settles at Sequentia speed, typically about a minute.',
+              style: AmbraText.sub),
         ]),
       ),
       const SizedBox(height: 16),

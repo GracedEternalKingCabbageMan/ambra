@@ -265,6 +265,70 @@ class SettlementDispatch {
   final String? reason;
 }
 
+/// The SPEED CLASS of a mixed-take candidate: how the taker's crossed leg settles once committed.
+/// [native] = the maker itself serves the taker's rails (a P2P submarine / an asset-over-LN maker), so
+/// the take settles at Sequentia speed — typically about a minute, no Bitcoin-confirmation wait.
+/// [bridged] = the maker-first bridged path (the LSP terminates the crossed leg): settlement waits on
+/// Bitcoin confirmations, typically 10-60+ minutes on testnet4, unless the LSP fronts from inventory.
+enum MixedSpeed { native, bridged }
+
+/// One candidate for a mixed BTC<->asset take, priced by its EXECUTED amounts — the amounts the take
+/// itself would settle (for the whole-offer submarine/bridge rails: [sizeSubswapTake]'s take amounts),
+/// never the advertised unit price. Review must equal execution, so selection compares the same numbers.
+class MixedCandidate<T> {
+  const MixedCandidate({
+    required this.offer,
+    required this.execAssetAtoms,
+    required this.execBtcSats,
+    required this.speed,
+  });
+
+  /// The book offer this candidate wraps (opaque to the planner).
+  final T offer;
+
+  /// The EXECUTED leg amounts — what would actually move, computed with the same proportional/rounding
+  /// math the take uses.
+  final BigInt execAssetAtoms;
+  final BigInt execBtcSats;
+
+  final MixedSpeed speed;
+}
+
+/// ROUTING HONESTY (the stared-at-a-conf-wait incident): choose the candidate for a mixed take AFTER
+/// classifying every candidate's settlement path, never before. The rule: the best-priced NATIVE-fast
+/// candidate wins whenever its executed price is EQUAL-OR-BETTER; a BRIDGED-slow candidate is chosen
+/// ONLY when its executed price is STRICTLY better than every native one — a taker paying BTC over
+/// Lightning must never wait on Bitcoin confirmations for the sake of an equal price. Executed price is
+/// compared EXACTLY (BigInt cross-multiplication over the executed amounts — no float rounding); ties
+/// inside a class keep the caller's order (the caller pre-ranks by coverage/closeness). [buy] true =
+/// the taker pays BTC (fewer sats per atom is better); false = the taker receives BTC (more is better).
+/// Returns null only for an empty candidate list. PURE.
+MixedCandidate<T>? pickMixedCandidate<T>(List<MixedCandidate<T>> candidates, {required bool buy}) {
+  // negative = a prices strictly better than b for this side. A zero-atom candidate is unpriceable and
+  // compares as worst (never chosen over a priceable one).
+  int cmp(MixedCandidate<T> a, MixedCandidate<T> b) {
+    final aDead = a.execAssetAtoms <= BigInt.zero, bDead = b.execAssetAtoms <= BigInt.zero;
+    if (aDead || bDead) return aDead == bDead ? 0 : (aDead ? 1 : -1);
+    final c = (a.execBtcSats * b.execAssetAtoms).compareTo(b.execBtcSats * a.execAssetAtoms);
+    return buy ? c : -c;
+  }
+
+  MixedCandidate<T>? bestOf(MixedSpeed s) {
+    MixedCandidate<T>? best;
+    for (final c in candidates) {
+      if (c.speed != s) continue;
+      if (best == null || cmp(c, best) < 0) best = c; // strict < keeps the caller's order on ties
+    }
+    return best;
+  }
+
+  final native = bestOf(MixedSpeed.native);
+  final bridged = bestOf(MixedSpeed.bridged);
+  if (native == null) return bridged;
+  if (bridged == null) return native;
+  return cmp(bridged, native) < 0 ? bridged : native; // bridged ONLY on a STRICTLY better executed price
+}
+
 /// Route a rail-blind cross [route] to its settlement PATH given the resting offer's caps — the Dart twin
 /// of settlement-router.mjs `chooseSettlementPath` + subswap.js `dispatchSubswap`. The rail crossing is
 /// always on the BTC leg (the asset leg is Sequentia on-chain); its lnSide names who is on Lightning.

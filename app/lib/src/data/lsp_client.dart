@@ -1069,6 +1069,8 @@ class BridgeJobStatus {
     required this.makerSeqRefundPub,
     required this.makerSeqLeg,
     required this.handshakeFailed,
+    this.frontMode,
+    this.expectedWait,
     required this.raw,
   });
   final bool ok;
@@ -1079,10 +1081,21 @@ class BridgeJobStatus {
   final String? makerSeqRefundPub; // bridge_terms.maker_seq_refund_pub — re-read WITH the leg (fronted legs)
   final BridgeLeg? makerSeqLeg;
   final bool handshakeFailed; // bridgeHandshake.ok === false
+
+  /// How the LSP is serving the asset leg — `'inventory'` (fronted from its own inventory, fast) or
+  /// `'maker-first'` (waits on Bitcoin confirmations, slow). TOLERANT: an older LSP omits it, and
+  /// ABSENT means the slow maker-first path — never assume fast.
+  final String? frontMode;
+
+  /// The LSP's own human-readable timescale for the current wait (`expected_wait`), when it gives one.
+  final String? expectedWait;
   final Map<String, dynamic> raw;
 
   bool get hasTerms => termsHashH != null && termsHashH!.isNotEmpty;
   bool get failed => status == 'failed' || handshakeFailed;
+
+  /// True ONLY when the LSP explicitly says it fronts the asset from inventory (the fast variant).
+  bool get frontedFromInventory => frontMode == 'inventory';
 
   static BridgeJobStatus fromJson(Map<String, dynamic> j) {
     final terms = j['bridge_terms'];
@@ -1097,6 +1110,12 @@ class BridgeJobStatus {
       makerSeqRefundPub: (t['maker_seq_refund_pub'] ?? t['makerSeqRefundPub'])?.toString(),
       makerSeqLeg: BridgeLeg.fromJson(j['maker_seq_leg'] ?? t['maker_seq_leg']),
       handshakeFailed: hs is Map && hs['ok'] == false,
+      // Asset-side fronting fields — read TOLERANTLY (top-level or inside bridge_terms, either casing);
+      // absent stays null, which every reader treats as the slow maker-first path.
+      frontMode: (j['front_mode'] ?? j['frontMode'] ?? t['front_mode'] ?? t['frontMode'])
+          ?.toString()
+          .toLowerCase(),
+      expectedWait: (j['expected_wait'] ?? j['expectedWait'] ?? t['expected_wait'] ?? t['expectedWait'])?.toString(),
       raw: j,
     );
   }

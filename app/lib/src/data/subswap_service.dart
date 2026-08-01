@@ -43,6 +43,7 @@ import 'config.dart';
 import 'cross_courier.dart';
 import 'lightning_service.dart';
 import 'lsp_client.dart';
+import 'store_log.dart';
 import 'trade_slots.dart';
 import 'tx_flow.dart';
 import 'wallet_repository.dart';
@@ -813,9 +814,10 @@ class SubswapStore {
     } catch (_) {/* mirrors already fail safe inside loadAll */}
   }
 
-  /// Remove ONE record by id (a settled/refunded/abandoned swap) — never the whole store.
-  static Future<void> remove(String id) async {
-    await _list.removeById(id);
+  /// Remove ONE record by id (a settled/refunded/abandoned swap) — never the whole store. [reason] is
+  /// logged loudly by the substrate — a subswap record removal must never be silent.
+  static Future<void> remove(String id, {String reason = 'unspecified'}) async {
+    await _list.removeById(id, reason: reason);
     try {
       await loadAll();
     } catch (_) {}
@@ -1153,7 +1155,8 @@ class SubswapService {
       if (rescan != HtlcScanResult.empty) return false;
       // ALL gates hold (NO wall clock consulted — the re-scan's clock-free height proof is the sole margin):
       // the warned clear proceeds — remove EXACTLY this record (other trades' records untouched).
-      await SubswapStore.remove(fresh.id);
+      await SubswapStore.remove(fresh.id,
+          reason: 'user-warned clear: every clock-free gate held (state=${fresh.state.name})');
       return true;
     } finally {
       _drivingIds.remove(rec.id);
@@ -1686,9 +1689,12 @@ class SubswapService {
     List<SubswapRecord> recs;
     try {
       recs = await SubswapStore.loadAll();
-    } catch (_) {
+    } catch (e) {
+      storeLog('subswap resume: store UNREADABLE ($e) - nothing driven, records stay persisted');
       return; // fail-safe already applied inside loadAll (guard closed); retry next boot/choke point
     }
+    storeLog('subswap resume: ${recs.length} record(s)'
+        '${recs.isEmpty ? '' : ' [${recs.map((r) => '${r.id}:${r.state.name}').join(', ')}]'}');
     await Future.wait([
       for (final r in recs) _resumeOne(r, onStep: onStep).catchError((Object _) {}),
     ]);
@@ -1708,7 +1714,8 @@ class SubswapService {
 
   static Future<void> _resumeInner(SubswapRecord rec, {void Function(String)? onStep}) async {
     if (rec.terminal) {
-      await SubswapStore.remove(rec.id); // drop ONLY this finished record
+      storeLog('subswap resume: id=${rec.id} terminal (state=${rec.state.name}) - record dropped');
+      await SubswapStore.remove(rec.id, reason: 'resume: terminal record (state=${rec.state.name})');
       return;
     }
     final m = await _mnemonic();
@@ -1843,7 +1850,8 @@ class SubswapService {
           // drop THIS record cleanly (no dangling record eating a trade slot, no double-fund — nothing to
           // fund). A record whose broadcast WAS attempted can never take this branch, so a
           // funded-but-txid-unpersisted HTLC is never cleared.
-          await SubswapStore.remove(rec.id);
+          await SubswapStore.remove(rec.id,
+              reason: 'resume: broadcast never attempted and the P2SH is definitively unfunded');
           return;
         }
         // Not yet visible / unreadable: keep resumable (never a false drop of a possibly-funded SELL).
@@ -1906,7 +1914,8 @@ class SubswapService {
 
     // Pre-commitment (no P, no funded leg): the live courier session cannot be resumed and nothing was
     // committed — drop THIS record. (A 'paying' buy / funded sell are handled above and NEVER reach here.)
-    await SubswapStore.remove(rec.id);
+    await SubswapStore.remove(rec.id,
+        reason: 'resume: pre-commitment record (state=${rec.state.name}) - nothing was committed');
   }
 
   // -- chain reads + per-asset fees (mirror XchainSwapService) -----------------------------------------

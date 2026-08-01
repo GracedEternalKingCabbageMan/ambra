@@ -3123,12 +3123,50 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     } else {
       cands.sort((a, b) => a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom));
     }
-    final offer = cands.first;
+    // ROUTING HONESTY (the 25-minute-stare incident): classify EVERY candidate's settlement path BEFORE
+    // choosing, then pick with [pickMixedCandidate] — the NATIVE-fast class (a P2P submarine, settling at
+    // Sequentia speed) wins at an equal-or-better executed price; a BRIDGED maker-first candidate (the
+    // LSP leg-bridge, waiting on Bitcoin confirmations) is chosen ONLY for a STRICTLY better executed
+    // price. The old order (offer first, path second) let a slow cross maker at the top of the price
+    // sort shadow a fast submarine maker resting at essentially the same price. Executed amounts come
+    // from [sizeSubswapTake] — the same whole-offer math the take itself settles (review == execution).
+    SettlementDispatch dispFor(CrossOffer o) => chooseSettlementPath(r,
+        makerInteractive: o.interactive, makerBtcLn: o.btcLn, makerAssetOnchain: o.assetOnchain);
+    final viable = <MixedCandidate<CrossOffer>>[];
+    SettlementDispatch? bestUnusable; // the best-ranked candidate NO path serves — keys the honest refusal
+    for (final o in cands) {
+      final d = dispFor(o);
+      // The RECEIVER bridge (a SELL over the LSP) is not built on mobile, so a bridged SELL candidate is
+      // not viable — it must lose to nothing rather than be picked and then refused.
+      final usable = d.path == SettlementPath.p2pSubmarine ||
+          (d.path == SettlementPath.lspBridge && d.lnSide == 'payer');
+      if (!usable) {
+        bestUnusable ??= d;
+        continue;
+      }
+      final size = sizeSubswapTake(want: reqAtoms ?? BigInt.zero, offerAtoms: o.assetAtoms, offerBtc: o.btcSats);
+      viable.add(MixedCandidate<CrossOffer>(
+          offer: o,
+          execAssetAtoms: size.takeAtoms,
+          execBtcSats: size.takeBtc,
+          speed: d.path == SettlementPath.p2pSubmarine ? MixedSpeed.native : MixedSpeed.bridged));
+    }
+    if (viable.isEmpty) {
+      // Nothing any built path serves: the existing honest refusals, keyed on WHY the best was refused.
+      if (bestUnusable?.path == SettlementPath.unsupported) {
+        _snack('The best $tk offer rests over Lightning, so this rail crossing has no on-chain $tk leg to '
+            'settle against right now · try again shortly, or switch the $tk leg to On-chain.');
+      } else {
+        _snack('No resting $tk offer that settles this Lightning crossing right now · try again shortly, '
+            'or set the crossed leg to On-chain.');
+      }
+      return;
+    }
+    final offer = pickMixedCandidate(viable, buy: buy)!.offer;
     // ORDER (Task 4): route on the maker's SIGNED caps FIRST, then apply the per-path gates. The BTC-LN
     // outbound check + whole-offer guard apply ONLY to the p2pSubmarine buy — an on-chain-only maker
     // (-> lspBridge, honest-disabled) must NOT be told to fund a BTC-LN channel that path never uses.
-    final disp = chooseSettlementPath(r,
-        makerInteractive: offer.interactive, makerBtcLn: offer.btcLn, makerAssetOnchain: offer.assetOnchain);
+    final disp = dispFor(offer);
     switch (disp.path) {
       case SettlementPath.p2pSubmarine:
         // BUY BTC-LN OUTBOUND CHECK (mirror web reviewSubmarineP2P) — ONLY on the P2P submarine buy branch.
@@ -5470,6 +5508,8 @@ class _BridgeRunSheetState extends State<_BridgeRunSheet> {
               _Row('You pay', '${formatAtoms(o.btcSats.toString(), 8)} BTC'),
               _Row('You receive', '${formatAtoms(o.assetAtoms.toString(), _aprec)} $_tk'),
               _Row('Your funds', 'Your funds stay in your control until this completes.'),
+              _Row('How long', 'The asset lock waits on Bitcoin confirmations · typically 10-60+ minutes on testnet4. '
+                  'Safe to leave the app · the trade resumes from its in-flight card on the Swap tab.'),
               _Row('If it stalls', 'Your Bitcoin payment is held, never captured · it expires back on its own if the swap does not complete.'),
             ]),
           ),
@@ -5483,7 +5523,8 @@ class _BridgeRunSheetState extends State<_BridgeRunSheet> {
               ]),
             ),
             const SizedBox(height: 10),
-            const Text('You can close this — the swap is saved and resumes from the Swap tab.', style: AmbraText.sub),
+            const Text('You can close this and leave the app · the swap is saved and resumes from the Swap tab, '
+                'typically completing in 10-60+ minutes.', style: AmbraText.sub),
             const SizedBox(height: 10),
           ],
           if (_error != null)

@@ -10,6 +10,7 @@ import 'config.dart';
 import 'lightning_service.dart';
 import 'lsp_client.dart';
 import 'trade_receipts.dart';
+import 'store_log.dart';
 import 'trade_slots.dart';
 import 'wallet_repository.dart';
 
@@ -175,12 +176,14 @@ class SubSellStore {
 
   static Future<void> save(SubSellRecord r) => _list.upsert(r.toJson());
 
-  /// Remove ONE record by id (a finished sell, or a definitively-dead 'paying' stub).
-  static Future<void> remove(String id) => _list.removeById(id);
+  /// Remove ONE record by id (a finished sell, or a definitively-dead 'paying' stub). [reason] is
+  /// logged loudly by the substrate — a sell-record removal must never be silent.
+  static Future<void> remove(String id, {String reason = 'unspecified'}) =>
+      _list.removeById(id, reason: reason);
 
   /// Drop terminal records before starting a new sell (bounded-list hygiene). A record still in
   /// flight — even 'paying' (asset possibly paid) — is NEVER pruned.
-  static Future<void> pruneSettled() => _list.removeWhere((e) {
+  static Future<void> pruneSettled() => _list.removeWhere(reason: 'pruneSettled: finished sell', (e) {
         try {
           return !SubSellRecord.fromJson(e).inFlight;
         } catch (_) {
@@ -350,7 +353,10 @@ class SubassetSellService {
         // are their own trades' recovery handles).
         if (paidCallStarted && !_payMayHaveCompleted(e)) {
           final cur = await SubSellStore.load(id: paying.id);
-          if (cur != null && cur.step == SubSellStep.paying) await SubSellStore.remove(paying.id);
+          if (cur != null && cur.step == SubSellStep.paying) {
+            await SubSellStore.remove(paying.id,
+                reason: 'begin: pay call failed before the asset could have been paid');
+          }
         }
         rethrow;
       }
@@ -518,9 +524,12 @@ class SubassetSellService {
     List<SubSellRecord> recs;
     try {
       recs = await SubSellStore.activeAll();
-    } catch (_) {
+    } catch (e) {
+      storeLog('sub-asset SELL resume: store UNREADABLE ($e) - nothing driven, records stay persisted');
       return; // unreadable store: records stay persisted for the next resume
     }
+    storeLog('sub-asset SELL resume: ${recs.length} active record(s)'
+        '${recs.isEmpty ? '' : ' [${recs.map((r) => '${r.id}:${r.step.name}').join(', ')}]'}');
     await Future.wait([for (final r in recs) _resumeOne(r).catchError((Object _) {})]);
   }
 
@@ -545,7 +554,9 @@ class SubassetSellService {
       // still-'paying' record this old can't complete — clear it rather than re-attempt (or re-run) forever.
       final startedMs = rec.startedMs ?? 0;
       if (startedMs > 0 && DateTime.now().millisecondsSinceEpoch - startedMs > _kPayingTtlMs) {
-        await SubSellStore.remove(rec.id); // only THIS dead record; others keep their handles
+        // only THIS dead record; others keep their handles
+        await SubSellStore.remove(rec.id,
+            reason: 'resume: stale paying record past the Lightning-leg TTL - cannot complete');
         return;
       }
       try {

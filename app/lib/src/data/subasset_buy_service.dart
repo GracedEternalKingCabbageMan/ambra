@@ -8,6 +8,7 @@ import 'config.dart';
 import 'lightning_service.dart';
 import 'lsp_client.dart';
 import 'trade_receipts.dart';
+import 'store_log.dart';
 import 'trade_slots.dart';
 import 'wallet_repository.dart';
 
@@ -232,13 +233,15 @@ class SubBuyStore {
 
   static Future<void> save(SubBuyRecord r) => _list.upsert(r.toJson());
 
-  /// Remove ONE record by id (a finished/abandoned buy) — never the whole store.
-  static Future<void> remove(String id) => _list.removeById(id);
+  /// Remove ONE record by id (a finished/abandoned buy) — never the whole store. [reason] is logged
+  /// loudly by the substrate — a buy-record removal must never be silent.
+  static Future<void> remove(String id, {String reason = 'unspecified'}) =>
+      _list.removeById(id, reason: reason);
 
   /// Drop terminal records + never-funded secretReady stubs before starting a new buy (the bounded-list
   /// hygiene the single slot got for free). A record that is (or may be) holding funds is NEVER pruned.
   static Future<void> pruneSettled() =>
-      _list.removeWhere((e) {
+      _list.removeWhere(reason: 'pruneSettled: terminal / never-funded stub', (e) {
         try {
           final r = SubBuyRecord.fromJson(e);
           return r.terminal || (r.step == SubBuyStep.secretReady && r.fundingTxid.isEmpty);
@@ -711,9 +714,12 @@ class SubassetBuyService {
     List<SubBuyRecord> recs;
     try {
       recs = await SubBuyStore.activeAll();
-    } catch (_) {
+    } catch (e) {
+      storeLog('sub-asset BUY resume: store UNREADABLE ($e) - nothing driven, records stay persisted');
       return; // unreadable store: nothing to drive now; records stay persisted
     }
+    storeLog('sub-asset BUY resume: ${recs.length} active record(s)'
+        '${recs.isEmpty ? '' : ' [${recs.map((r) => '${r.id}:${r.step.name}').join(', ')}]'}');
     await Future.wait([
       for (final r in recs)
         if (r.inFlight && r.preimage.isNotEmpty) _resumeOne(r).catchError((Object _) {}),
