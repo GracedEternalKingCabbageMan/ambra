@@ -43,6 +43,7 @@ import 'config.dart';
 import 'cross_courier.dart';
 import 'lightning_service.dart';
 import 'lsp_client.dart';
+import 'trade_slots.dart';
 import 'tx_flow.dart';
 import 'wallet_repository.dart';
 
@@ -363,6 +364,7 @@ enum SubState { starting, verifying, verified, paying, claiming, settled, fundin
 
 class SubswapRecord {
   SubswapRecord({
+    String? id,
     required this.buy,
     required this.state,
     required this.asset,
@@ -389,8 +391,11 @@ class SubswapRecord {
     this.broadcastAt = 0,
     this.broadcastSeqHeight = 0,
     this.detail = '',
-  });
+  }) : id = id ?? newTradeId();
 
+  /// Stable per-record id (multi-record store): every save upserts on it, so a second submarine can
+  /// never clobber this record's H/P/redeem/txid (the fund-safety the single slot enforced by refusal).
+  final String id;
   final bool buy; // true = reverse buy (ln_direction 1); false = normal sell (ln_direction 0)
   SubState state;
   final String asset; // asset id (hex)
@@ -455,6 +460,7 @@ class SubswapRecord {
   bool get terminal => state == SubState.settled || state == SubState.failed || state == SubState.refunded;
 
   Map<String, dynamic> toJson() => {
+        'id': id,
         'buy': buy,
         'state': state.name,
         'asset': asset,
@@ -484,6 +490,7 @@ class SubswapRecord {
       };
 
   static SubswapRecord fromJson(Map<String, dynamic> j) => SubswapRecord(
+        id: '${j['id'] ?? ''}'.isEmpty ? null : '${j['id']}',
         buy: j['buy'] == true,
         // UNRECOGNISED state -> SubState.unknown (NON-terminal), NEVER SubState.failed (terminal). A future/foreign
         // state string decoding to a terminal value would let the guard read a LIVE record as done and clobber it.
@@ -515,11 +522,15 @@ class SubswapRecord {
       );
 }
 
-/// Persists the single active submarine. Distinct key from the cross forward/reverse stores so the
-/// wizards never clobber each other.
+/// Persists the active submarines — a MULTI-RECORD list ('ambra.subswaps', the web SUBSWAPS array) with
+/// one-time never-lossy adoption of the legacy single-slot record ('ambra.subswap.active'). Every save
+/// upserts by [SubswapRecord.id], so records never clobber each other; the synchronous guard machinery
+/// (primed / primeErrored / corrupt / activeCount) keeps its single-slot fail-safe semantics, now over
+/// the whole list. Distinct keys from the cross forward/reverse stores so the wizards never mix.
 class SubswapStore {
   SubswapStore._();
-  static const _key = 'ambra.subswap.active';
+  static final TradeListStore _list =
+      TradeListStore(listKey: 'ambra.subswaps', legacyKey: 'ambra.subswap.active');
   static const _storage = FlutterSecureStorage();
 
   /// The secure-storage slot the RETIRED RFQ reverse rail (its service and store, both deleted)
@@ -644,16 +655,15 @@ class SubswapStore {
     }
   }
 
-  /// SYNCHRONOUS in-memory mirror of "a NON-TERMINAL submarine record exists" — the Dart twin of swap.js's
-  /// module-level SUBSWAP + hasSubswapInFlight(). Secure-storage reads are async, so WITHOUT a synchronous
-  /// flag a fresh _start could save a new record over a live one in the load() gap (destroying its
-  /// H/P/redeem/txid -> STRANDED funds). Primed at cold start (via [primeInFlight], AWAITED in shell startup
-  /// BEFORE the Swap tab is interactive) and kept current by every [load]/[save]/[clear], so both the review
-  /// dispatch and _start can refuse a second submarine with NO async race. One submarine at a time
-  /// (whole-HTLC, resumable) — matches the web, whose hasSubswapInFlight is authoritative from the first
-  /// frame because it hydrates SYNCHRONOUSLY at module-eval.
-  static bool _inFlight = false;
-  static bool get hasInFlight => _inFlight;
+  /// SYNCHRONOUS in-memory mirror of "how many NON-TERMINAL submarine records exist" — the Dart twin of
+  /// swap.js's module-level SUBSWAPS + activeSubswaps(). Secure-storage reads are async, so without a
+  /// synchronous mirror a dispatch would race the load() gap. Primed at cold start (via [primeInFlight],
+  /// AWAITED in shell startup BEFORE the Swap tab is interactive) and kept current by every
+  /// [loadAll]/[save]/[remove]/[clear]. Corrupt/undrivable entries COUNT as active (they may represent
+  /// live funded swaps), so the guard fails safe over them.
+  static int _activeCount = 0;
+  static int get activeCount => _activeCount;
+  static bool get hasInFlight => _activeCount > 0;
 
   /// Whether the guard has been AUTHORITATIVELY established from disk yet (by [primeInFlight], any [load], or
   /// a [save]/[clear]). Until then the default-false [hasInFlight] is NOT trustworthy — a caller reaching the
@@ -685,9 +695,9 @@ class SubswapStore {
   static bool _corrupt = false;
   static bool get corrupt => _corrupt;
 
-  /// Set the synchronous [hasInFlight] flag directly — belt-and-suspenders for callers that must FORCE the
-  /// guard closed (e.g. the cold-start resume's .catchError, so a read failure never leaves it open).
-  static void markInFlight(bool v) => _inFlight = v;
+  /// Set the synchronous [hasInFlight] guard directly — belt-and-suspenders for callers that must FORCE
+  /// the guard closed (e.g. the cold-start resume's .catchError, so a read failure never leaves it open).
+  static void markInFlight(bool v) => _activeCount = v ? (_activeCount > 0 ? _activeCount : 1) : 0;
 
   /// AWAITED cold-start prime: split from the heavy settlement drive [SubswapService.resume] so the guard is
   /// authoritative BEFORE the swap UI is reachable. Loads the persisted record and sets [hasInFlight] to
@@ -700,97 +710,150 @@ class SubswapStore {
     // cold-start hook. It never throws and touches a DIFFERENT key, so it cannot affect the priming below.
     await sweepLegacyReverseRecord();
     try {
-      await load(); // a definitive read sets _inFlight + _primed; a read/decode error fails safe (in-flight)
+      await loadAll(); // a definitive read sets the mirrors; a read/decode error fails safe (in-flight)
     } catch (_) {
-      // [load] already failed safe (_inFlight = true, _primed = true, _primeErrored = true, and _corrupt on a
+      // [loadAll] already failed safe (guard closed, _primed, _primeErrored, and _corrupt on a durable
       // decode error). Priming must not throw into startup.
     }
   }
 
-  /// Load the persisted record AND keep the synchronous guard authoritative. FAIL SAFE (fund-loss): a locked
-  /// keystore / decrypt / unreadable read is NOT mistaken for "no record" — it sets [hasInFlight] true
-  /// (primed-but-uncertain) and rethrows, so _start / _dispatchSubmarine BLOCK rather than clobber a
-  /// possibly-live on-disk record. A read that DEFINITIVELY returns null/empty is the ONLY path that sets
-  /// not-in-flight.
+  /// Load every DRIVABLE persisted record AND keep the synchronous guard authoritative. FAIL SAFE
+  /// (fund-loss): a locked keystore / unreadable read is NOT mistaken for "no records" — it keeps
+  /// [hasInFlight] closed (primed-but-uncertain) and rethrows. A read that DEFINITIVELY returns an
+  /// empty store is the ONLY path that opens the guard.
   ///
-  /// DISTINGUISH TRANSIENT READ vs DURABLE CORRUPT (Task 1/2): the `_storage.read` and the decode are in
-  /// SEPARATE try-blocks. An exception from the READ is transient (a locked/busy keystore) — it sets
-  /// [primeErrored] so a retry at a dispatch choke point can HEAL the guard. An exception from decoding a
-  /// PRESENT non-empty value is DURABLE (a torn write / keystore-migration decrypt mismatch): it throws on
-  /// every load, so it additionally sets [corrupt] and the UI surfaces an explicit recovery affordance instead
-  /// of an unbounded silent block. A definitive success (either branch) clears both flags.
-  static Future<SubswapRecord?> load() async {
-    String? s;
+  /// TRANSIENT READ vs DURABLE CORRUPT (Task 1/2), now at TWO granularities:
+  ///   • the WHOLE blob (list, or the un-adopted legacy slot) present but undecodable — durable: sets
+  ///     [corrupt] + fails safe + throws [SubswapCorruptRecordException] (the old single-slot corrupt);
+  ///   • ONE entry undecodable or carrying an UNRECOGNISED state (SubState.unknown — version skew / a
+  ///     foreign write): the entry is KEPT ON DISK (never dropped — it may be a LIVE funded swap),
+  ///     COUNTED as active (guard fails safe over it), EXCLUDED from the returned drivable list, and
+  ///     [corrupt] is set so the guarded RECOVER affordance surfaces. Other records stay fully drivable
+  ///     — one wedged record no longer blocks the whole rail.
+  static Future<List<SubswapRecord>> loadAll() async {
+    TradeListRead read;
     try {
-      s = await _storage.read(key: _key);
-    } catch (e) {
-      // TRANSIENT READ error: not proof of "no record". Fail safe + mark HEALABLE (Task 1) — a later
-      // succeeding read at a choke point re-runs load() and clears the block. NOT corrupt (retry may succeed).
-      _inFlight = true;
-      _primed = true;
-      _primeErrored = true;
-      rethrow;
-    }
-    if (s == null || s.isEmpty) {
-      _inFlight = false; // DEFINITIVE no record — the ONLY path that sets not-in-flight
-      _primed = true;
-      _primeErrored = false;
-      _corrupt = false;
-      return null;
-    }
-    try {
-      final rec = SubswapRecord.fromJson(jsonDecode(s) as Map<String, dynamic>);
-      // UNKNOWN STATE (Task 1, fund-loss): the JSON decoded, but its persisted 'state' was unrecognised by this
-      // build (version skew / a future-build state / a foreign write) -> SubState.unknown. It is deliberately
-      // NON-terminal, so the guard would (correctly) stay CLOSED — but this build cannot DRIVE it (we don't know
-      // its phase), and it may represent a LIVE, funded swap. Route it through the SAME durable-recovery path as a
-      // corrupt record: NEVER clobber/clear it, surface an explicit guarded RECOVER affordance. The throw is caught
-      // just below (sets _inFlight = true + _corrupt = true and rethrows [SubswapCorruptRecordException]), so the
-      // drive/resume ([_resumeInner]'s leading load) can never reach a clear() for an unknown-state record.
-      if (rec.state == SubState.unknown) throw const SubswapCorruptRecordException();
-      _inFlight = !rec.terminal;
-      _primed = true;
-      _primeErrored = false;
-      _corrupt = false;
-      return rec;
-    } catch (e) {
-      // DURABLE DECODE error: a value IS present but is unparseable, so it will throw on EVERY load. Fail safe
-      // (assume in-flight) AND flag [corrupt] so the UI offers an honest recovery affordance instead of an
-      // unbounded silent block. [primeErrored] is set too (per Task 1), but the heal alone never clears a
-      // corrupt record — only an explicit [clear]/[save] does.
-      _inFlight = true;
+      read = await _list.readAll();
+    } on TradeListCorruptException {
+      // DURABLE: the whole list blob is present but unparseable. Fail safe + flag corrupt (never
+      // self-heals by retrying; the blob is preserved for the recovery affordance).
+      _activeCount = _activeCount > 0 ? _activeCount : 1;
       _primed = true;
       _primeErrored = true;
       _corrupt = true;
       throw const SubswapCorruptRecordException();
+    } catch (e) {
+      // TRANSIENT READ error: not proof of "no records". Fail safe + mark HEALABLE (Task 1) — a later
+      // succeeding read at a choke point re-runs loadAll() and clears the block. NOT corrupt.
+      _activeCount = _activeCount > 0 ? _activeCount : 1;
+      _primed = true;
+      _primeErrored = true;
+      rethrow;
     }
+    final out = <SubswapRecord>[];
+    var corruptEntries = read.undecodableEntries;
+    for (final e in read.entries) {
+      SubswapRecord? rec;
+      try {
+        rec = SubswapRecord.fromJson(e);
+      } catch (_) {
+        rec = null;
+      }
+      if (rec == null || rec.state == SubState.unknown) {
+        // UNKNOWN STATE / undecodable entry (Task 1, fund-loss): non-terminal by construction, kept on
+        // disk, counted active, surfaced via the recovery affordance — never clobbered or cleared here.
+        corruptEntries++;
+      } else {
+        out.add(rec);
+      }
+    }
+    _activeCount = out.where((r) => !r.terminal).length + corruptEntries;
+    _primed = true;
+    _corrupt = corruptEntries > 0 || read.legacyUndecodable;
+    if (read.legacyUndecodable) _activeCount = _activeCount > 0 ? _activeCount : 1; // may be a live swap
+    _primeErrored = _corrupt; // a corrupt store is not a definitive clean answer (never self-heals alone)
+    return out;
   }
 
-  /// The RAW persisted value for the recovery affordance to INSPECT before the user clears a [corrupt] record.
-  /// Returns the stored string as-is (undecodable), or null on an empty store / a transient read error — the
-  /// inspection is best-effort and must never itself throw into the recovery UI.
-  static Future<String?> readRaw() async {
-    try {
-      return await _storage.read(key: _key);
-    } catch (_) {
+  /// Compat single-record read: by [id] when given, else the first non-terminal drivable record, else
+  /// the most recent drivable record. Throws [SubswapCorruptRecordException] (like the old single-slot
+  /// load) when NOTHING drivable exists but corrupt material does — the caller's recovery path applies.
+  static Future<SubswapRecord?> load({String? id}) async {
+    final all = await loadAll();
+    if (id != null && id.isNotEmpty) {
+      for (final r in all) {
+        if (r.id == id) return r;
+      }
       return null;
     }
+    for (final r in all) {
+      if (!r.terminal) return r;
+    }
+    if (all.isNotEmpty) return all.first;
+    if (_corrupt) throw const SubswapCorruptRecordException();
+    return null;
   }
 
+  /// The RAW persisted value(s) for the recovery affordance to INSPECT before the user clears corrupt
+  /// material: the un-adopted legacy blob when present, else the list blob. Best-effort, never throws.
+  static Future<String?> readRaw() async {
+    final legacy = await _list.readRawLegacy();
+    if (legacy != null && legacy.isNotEmpty) return legacy;
+    return _list.readRawList();
+  }
+
+  /// Upsert ONE record by id and keep the synchronous guard current. A healthy write proves the store
+  /// is writable; it does NOT clear [corrupt] (other entries may still need recovery) — [loadAll]
+  /// recomputes that honestly right after.
   static Future<void> save(SubswapRecord r) async {
-    _inFlight = !r.terminal; // keep the synchronous guard current on every persisted transition
+    await _list.upsert(r.toJson());
     _primed = true;
-    _primeErrored = false; // a healthy write proves the store is readable + this record decodable
-    _corrupt = false;
-    await _storage.write(key: _key, value: jsonEncode(r.toJson()));
+    try {
+      await loadAll(); // recompute the mirrors over the WHOLE list (cheap; single decode pass)
+    } catch (_) {/* mirrors already fail safe inside loadAll */}
   }
 
+  /// Remove ONE record by id (a settled/refunded/abandoned swap) — never the whole store.
+  static Future<void> remove(String id) async {
+    await _list.removeById(id);
+    try {
+      await loadAll();
+    } catch (_) {}
+  }
+
+  /// Drop EXACTLY the corrupt material after the user was warned and shown [readRaw]: the undecodable
+  /// legacy blob, a whole-blob-corrupt list, and any undecodable / unknown-state entries. Healthy
+  /// records SURVIVE. The recovery affordance's clear — production code never wipes blindly.
+  static Future<void> clearCorrupt() async {
+    await _list.deleteLegacyBlob();
+    try {
+      await _list.removeWhere(
+        (e) {
+          try {
+            return SubswapRecord.fromJson(e).state == SubState.unknown;
+          } catch (_) {
+            return true; // entry undecodable
+          }
+        },
+        dropNonObjects: true,
+      );
+    } on TradeListCorruptException {
+      await _list.wipeListBlob(); // the whole blob was the corrupt material
+    }
+    _corrupt = false;
+    _primeErrored = false;
+    try {
+      await loadAll();
+    } catch (_) {}
+  }
+
+  /// FULL wipe of both keys (tests + the last-resort recovery reset). Opens the guard.
   static Future<void> clear() async {
-    _inFlight = false;
+    _activeCount = 0;
     _primed = true;
     _primeErrored = false; // the store is now definitively empty — no read/decode error, no corrupt record
     _corrupt = false;
-    await _storage.delete(key: _key);
+    await _list.wipeAll();
   }
 }
 
@@ -820,20 +883,24 @@ enum HtlcScanResult { empty, funded, unreadable }
 class SubswapService {
   SubswapService._();
 
-  /// NO-DOUBLE-DRIVE guard (Task 3), the Dart twin of swap.js's `_subswapDriving`. A cold-start UNAWAITED
-  /// [resume] (fired from shell) can still be settling the SAME record when the user taps 'Resume swap' (or a
-  /// second cold-start path fires) — a SECOND concurrent drive would fire duplicate settle/claim/refund
-  /// broadcasts (idempotent on-chain, but racy). This GLOBAL one-at-a-time flag (a submarine is one-at-a-time)
-  /// is set at the start of any drive ([runReverseBuy]/[runSubmarineSell]/[resume]) and cleared in a finally,
-  /// so a second concurrent drive short-circuits. Mirrors the web `if (... || _subswapDriving) return;`.
-  static bool _driving = false;
-  static bool get driving => _driving;
+  /// NO-DOUBLE-DRIVE guard (Task 3), the Dart twin of swap.js's `_subswapDriving` — now PER RECORD. A
+  /// cold-start UNAWAITED [resume] (fired from shell) can still be settling a record when the user taps
+  /// 'Resume swap' (or a second cold-start path fires) — a SECOND concurrent drive of the SAME record
+  /// would fire duplicate settle/claim/refund broadcasts (idempotent on-chain, but racy). Each drive
+  /// registers its record id here and clears it in a finally, so a concurrent drive of the same record
+  /// short-circuits while DIFFERENT records drive independently (multi-record store).
+  static final Set<String> _drivingIds = <String>{};
 
-  /// TEST SEAM (Task 3) — force the one-at-a-time [_driving] guard so a unit test can assert that a concurrent
-  /// [runReverseBuy]/[runSubmarineSell] throws and [resume] short-circuits, without spinning up a real drive
-  /// (which needs the wallet + LSP + network). NEVER used in production code.
+  /// GLOBAL drive block (test seam + belt-and-suspenders): when set, every drive/resume short-circuits.
+  static bool _drivingAll = false;
+  static bool get driving => _drivingAll || _drivingIds.isNotEmpty;
+  static bool _isDriving(String id) => _drivingAll || _drivingIds.contains(id);
+
+  /// TEST SEAM (Task 3) — force the one-at-a-time guard so a unit test can assert that a concurrent
+  /// [runReverseBuy]/[runSubmarineSell] throws and [resume] short-circuits, without spinning up a real
+  /// drive (which needs the wallet + LSP + network). NEVER used in production code.
   @visibleForTesting
-  static set debugDriving(bool v) => _driving = v;
+  static set debugDriving(bool v) => _drivingAll = v;
 
   /// TEST SEAM (round 13) — override the AUTHORITATIVE RE-SCAN the abandon clear gate runs on the FRESH on-disk
   /// record immediately before [SubswapStore.clear] (the re-scan-before-clear that stops trusting the stale
@@ -1053,16 +1120,16 @@ class SubswapService {
     // drive before touching disk. The passed-in [scan] is the WARNING's evidence, captured BEFORE the user saw
     // the abandon dialog; it is deliberately NOT the authoritative clear signal (see the re-scan below).
     if (scan != HtlcScanResult.empty) return false; // PRE-DIALOG EMPTY-SCAN gate — a funded/unreadable pre-scan never proceeds
-    if (_driving) return false; // NOT-DRIVING gate — a resume is advancing this record; let it win
-    // Acquire the one-at-a-time guard so no resume can START and advance the record during our fresh-reload ->
+    if (_isDriving(rec.id)) return false; // NOT-DRIVING gate — a resume is advancing this record; let it win
+    // Acquire the per-record guard so no resume can START and advance THIS record during our fresh-reload ->
     // re-scan -> clear window (safe-by-construction against the cold-start-resume clobber). Released in the finally.
-    _driving = true;
+    _drivingIds.add(rec.id);
     try {
-      // Gate 2 — FRESH RELOAD: operate on the on-disk record, NEVER the passed-in stale one. Fail closed on an
-      // unreadable/corrupt reload (never clear over a record we cannot even read).
+      // Gate 2 — FRESH RELOAD: operate on the on-disk record BY ID, NEVER the passed-in stale one. Fail closed
+      // on an unreadable/corrupt reload (never clear over a record we cannot even read).
       SubswapRecord? fresh;
       try {
-        fresh = await SubswapStore.load();
+        fresh = await SubswapStore.load(id: rec.id);
       } catch (_) {
         return false;
       }
@@ -1085,11 +1152,11 @@ class SubswapService {
       final rescan = await (debugRescanForAbandon ?? scanHtlcForAbandon)(fresh);
       if (rescan != HtlcScanResult.empty) return false;
       // ALL gates hold (NO wall clock consulted — the re-scan's clock-free height proof is the sole margin):
-      // the warned clear proceeds (rail freed).
-      await SubswapStore.clear();
+      // the warned clear proceeds — remove EXACTLY this record (other trades' records untouched).
+      await SubswapStore.remove(fresh.id);
       return true;
     } finally {
-      _driving = false;
+      _drivingIds.remove(rec.id);
     }
   }
 
@@ -1106,16 +1173,17 @@ class SubswapService {
   /// (claim=my key on H, right asset/amount/locktime, funding pays the HTLC P2SH); seq claim window;
   /// anchor-buried POLL; bolt11 payment_hash == H; bolt11 amount == the offer price; re-check the claim
   /// window; hold-CLTV gate; PERSIST leg+bolt11+H; then pay -> learn P -> PERSIST P -> claim.
-  /// Wrapped by the [_driving] NO-DOUBLE-DRIVE guard (Task 3) so it never runs concurrently with a resume.
+  /// Wrapped by the PER-RECORD NO-DOUBLE-DRIVE guard (Task 3) so THIS record is never driven
+  /// concurrently with its own resume; other records drive independently (multi-record store).
   static Future<SubswapRecord> runReverseBuy(SubswapRecord rec, {void Function(String)? onStep}) async {
-    if (_driving) {
-      throw Exception('A rail-crossing swap is already being driven; wait for it to finish or resume it before starting another.');
+    if (_isDriving(rec.id)) {
+      throw Exception('This rail-crossing swap is already being driven; wait for it to finish or resume it before starting another.');
     }
-    _driving = true;
+    _drivingIds.add(rec.id);
     try {
       return await _runReverseBuy(rec, onStep: onStep);
     } finally {
-      _driving = false;
+      _drivingIds.remove(rec.id);
     }
   }
 
@@ -1350,14 +1418,14 @@ class SubswapService {
   /// simultaneously captures the BTC and reveals P — so it can never reveal P without capturing the BTC.
   /// Wrapped by the [_driving] NO-DOUBLE-DRIVE guard (Task 3); its ~2h maker-pay poll never overlaps a resume.
   static Future<SubswapRecord> runSubmarineSell(SubswapRecord rec, {void Function(String)? onStep}) async {
-    if (_driving) {
-      throw Exception('A rail-crossing swap is already being driven; wait for it to finish or resume it before starting another.');
+    if (_isDriving(rec.id)) {
+      throw Exception('This rail-crossing swap is already being driven; wait for it to finish or resume it before starting another.');
     }
-    _driving = true;
+    _drivingIds.add(rec.id);
     try {
       return await _runSubmarineSell(rec, onStep: onStep);
     } finally {
-      _driving = false;
+      _drivingIds.remove(rec.id);
     }
   }
 
@@ -1610,25 +1678,37 @@ class SubswapService {
   /// refunded twice concurrently. The internal D0->C handoff calls [_resumeInner] directly (already inside the
   /// guard) so the re-entrant continuation is not itself short-circuited.
   static Future<void> resume({void Function(String)? onStep}) async {
-    if (_driving) return; // a drive is already running this record — do not fire a second concurrent one
-    _driving = true;
+    if (_drivingAll) return; // globally blocked (test seam): no storage is touched
+    // The synchronous guard is PRIMED earlier, in shell's AWAITED startup ([SubswapStore.primeInFlight]).
+    // [loadAll] keeps it current (a definitive read recounts; a read error fails safe and is swallowed
+    // here with the guard CLOSED). EVERY record is then driven INDEPENDENTLY — one stuck counterparty
+    // must not block another record's settle/refund (the web resumeSubswap over activeSubswaps).
+    List<SubswapRecord> recs;
     try {
-      await _resumeInner(onStep: onStep);
+      recs = await SubswapStore.loadAll();
+    } catch (_) {
+      return; // fail-safe already applied inside loadAll (guard closed); retry next boot/choke point
+    }
+    await Future.wait([
+      for (final r in recs) _resumeOne(r, onStep: onStep).catchError((Object _) {}),
+    ]);
+  }
+
+  /// Drive ONE record under its per-record NO-DOUBLE-DRIVE guard (Task 3): a concurrent drive of the
+  /// SAME record short-circuits; different records drive concurrently.
+  static Future<void> _resumeOne(SubswapRecord rec, {void Function(String)? onStep}) async {
+    if (_isDriving(rec.id)) return;
+    _drivingIds.add(rec.id);
+    try {
+      await _resumeInner(rec, onStep: onStep);
     } finally {
-      _driving = false;
+      _drivingIds.remove(rec.id);
     }
   }
 
-  static Future<void> _resumeInner({void Function(String)? onStep}) async {
-    // The synchronous guard is PRIMED earlier, in shell's AWAITED startup ([SubswapStore.primeInFlight]),
-    // so it is already authoritative before the Swap tab is interactive. This heavy settlement drive runs
-    // UNAWAITED, AFTER priming. [load] itself keeps the guard current (a definitive null => not-in-flight; a
-    // read error fails safe to in-flight and rethrows to the caller's .catchError), so no separate
-    // markInFlight is needed here (Task 1/2).
-    final rec = await SubswapStore.load();
-    if (rec == null) return;
+  static Future<void> _resumeInner(SubswapRecord rec, {void Function(String)? onStep}) async {
     if (rec.terminal) {
-      await SubswapStore.clear();
+      await SubswapStore.remove(rec.id); // drop ONLY this finished record
       return;
     }
     final m = await _mnemonic();
@@ -1754,15 +1834,16 @@ class SubswapService {
             ..legBlockHash = foundBlockHash.isNotEmpty ? foundBlockHash : rec.legBlockHash
             ..state = SubState.settling;
           await SubswapStore.save(rec);
-          await _resumeInner(onStep: onStep); // continue at (C): settle with P / refund after T_seq (re-entrant, still inside the drive guard)
+          await _resumeInner(rec, onStep: onStep); // continue at (C): settle with P / refund after T_seq (re-entrant, still inside the per-record guard)
           return;
         }
         if (definitivelyEmpty) {
           // Reachable ONLY when broadcastAttempted == false (Task 2): the broadcast was never reached and the
           // P2SH is definitively unfunded, so nothing was ever locked and the live courier session is gone —
-          // drop cleanly (no dangling record wedging the rail, no double-fund — nothing to fund). A record whose
-          // broadcast WAS attempted can never take this branch, so a funded-but-txid-unpersisted HTLC is never cleared.
-          await SubswapStore.clear();
+          // drop THIS record cleanly (no dangling record eating a trade slot, no double-fund — nothing to
+          // fund). A record whose broadcast WAS attempted can never take this branch, so a
+          // funded-but-txid-unpersisted HTLC is never cleared.
+          await SubswapStore.remove(rec.id);
           return;
         }
         // Not yet visible / unreadable: keep resumable (never a false drop of a possibly-funded SELL).
@@ -1824,8 +1905,8 @@ class SubswapService {
     }
 
     // Pre-commitment (no P, no funded leg): the live courier session cannot be resumed and nothing was
-    // committed — drop it. (A 'paying' buy / funded sell are handled above and NEVER reach here.)
-    await SubswapStore.clear();
+    // committed — drop THIS record. (A 'paying' buy / funded sell are handled above and NEVER reach here.)
+    await SubswapStore.remove(rec.id);
   }
 
   // -- chain reads + per-asset fees (mirror XchainSwapService) -----------------------------------------

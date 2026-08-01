@@ -4,6 +4,7 @@ import '../data/config.dart';
 import '../data/format.dart';
 import '../data/seqob_client.dart';
 import '../data/subswap_service.dart';
+import '../data/trade_slots.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 
@@ -18,13 +19,17 @@ import '../widgets/widgets.dart';
 /// is anchor-buried, ALL before it pays — and PERSISTS P + the leg before claiming. The SELL never reveals
 /// the secret without capturing the Bitcoin. This screen is the review + drive surface over that service.
 class SubmarineSwapScreen extends StatefulWidget {
-  const SubmarineSwapScreen({super.key, required this.buy, required this.offer});
+  const SubmarineSwapScreen({super.key, required this.buy, required this.offer, this.recordId});
 
   /// true = a BUY (pay BTC over Lightning, receive the asset on-chain); false = a SELL.
   final bool buy;
 
   /// The resting cross offer to take (whole-offer — a submarine take is the whole resting offer).
   final CrossOffer offer;
+
+  /// A specific persisted record to open (the composer's in-flight card taps pass it). Null = the
+  /// first non-terminal submarine record, if any (multi-record store).
+  final String? recordId;
 
   @override
   State<SubmarineSwapScreen> createState() => _SubmarineSwapScreenState();
@@ -45,15 +50,28 @@ class _SubmarineSwapScreenState extends State<SubmarineSwapScreen> {
     _checkInFlight();
   }
 
-  /// A submarine is one-at-a-time (whole-HTLC, resumable). If one is already in flight, RESUME it rather
-  /// than starting a second (which would strand funds) — mirroring the web's hasSubswapInFlight guard.
+  /// Adopt the record this screen was opened FOR (a tapped in-flight card passes its id), else surface
+  /// a matching live record so it resumes rather than being duplicated. With the multi-record store a
+  /// second submarine no longer blocks the rail — the shared trade-slot bound gates dispatch instead.
   Future<void> _checkInFlight() async {
     SubswapRecord? rec;
     try {
-      rec = await SubswapStore.load();
+      if (widget.recordId != null && widget.recordId!.isNotEmpty) {
+        rec = await SubswapStore.load(id: widget.recordId);
+      } else {
+        // No specific record: adopt a live record for THIS offer, if one exists (never start a
+        // duplicate take of the same offer from the review).
+        final all = await SubswapStore.loadAll();
+        for (final r in all) {
+          if (!r.terminal && r.offerId == widget.offer.offerId) {
+            rec = r;
+            break;
+          }
+        }
+      }
     } catch (_) {
-      // load() FAILED SAFE (in-flight = true): we cannot READ or DECODE the record, but MUST NOT start a
-      // fresh one. The corrupt vs transient split below decides which surface to show.
+      // loadAll() FAILED SAFE (guard closed): we cannot READ or DECODE the store, but MUST NOT start a
+      // fresh record over it. The corrupt vs transient split below decides which surface to show.
       rec = null;
     }
     if (!mounted) return;
@@ -63,14 +81,10 @@ class _SubmarineSwapScreenState extends State<SubmarineSwapScreen> {
         _phase = 'inflight';
       });
     } else if (SubswapStore.corrupt) {
-      // DURABLE corrupt record (Task 2): a present-but-undecodable value blocks the rail on EVERY load and
-      // never self-heals. Surface an honest distinct state with an explicit RECOVER affordance instead of the
-      // false 'in progress' (which would block forever).
+      // Corrupt/undrivable material is pending (a whole-blob corrupt store, an undecodable entry, or an
+      // unknown-state record): surface the recovery affordance — it never self-heals, and the composer's
+      // corrupt banner routes here expecting it (Task 2). Healthy records elsewhere stay drivable.
       setState(() => _phase = 'corrupt');
-    } else if (SubswapStore.hasInFlight) {
-      // A TRANSIENT read error left the guard CLOSED but no decodable record. Show the resume surface (which
-      // retries the read/drive) rather than the review — never a path that could clobber a possibly-live record.
-      setState(() => _phase = 'inflight');
     }
   }
 
@@ -85,8 +99,8 @@ class _SubmarineSwapScreenState extends State<SubmarineSwapScreen> {
     // corrupt-recovery view instead of an unbounded block.
     if (!SubswapStore.primed || SubswapStore.primeErrored) {
       try {
-        await SubswapStore.load();
-      } catch (_) {/* load() failed safe: _inFlight = true; the guard(s) below handle transient vs corrupt */}
+        await SubswapStore.loadAll();
+      } catch (_) {/* loadAll() failed safe (guard closed); the guard(s) below handle transient vs corrupt */}
       if (!mounted) return;
     }
     // A DURABLE corrupt record can never heal by retrying — surface the honest recovery affordance rather
@@ -95,13 +109,17 @@ class _SubmarineSwapScreenState extends State<SubmarineSwapScreen> {
       setState(() => _phase = 'corrupt');
       return;
     }
-    // SYNCHRONOUS in-flight re-check immediately before we persist (fund-loss, critical): a submarine is
-    // one-at-a-time over a SINGLE-KEY store, so saving a fresh record while another is live would OVERWRITE
-    // its H/P/redeem/txid -> stranded funds. The flag is primed at cold start + updated synchronously on
-    // every save/clear, so this closes the async _checkInFlight gap with NO race (mirror web
-    // startSubswapP2P's hasSubswapInFlight guard). Surface the live record's resume view instead of starting.
-    if (SubswapStore.hasInFlight) {
-      await _checkInFlight();
+    // SHARED SLOT GATE at the dispatch choke point (web tradeSlotsFree): records upsert by per-record id
+    // so a fresh save can no longer OVERWRITE a live record's H/P/redeem/txid — the fund-safety the old
+    // single-slot hasInFlight refusal enforced is now structural. What remains is the bounded
+    // concurrent-trade count, refused with the web's honest message.
+    final refusal = await TradeSlots.refusalIfFull();
+    if (!mounted) return;
+    if (refusal != null) {
+      setState(() {
+        _phase = 'error';
+        _error = refusal;
+      });
       return;
     }
     setState(() {
@@ -130,7 +148,7 @@ class _SubmarineSwapScreenState extends State<SubmarineSwapScreen> {
     });
     try {
       await SubswapService.resume(onStep: _onStep);
-      final rec = await SubswapStore.load();
+      final rec = _rec != null ? await SubswapStore.load(id: _rec!.id) : await SubswapStore.load();
       if (!mounted) return;
       setState(() {
         _rec = rec;
@@ -428,7 +446,9 @@ class _SubmarineSwapScreenState extends State<SubmarineSwapScreen> {
       ),
     );
     if (confirmed != true) return;
-    await SubswapStore.clear(); // resets in-flight + corrupt + primeErrored; the rail is usable again
+    // Drop EXACTLY the corrupt material (undecodable blob / entries / unknown-state records) — healthy
+    // records survive. Resets the corrupt + primeErrored flags; the rail is usable again.
+    await SubswapStore.clearCorrupt();
     if (!mounted) return;
     setState(() {
       _rec = null;

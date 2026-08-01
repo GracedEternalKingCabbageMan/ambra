@@ -24,8 +24,11 @@ import '../data/sbtc_peg_service.dart';
 import '../data/seqdex_client.dart';
 import '../data/seqln_keys.dart' as lnkeys;
 import '../data/seqob_client.dart';
+import '../data/subasset_buy_service.dart' show SubBuyRecord, SubBuyStep, SubBuyStore;
+import '../data/subasset_sell_service.dart' show SubSellRecord, SubSellStep, SubSellStore;
 import '../data/swap_route.dart';
 import '../data/trade_receipts.dart';
+import '../data/trade_slots.dart';
 import '../data/wallet_repository.dart';
 import '../data/xchain_client.dart';
 import '../data/xchain_swap_service.dart';
@@ -33,7 +36,9 @@ import '../data/xr_swap_service.dart';
 import '../rust/api.dart' as core;
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
+import '../data/cross_walk.dart';
 import 'cross_lift_screen.dart';
+import 'cross_walk_screen.dart';
 import 'my_orders_screen.dart';
 import 'subasset_buy_screen.dart';
 import 'subasset_sell_screen.dart';
@@ -115,10 +120,14 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   bool? _payRailLn;
   bool? _recvRailLn;
   XchainSwapRecord? _xInFlight; // a persisted cross-swap with locked BTC needing resume/refund (banner)
-  SubswapRecord? _subInFlight; // a persisted P2P submarine mid-flight needing resume/refund/settle (banner)
-  XrSwapRecord? _xrInFlight; // a persisted REVERSE cross sell with a locked asset leg (banner + resume/refund)
-  LspBridgeRecord? _bridgeInFlight; // a persisted LSP payer-bridge buy whose hold may be HELD (banner + resume)
-  LnStaleVerdict? _lnStale; // a stale pure-LN take that did not settle (honest banner; nothing was committed)
+  // Multi-record in-flight surfaces (one card PER record, gap 12): every persisted non-terminal trade of
+  // every rail-crossing kind renders its own composer card, so no live record is ever invisible.
+  List<SubswapRecord> _subInFlight = const []; // P2P submarines mid-flight (resume/refund/settle)
+  List<SubBuyRecord> _buyInFlight = const []; // sub-asset BUYs with (possibly) locked on-chain funds
+  List<SubSellRecord> _sellInFlight = const []; // sub-asset SELLs still claiming / possibly paid
+  List<XrSwapRecord> _xrInFlight = const []; // REVERSE cross sells with a locked asset leg
+  List<LspBridgeRecord> _bridgeInFlight = const []; // LSP payer-bridge buys whose hold may be HELD
+  List<LnStaleVerdict> _lnStale = const []; // stale pure-LN takes that did not settle (nothing committed)
   // Resume-on-entry once-per-session kicks (the services' resumes are idempotent, but a poll storm from
   // repeated tab activations would still be waste; the completion reload refreshes the banner).
   static bool _xrResumeKicked = false;
@@ -499,31 +508,36 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       // opens that screen directly, so without this banner a mid-flight swap (and its
       // CLTV refund) would be stranded off-screen.
       try { _xInFlight = await XchainStore.inFlightWithFunds(); } catch (_) { _xInFlight = null; }
-      // Same for an in-flight P2P SUBMARINE: without this banner a mid-flight submarine (its HELD Bitcoin
-      // hold to settle, or its CLTV asset refund past T_seq) would be reachable only by re-navigating the
-      // exact composer path. The cold-start SubswapService.resume() already fires those actions; this
-      // surfaces the record so the user is prompted (mirror the XchainStore cross in-flight surfacing).
+      // Same for the in-flight P2P SUBMARINES: without these cards a mid-flight submarine (its HELD
+      // Bitcoin hold to settle, or its CLTV asset refund past T_seq) would be reachable only by
+      // re-navigating the exact composer path. The cold-start SubswapService.resume() already fires those
+      // actions; this surfaces EVERY non-terminal record (multi-record store) so the user is prompted.
       try {
-        final rec = await SubswapStore.load();
-        _subInFlight = (rec != null && !rec.terminal) ? rec : null;
-        _subCorrupt = false;
+        final recs = await SubswapStore.loadAll();
+        _subInFlight = recs.where((r) => !r.terminal).toList();
+        _subCorrupt = SubswapStore.corrupt;
       } catch (_) {
-        _subInFlight = null;
+        _subInFlight = const [];
         // A DURABLE decode error (Task 2) surfaces a distinct recovery banner; a transient read error is left
         // to self-heal on the next successful load (Task 1) and shows no banner.
         _subCorrupt = SubswapStore.corrupt;
       }
+      // In-flight sub-asset BUYs and SELLs (gap 12): previously these records were read only inside
+      // their own screens, so a live buy/sell was INVISIBLE from the composer. One card per record;
+      // tapping opens the record's screen with its existing resume/refund affordances.
+      try { _buyInFlight = await SubBuyStore.activeAll(); } catch (_) { _buyInFlight = const []; }
+      try { _sellInFlight = await SubSellStore.activeAll(); } catch (_) { _sellInFlight = const []; }
       try {
         _legacyReverseOrphan = await SubswapStore.orphanedLegacyReverseDigest();
       } catch (_) {
         _legacyReverseOrphan = null; // best-effort; the banner reappears on a later load
       }
-      // In-flight REVERSE cross sell (rail 1 SELL): surface the record whose asset leg is (or might be)
-      // locked, and RESUME its on-chain tail once per session — resume settles a leg the maker already
-      // claimed (read P off-chain -> claim the BTC), adopts a strand-recovered funding, or leaves the
-      // record for the CLTV refund. The banner is the reachable recovery surface either way.
-      try { _xrInFlight = await XrSwapStore.inFlightWithFunds(); } catch (_) { _xrInFlight = null; }
-      if (_xrInFlight != null && !_xrResumeKicked) {
+      // In-flight REVERSE cross sells (rail 1 SELL): surface every record whose asset leg is (or might
+      // be) locked, and RESUME their on-chain tails once per session — resume settles a leg the maker
+      // already claimed (read P off-chain -> claim the BTC), adopts a strand-recovered funding, or
+      // leaves the record for the CLTV refund. The cards are the reachable recovery surface either way.
+      try { _xrInFlight = await XrSwapStore.inFlightWithFunds(); } catch (_) { _xrInFlight = const []; }
+      if (_xrInFlight.isNotEmpty && !_xrResumeKicked) {
         _xrResumeKicked = true;
         unawaited(XrSwapService.resume().catchError((Object _) => null).whenComplete(() async {
           if (!mounted) return;
@@ -531,10 +545,10 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           if (mounted) setState(() {});
         }));
       }
-      // In-flight LSP payer-bridge buy: its HELD Bitcoin payment (keyed by the record's P) may still
-      // settle — resume re-polls the job, verifies the maker leg and claims with the window gate.
-      try { _bridgeInFlight = await LspBridgeStore.inFlightWithFunds(); } catch (_) { _bridgeInFlight = null; }
-      if (_bridgeInFlight != null && !_bridgeResumeKicked) {
+      // In-flight LSP payer-bridge buys: each HELD Bitcoin payment (keyed by its record's P) may still
+      // settle — resume re-polls the jobs, verifies the maker legs and claims with the window gate.
+      try { _bridgeInFlight = await LspBridgeStore.inFlightWithFunds(); } catch (_) { _bridgeInFlight = const []; }
+      if (_bridgeInFlight.isNotEmpty && !_bridgeResumeKicked) {
         _bridgeResumeKicked = true;
         unawaited(LspBridgeService.resume().catchError((Object _) => null).whenComplete(() async {
           if (!mounted) return;
@@ -542,10 +556,13 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           if (mounted) setState(() {});
         }));
       }
-      // A stale pure-LN take (older than the LSP's 90s timeout): resolved off the receipt trail — a
-      // proven settle clears silently; otherwise the honest "did not settle · funds are safe" banner.
-      try { _lnStale = await LnTakeService.resolveStale(); } catch (_) { _lnStale = null; }
-      if (_lnStale != null && _lnStale!.settled) _lnStale = null; // settled: nothing to surface
+      // Stale pure-LN takes (older than the LSP's 90s timeout): resolved off the receipt trail — a
+      // proven settle clears silently; the rest get the honest "did not settle · funds are safe" card.
+      try {
+        _lnStale = (await LnTakeService.resolveStaleAll()).where((v) => !v.settled).toList();
+      } catch (_) {
+        _lnStale = const [];
+      }
       // Own maker identity, so a MARKET book-walk never self-fills this wallet's own resting covenants.
       try { _ownMakerPub = await core.seqobMakerPubkey(mnemonic: m); } catch (_) {/* self-filter is best-effort */}
       try {
@@ -1953,20 +1970,30 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
             _inFlightCrossBanner(_xInFlight!),
             const SizedBox(height: 14),
           ],
-          if (_subInFlight != null) ...[
-            _inFlightSubmarineBanner(_subInFlight!),
+          // ONE CARD PER RECORD (gap 12): with the multi-record stores every non-terminal trade renders
+          // its own card — a second in-flight trade of the same kind is never hidden behind the first.
+          for (final r in _subInFlight) ...[
+            _inFlightSubmarineBanner(r),
             const SizedBox(height: 14),
           ],
-          if (_xrInFlight != null) ...[
-            _inFlightXrBanner(_xrInFlight!),
+          for (final r in _buyInFlight) ...[
+            _inFlightSubBuyBanner(r),
             const SizedBox(height: 14),
           ],
-          if (_bridgeInFlight != null) ...[
-            _inFlightBridgeBanner(_bridgeInFlight!),
+          for (final r in _sellInFlight) ...[
+            _inFlightSubSellBanner(r),
             const SizedBox(height: 14),
           ],
-          if (_lnStale != null) ...[
-            _lnStaleBanner(_lnStale!),
+          for (final r in _xrInFlight) ...[
+            _inFlightXrBanner(r),
+            const SizedBox(height: 14),
+          ],
+          for (final r in _bridgeInFlight) ...[
+            _inFlightBridgeBanner(r),
+            const SizedBox(height: 14),
+          ],
+          for (final v in _lnStale) ...[
+            _lnStaleBanner(v),
             const SizedBox(height: 14),
           ],
           if (_subCorrupt) ...[
@@ -2569,7 +2596,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           makerPubkey: r.makerPubkey,
         );
         await Navigator.of(context)
-            .push(MaterialPageRoute<void>(builder: (_) => SubmarineSwapScreen(buy: r.buy, offer: offer)));
+            .push(MaterialPageRoute<void>(builder: (_) => SubmarineSwapScreen(buy: r.buy, offer: offer, recordId: r.id)));
         if (mounted) _load();
       },
       child: AmbraCard(
@@ -2716,11 +2743,94 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           label: 'Dismiss',
           icon: Icons.close,
           onPressed: () async {
-            await LnTakeService.dismiss();
-            if (mounted) setState(() => _lnStale = null);
+            await LnTakeService.dismiss(v.record); // removes only THIS record
+            if (mounted) setState(() => _lnStale = _lnStale.where((x) => x.record.id != v.record.id).toList());
           },
         ),
       ]),
+    );
+  }
+
+  /// Surface an in-flight sub-asset BUY (gap 12): its BTC (or quote-asset) HTLC is — or may be — locked
+  /// on-chain, with P living only in the record. Previously visible only inside its own screen; now one
+  /// card per record. Amounts are in each leg's OWN ticker + precision. Tapping opens the record's
+  /// screen with its existing resume/refund affordances.
+  Widget _inFlightSubBuyBanner(SubBuyRecord r) {
+    final tk = SeqAssets.labelFor(r.asset).ticker;
+    final aprec = SeqAssets.labelFor(r.asset).precision;
+    final qtk = r.quoteAsset != null ? SeqAssets.labelFor(r.quoteAsset!).ticker : 'BTC';
+    final qprec = r.quoteAsset != null ? SeqAssets.labelFor(r.quoteAsset!).precision : 8;
+    final state = switch (r.step) {
+      SubBuyStep.secretReady => 'prepared · nothing locked yet',
+      SubBuyStep.funding => 'locking $qtk on-chain',
+      SubBuyStep.funded => 'waiting for the maker to pay',
+      SubBuyStep.holding => 'settling · asset payment held',
+      _ => r.step.name,
+    };
+    return InkWell(
+      borderRadius: BorderRadius.circular(AmbraRadii.card),
+      onTap: () async {
+        await Navigator.of(context).push(MaterialPageRoute<void>(
+            builder: (_) => SubassetBuyScreen(asset: r.asset, quoteAsset: r.quoteAsset, recordId: r.id)));
+        if (mounted) _load();
+      },
+      child: AmbraCard(
+        child: Row(children: [
+          const Icon(Icons.warning_amber_rounded, color: AmbraColors.amber, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Sub-asset buy in progress · $tk', style: AmbraText.body),
+              const SizedBox(height: 2),
+              Text(
+                  'Buying ${formatAtoms(r.assetAtoms.toString(), aprec)} $tk for '
+                  '${formatAtoms(r.btcSats.toString(), qprec)} $qtk · $state. '
+                  'Tap to resume — it settles, or your $qtk refunds after its timeout.',
+                  style: AmbraText.sub),
+            ]),
+          ),
+          const Icon(Icons.chevron_right, size: 18, color: AmbraColors.dim),
+        ]),
+      ),
+    );
+  }
+
+  /// Surface an in-flight sub-asset SELL (gap 12): the asset is (or may be) already paid over
+  /// Lightning, and the record's preimage is the ONLY claim to the on-chain BTC (or quote asset) —
+  /// claim-or-lose, so the card must exist wherever the composer is. One card per record; tapping opens
+  /// the record's screen, whose claim retry/resume affordances are unchanged.
+  Widget _inFlightSubSellBanner(SubSellRecord r) {
+    final tk = SeqAssets.labelFor(r.asset).ticker;
+    final qtk = r.quoteAsset != null ? SeqAssets.labelFor(r.quoteAsset!).ticker : 'BTC';
+    final qprec = r.quoteAsset != null ? SeqAssets.labelFor(r.quoteAsset!).precision : 8;
+    final claiming = r.step == SubSellStep.claiming;
+    final got = claiming && r.gotBtc > BigInt.zero ? '${formatAtoms(r.gotBtc.toString(), qprec)} $qtk' : qtk;
+    return InkWell(
+      borderRadius: BorderRadius.circular(AmbraRadii.card),
+      onTap: () async {
+        await Navigator.of(context).push(MaterialPageRoute<void>(
+            builder: (_) => SubassetSellScreen(asset: r.asset, quoteAsset: r.quoteAsset, recordId: r.id)));
+        if (mounted) _load();
+      },
+      child: AmbraCard(
+        child: Row(children: [
+          const Icon(Icons.warning_amber_rounded, color: AmbraColors.amber, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Sub-asset sell in progress · $tk', style: AmbraText.body),
+              const SizedBox(height: 2),
+              Text(
+                  claiming
+                      ? 'Your $tk is paid · claiming $got on-chain. Tap to retry the claim until it confirms.'
+                      : 'Your $tk sale may still be settling over Lightning. Tap to check — it recovers '
+                          'idempotently, nothing is paid twice.',
+                  style: AmbraText.sub),
+            ]),
+          ),
+          const Icon(Icons.chevron_right, size: 18, color: AmbraColors.dim),
+        ]),
+      ),
     );
   }
 
@@ -2840,18 +2950,33 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         await _placePeggedBtcOrder(asset);
         return;
       }
-      _snack('Resting a Bitcoin order at your own price is coming. Use Market to take a resting offer now, '
-          'or place a limit order on a same-chain pair.');
+      // CROSS LIMIT (gap 4) — HONEST REFUSAL, scoped deliberately. A resting cross order makes THIS
+      // device a MAKER: the web wallet posts the offer and then keeps a courier listener open
+      // (xcourier.js `openMakerListener`, re-attached across reloads by `reattachCourierSession`;
+      // offer_submit rides the To-field-102 envelope) so the maker can co-sign each lift LIVE — quote
+      // the taker's slice, watch its BTC lock confirm, then fund/claim the asset leg interactively.
+      // That maker build requires the device to STAY ONLINE for the offer's whole life, which a mobile
+      // wallet cannot promise (backgrounding kills the socket and the offer dead-ends takers), so
+      // mobile does not rest one yet. FULL PORT (filed): port xcourier.js openMakerListener +
+      // reattachCourierSession over CrossCourier, persist the maker session key so a relaunch
+      // re-attaches, and gate resting on a foreground-service affordance. Until then the refusal names
+      // exactly what works instead — do NOT half-build a maker listener here.
+      _snack('A resting Bitcoin order needs this device to stay online as the maker (it co-signs each '
+          'fill live), which mobile cannot promise yet. Instead: use Market to take resting offers now; '
+          'when paying on-chain Bitcoin, turn on "keep resting" to rest via the SBTC peg (works offline); '
+          'or rest a limit order on a same-chain pair (the covenant book rests offline too).');
       return;
     }
 
     // On-chain cross (BTC<->asset) settles over the relay ORDER-BOOK COURIER (the durable book), NOT the
-    // retired /dex RFQ. Review = lift the best resting offer, exactly like tapping it in the book.
+    // retired /dex RFQ. Review = the planned fill, exactly like tapping the book.
     if (r.kind == SwapRouteKind.cross) {
       if (r.payIsBtc) {
-        // BUY the asset with Bitcoin. The rail lifts one resting "buy" offer (maker sells the asset) IN
-        // FULL — so pick the offer CLOSEST in size to what the user typed (tie-break cheaper), not just
-        // the cheapest, else typing "1" could lift a 60-unit offer. With no typed amount, the cheapest.
+        // BUY the asset with Bitcoin (gap 11): plan a MULTI-OFFER WALK across the sorted cross asks
+        // (web walkBook) — a request larger than the best offer sweeps the depth behind it, best price
+        // first, per-leg sized so every leg is independently valid. One offer -> the proven
+        // single-offer lift (unchanged); several -> the sequential walk with its aggregate review,
+        // honest remainder, and stop-on-failure.
         final aprec = SeqAssets.labelFor(asset).precision;
         final reqAtoms = _typedAssetAtoms(asset, aprec);
         final asks = _crossOffers.where((o) => o.makerSellsAsset).toList();
@@ -2859,18 +2984,30 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           _snack('No resting Bitcoin offer for ${_tk(asset)} yet — the makers post continuously; check back in a moment.');
           return;
         }
+        asks.sort((a, b) => a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom));
         if (reqAtoms != null && reqAtoms > BigInt.zero) {
-          // Partial fills are live now (priority C): prefer the CHEAPEST offer that can COVER the typed
-          // slice (we partial-fill it to exactly the slice), falling back to the closest-sized one when
-          // none is big enough. This replaces the old closest-size heuristic that a whole-offer lift needed.
-          asks.sort((a, b) {
-            final aCovers = a.assetAtoms >= reqAtoms, bCovers = b.assetAtoms >= reqAtoms;
-            if (aCovers != bCovers) return aCovers ? -1 : 1;
-            final c = a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom);
-            return c != 0 ? c : (a.assetAtoms - reqAtoms).abs().compareTo((b.assetAtoms - reqAtoms).abs());
-          });
-        } else {
-          asks.sort((a, b) => a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom));
+          final plan = planCrossWalk(offers: asks, want: reqAtoms);
+          if (plan.offersUsed > 1) {
+            final changed = await Navigator.of(context)
+                .push<bool>(MaterialPageRoute(builder: (_) => CrossWalkScreen(plan: plan)));
+            if (changed == true && mounted) {
+              _payAmount.clear();
+              _recvAmount.clear();
+              _resetPriceField();
+            }
+            if (mounted) {
+              _fetchBook();
+              _load();
+            }
+            return;
+          }
+          if (plan.offersUsed == 1) {
+            // One offer covers it: the proven single-offer lift, partial-filling to the exact slice.
+            await _liftCross(plan.legs.first.offer, requestedAtoms: reqAtoms);
+            return;
+          }
+          // Nothing plannable (dust-small slice / empty depth): fall through to the cheapest offer so
+          // the existing lift path can state its own honest refusal.
         }
         await _liftCross(asks.first, requestedAtoms: reqAtoms);
       } else {
@@ -2878,6 +3015,9 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         // driven by [XrSwapService] — the maker locks BTC first, then we fund the asset leg behind the
         // mandatory anchor-ordering gate, and claim the BTC with the maker-revealed secret. Replaces
         // the honest-disable that stood in for the retired /dex RFQ reverse wizard.
+        // NOTE (gap 11): the reverse (xr) direction stays SINGLE-OFFER for now — its review sheet
+        // already retries down the ranked bids at never-worse terms, but a planned multi-offer sweep
+        // (per-leg records, stop-on-failure) has not been ported to the SELL side yet.
         await _dispatchXrSell(asset);
       }
       return;
@@ -2922,21 +3062,16 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     if (asset == null) return;
     final tk = _tk(asset);
     final buy = r.payIsBtc; // BUY = pay BTC over LN, receive asset on-chain; SELL = the inverse
-    // ONE submarine at a time (fund-loss, Task 1a): the taker keeps a SINGLE persisted submarine record.
-    // Refuse to open a second review while one is in flight (mirror web reviewSubmarineP2P's
-    // hasSubswapInFlight guard) — the live one resumes from its own banner/screen instead of being clobbered.
     // Belt-and-suspenders + SELF-HEAL (Task 1): the synchronous guard is authoritative only once cold-start
     // priming has run (shell's AWAITED SubswapStore.primeInFlight). Re-run an AUTHORITATIVE load here when the
     // guard is UNPRIMED (fast cold start) OR the last read/decode ERRORED (SubswapStore.primeErrored). A
-    // transient cold-start read failure fails the guard SAFE (in-flight), which would otherwise leave an IDLE
-    // wallet blocked with the false 'swap in progress' until some unrelated load succeeded; re-loading at this
-    // choke point HEALS the guard the moment a read succeeds. A still-failing read fails safe again inside
-    // load() (the guard below blocks); a DURABLE decode error routes to the corrupt-recovery surface instead
-    // of an unbounded silent block.
+    // transient cold-start read failure fails the guard SAFE (in-flight); re-loading at this choke point HEALS
+    // it the moment a read succeeds. A still-failing read fails safe again inside loadAll(); a DURABLE decode
+    // error routes to the corrupt-recovery surface instead of an unbounded silent block.
     if (!SubswapStore.primed || SubswapStore.primeErrored) {
       try {
-        await SubswapStore.load();
-      } catch (_) {/* load() failed safe: _inFlight = true; the guards below handle transient vs corrupt */}
+        await SubswapStore.loadAll();
+      } catch (_) {/* loadAll() failed safe (guard closed); the guards below handle transient vs corrupt */}
     }
     if (!mounted) return; // the belt-and-suspenders load above is an async gap — bail if the tab was disposed
     // A DURABLE corrupt record never heals by retrying (Task 2): be honest and route to the recovery
@@ -2944,7 +3079,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     // rebuilds the same screen; its initState re-detects the corrupt record and shows the recover surface.
     if (SubswapStore.corrupt) {
       _snack('Your rail-crossing swap record is unreadable · open it to recover before starting another.');
-      final rec = _subInFlight;
+      final rec = _subInFlight.isNotEmpty ? _subInFlight.first : null;
       final offer = rec != null
           ? CrossOffer(
               offerId: rec.offerId, seqAsset: rec.asset, makerSellsAsset: rec.buy,
@@ -2957,9 +3092,16 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       if (mounted) _load();
       return;
     }
-    if (SubswapStore.hasInFlight) {
-      _snack('You already have a rail-crossing swap in progress · finish it first before starting another.');
-      return;
+    // SHARED SLOT GATE (web tradeSlotsFree, gap 9): records upsert by per-record id so a second submarine
+    // can no longer clobber a live one — the old single-slot hard refusal becomes the bounded
+    // concurrent-trade count across all rail-crossing kinds, with the web's honest message.
+    {
+      final refusal = await TradeSlots.refusalIfFull();
+      if (!mounted) return;
+      if (refusal != null) {
+        _snack(refusal);
+        return;
+      }
     }
     final reqAtoms = _typedAssetAtoms(asset, SeqAssets.labelFor(asset).precision);
     // A BUY lifts an ASK (maker sells the asset); a SELL lifts a BID (maker gives BTC). Size to the typed
@@ -3083,15 +3225,17 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       _snack('The Lightning signer is not connected · try again in a moment, or choose on-chain rails.');
       return;
     }
-    // Single-slot: a take younger than the LSP's 90s timeout may still be settling in this process.
+    // A take younger than the LSP's 90s timeout may still be settling in this process (any record —
+    // the multi-record store keeps them all).
     try {
-      final live = await LnTakeStore.load();
-      if (live != null && !live.failed &&
-          DateTime.now().millisecondsSinceEpoch - live.startedMs < kLnLspTimeoutMs) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final live = (await LnTakeStore.loadAll())
+          .any((r) => !r.failed && now - r.startedMs < kLnLspTimeoutMs);
+      if (live) {
         _snack('A Lightning swap is already settling · give it a moment.');
         return;
       }
-    } catch (_) {/* best-effort; the take itself persists over any stale slot */}
+    } catch (_) {/* best-effort; the take itself persists its own record */}
     final pin = await LnTakeService.pinBest(side: side, asset: base, quoteAsset: quote);
     if (pin.offer == null) {
       // Served-but-empty vs unreachable are DIFFERENT honest messages (mirror web requote's split).
@@ -3138,18 +3282,19 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   /// an [XrNoMakerException] retries down them at never-worse-than-reviewed terms.
   Future<void> _dispatchXrSell(String asset, {CrossOffer? pinned}) async {
     final tk = _tk(asset);
-    // Single-slot: a record still protecting a locked asset leg blocks a second sell (its banner is
-    // the resume/refund surface).
-    XrSwapRecord? inFlight;
-    try {
-      inFlight = await XrSwapStore.inFlightWithFunds();
-    } catch (_) {
-      inFlight = null;
-    }
-    if (inFlight != null) {
-      if (mounted) setState(() => _xrInFlight = inFlight);
-      _snack('You already have a cross-chain sell in progress · resume or refund it from the banner above first.');
-      return;
+    // SHARED SLOT GATE (gap 9): records upsert by id, so a second sell can never clobber one protecting
+    // a locked asset leg — the bounded concurrent-trade count is what refuses now, honestly.
+    {
+      try {
+        _xrInFlight = await XrSwapStore.inFlightWithFunds();
+      } catch (_) {/* the cards refresh on the next _load */}
+      final refusal = await TradeSlots.refusalIfFull();
+      if (!mounted) return;
+      if (refusal != null) {
+        setState(() {});
+        _snack(refusal);
+        return;
+      }
     }
     final aprec = SeqAssets.labelFor(asset).precision;
     final reqAtoms = _typedAssetAtoms(asset, aprec);
@@ -3223,17 +3368,19 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     final asset = r.seqAsset;
     if (asset == null) return;
     final tk = _tk(asset);
-    // Single-slot: a record whose hold may be HELD blocks a second bridged buy.
-    LspBridgeRecord? inFlight;
-    try {
-      inFlight = await LspBridgeStore.inFlightWithFunds();
-    } catch (_) {
-      inFlight = null;
-    }
-    if (inFlight != null) {
-      if (mounted) setState(() => _bridgeInFlight = inFlight);
-      _snack('You already have a bridged swap in progress · it resumes from the banner above.');
-      return;
+    // SHARED SLOT GATE (gap 9): a second bridged buy can never clobber a HELD record (per-record ids);
+    // the bounded concurrent-trade count is what refuses now, honestly.
+    {
+      try {
+        _bridgeInFlight = await LspBridgeStore.inFlightWithFunds();
+      } catch (_) {/* the cards refresh on the next _load */}
+      final refusal = await TradeSlots.refusalIfFull();
+      if (!mounted) return;
+      if (refusal != null) {
+        setState(() {});
+        _snack(refusal);
+        return;
+      }
     }
     // Paying BTC over the taker's OWN Lightning needs REAL funded outbound — the bridge only
     // JIT-provisions the maker's on-chain BTC HTLC, never a channel for the buyer.
@@ -5233,7 +5380,7 @@ class _XrRecordSheetState extends State<_XrRecordSheet> {
             onPressed: _busy
                 ? null
                 : () => _run(() async {
-                      await XrSwapService.resume(onStep: (s) {
+                      await XrSwapService.resume(record: widget.record, onStep: (s) {
                         if (mounted) setState(() => _status = s);
                       });
                     }),
@@ -5254,7 +5401,7 @@ class _XrRecordSheetState extends State<_XrRecordSheet> {
               onPressed: _busy
                   ? null
                   : () => _run(() async {
-                        final ok = await XrSwapService.abandon();
+                        final ok = await XrSwapService.abandon(widget.record);
                         if (!ok) throw Exception('This record still protects a locked asset · refund it first.');
                       }),
             ),
@@ -5418,7 +5565,7 @@ class _BridgeRecordSheetState extends State<_BridgeRecordSheet> {
             onPressed: _busy
                 ? null
                 : () => _run(() async {
-                      await LspBridgeService.resume(onStep: (s) {
+                      await LspBridgeService.resume(record: widget.record, onStep: (s) {
                         if (mounted) setState(() => _status = s);
                       });
                     }),
@@ -5430,7 +5577,7 @@ class _BridgeRecordSheetState extends State<_BridgeRecordSheet> {
             onPressed: _busy
                 ? null
                 : () => _run(() async {
-                      final ok = await LspBridgeService.abandon();
+                      final ok = await LspBridgeService.abandon(widget.record);
                       if (!ok) {
                         throw Exception('This record still protects a held payment · it clears once the '
                             'swap settles or its timeout passes.');

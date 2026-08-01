@@ -18,7 +18,7 @@ import '../widgets/widgets.dart';
 /// direction). So once the LN pay settles, the preimage + the maker's BTC HTLC terms are persisted
 /// BEFORE the on-chain claim, and the claim is retried (here and on cold start) until it confirms.
 class SubassetSellScreen extends StatefulWidget {
-  const SubassetSellScreen({super.key, required this.asset, this.assetAmount, this.quoteAsset});
+  const SubassetSellScreen({super.key, required this.asset, this.assetAmount, this.quoteAsset, this.recordId});
 
   /// The Sequentia asset to sell for Bitcoin (paid over Lightning).
   final String asset;
@@ -30,6 +30,10 @@ class SubassetSellScreen extends StatefulWidget {
   /// MIXED same-chain: the pair's QUOTE asset — the claim leg is a Sequentia HTLC on it, standing in
   /// BTC's structural place, and every "BTC" position carries quote atoms. Null = the BTC shape.
   final String? quoteAsset;
+
+  /// A specific persisted record to open (the composer's in-flight card taps pass it). Null = the
+  /// first in-flight sell of this asset, if any (multi-record store).
+  final String? recordId;
 
   @override
   State<SubassetSellScreen> createState() => _SubassetSellScreenState();
@@ -66,7 +70,20 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
 
   Future<void> _load() async {
     try {
-      final rec = await SubSellStore.load();
+      // A tapped in-flight card opens ITS record; otherwise adopt the first in-flight sell of THIS
+      // asset (multi-record store: other assets' sells are their own cards, not this screen's).
+      SubSellRecord? rec;
+      if (widget.recordId != null && widget.recordId!.isNotEmpty) {
+        rec = await SubSellStore.load(id: widget.recordId);
+      } else {
+        final all = await SubSellStore.activeAll();
+        for (final r in all) {
+          if (r.asset == widget.asset) {
+            rec = r;
+            break;
+          }
+        }
+      }
       // Best-effort: source the best resting sell offer for the economic gate (expected BTC).
       SubOffer? offer;
       try {
@@ -147,8 +164,15 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
         // FUND-SAFETY: begin() pays the asset over Lightning, then persists the preimage + HTLC terms
         // at 'claiming' BEFORE the on-chain claim. If the claim (or anything after the pay) throws,
         // reload the PERSISTED record so the UI reflects that the asset is paid and the BTC is
-        // claimable — never re-show the "Sell" form (a re-tap must not re-pay the asset).
-        final saved = await SubSellStore.load();
+        // claimable — never re-show the "Sell" form (a re-tap must not re-pay the asset). Multi-record:
+        // adopt the first in-flight sell of THIS asset (its id was minted inside begin()).
+        SubSellRecord? saved;
+        for (final r in await SubSellStore.activeAll()) {
+          if (r.asset == widget.asset) {
+            saved = r;
+            break;
+          }
+        }
         if (saved != null && mounted) setState(() => _rec = saved);
         rethrow;
       }
@@ -164,7 +188,8 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
   }
 
   Future<void> _reset() async {
-    await SubSellStore.clear();
+    final r = _rec;
+    if (r != null) await SubSellStore.remove(r.id); // drop only THIS record; others keep their handles
     _poll?.cancel();
     if (mounted) {
       setState(() {

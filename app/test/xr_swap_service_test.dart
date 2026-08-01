@@ -402,17 +402,21 @@ void main() {
       expect(loaded!.seqLeg!.vout, 1);
       expect((await XrSwapStore.inFlightWithFunds()), isNotNull);
 
-      // Unknown persisted step -> XrStep.failed (non-terminal), never a silent "done".
-      final j = r.toJson()..['step'] = 'no_such_step';
+      // Unknown persisted step -> XrStep.failed (non-terminal), never a silent "done". Seeded under
+      // the LEGACY key with its OWN id so the one-time adoption carries it into the list.
+      final j = r.toJson()
+        ..['step'] = 'no_such_step'
+        ..['id'] = 'legacy-unknown-step';
       store.data[_storeKey] = jsonEncode(j);
-      final unk = await XrSwapStore.load();
+      final unk = await XrSwapStore.load(id: 'legacy-unknown-step');
       expect(unk!.step, XrStep.failed);
       expect(unk.terminal, isFalse);
       expect(unk.holdsOrMightHoldAsset, isTrue); // the funded evidence still guards it
+      expect(store.data.containsKey(_storeKey), isFalse, reason: 'adopted into the list, legacy slot emptied');
 
-      // Corrupt blob: load() null, but the blob survives (only an explicit clear deletes).
+      // Corrupt LEGACY blob: reads skip it, but the blob survives (never deleted by a read).
       store.data[_storeKey] = 'not json';
-      expect(await XrSwapStore.load(), isNull);
+      expect(await XrSwapStore.load(id: 'no-such-record'), isNull);
       expect(store.data.containsKey(_storeKey), isTrue);
       await XrSwapStore.clear();
       expect(store.data.containsKey(_storeKey), isFalse);
@@ -547,7 +551,7 @@ void main() {
         ..broadcastAttempted = false;
       await XrSwapStore.save(r);
       expect(XrSwapService.canAbandon(r), isTrue);
-      expect(await XrSwapService.abandon(), isTrue);
+      expect(await XrSwapService.abandon(r), isTrue);
       expect(await XrSwapStore.load(), isNull);
     });
 
@@ -563,7 +567,7 @@ void main() {
         mutate(r);
         await XrSwapStore.save(r);
         expect(XrSwapService.canAbandon(r), isFalse);
-        expect(await XrSwapService.abandon(), isFalse);
+        expect(await XrSwapService.abandon(r), isFalse);
         expect(await XrSwapStore.load(), isNotNull); // the reclaim material survives
         await XrSwapStore.clear();
       }
@@ -573,7 +577,7 @@ void main() {
       final done = _fundedRecord(step: XrStep.btcClaimed)..btcClaimTxid = 'btcclaim01';
       await XrSwapStore.save(done);
       expect(XrSwapService.canAbandon(done), isTrue);
-      expect(await XrSwapService.abandon(), isTrue);
+      expect(await XrSwapService.abandon(done), isTrue);
     });
   });
 

@@ -16,15 +16,12 @@
 // Amounts are BigInt atoms of each leg's OWN asset; display formatting stays with the caller.
 // ---------------------------------------------------------------------------
 
-import 'dart:convert';
-
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-
 import 'config.dart';
 import 'format.dart';
 import 'lightning_service.dart';
 import 'lsp_client.dart';
 import 'trade_receipts.dart';
+import 'trade_slots.dart';
 
 /// The LSP's /swap timeout (LspClient.swap posts with a 90s timeout). A persisted in-flight record OLDER
 /// than this can no longer be racing a live POST in any process, so restart-resolution may judge it.
@@ -39,6 +36,7 @@ const double kLnSizeNoteFractionPct = 5.0;
 /// via the receipt trail, or honestly "did not settle · funds are safe") — it holds no reclaim material.
 class LnTakeRecord {
   LnTakeRecord({
+    String? id,
     required this.state,
     required this.side,
     required this.asset,
@@ -49,8 +47,10 @@ class LnTakeRecord {
     required this.quoteAtoms,
     required this.startedMs,
     this.detail = '',
-  });
+  }) : id = id ?? newTradeId();
 
+  /// Stable per-record id (multi-record store).
+  final String id;
   String state; // 'inflight' | 'failed'
   final String side; // 'buy' (quote -> base) | 'sell' (base -> quote)
   final String asset; // the BASE asset id (hex)
@@ -65,6 +65,7 @@ class LnTakeRecord {
   bool get failed => state == 'failed';
 
   Map<String, dynamic> toJson() => {
+        'id': id,
         'state': state,
         'side': side,
         'asset': asset,
@@ -78,6 +79,7 @@ class LnTakeRecord {
       };
 
   static LnTakeRecord fromJson(Map<String, dynamic> j) => LnTakeRecord(
+        id: '${j['id'] ?? ''}'.isEmpty ? null : '${j['id']}',
         // An unrecognised persisted state decodes as 'inflight' (never silently resolved): the stale
         // resolver then judges it honestly off its age + the receipt trail.
         state: j['state'] == 'failed' ? 'failed' : 'inflight',
@@ -93,27 +95,50 @@ class LnTakeRecord {
       );
 }
 
-/// The single-slot store for the active pure-LN take. Secure storage like its rail siblings
-/// (XrSwapStore / SubswapStore), under its own key so it never clobbers another rail's record.
+/// The multi-record store for pure-LN takes (list under a new key, one-time adoption of the legacy
+/// 'ambra.ln.active'), secure storage like its rail siblings. Pure-LN records protect no funds and do
+/// NOT count toward the shared trade-slot bound — they exist only to keep interrupted takes VISIBLE.
 class LnTakeStore {
   LnTakeStore._();
-  static const _key = 'ambra.ln.active';
-  static const _storage = FlutterSecureStorage();
+  static final TradeListStore _list = TradeListStore(listKey: 'ambra.ln.takes', legacyKey: 'ambra.ln.active');
 
-  static Future<LnTakeRecord?> load() async {
-    final s = await _storage.read(key: _key);
-    if (s == null || s.isEmpty) return null;
+  /// Every persisted take record (undecodable entries skipped; a pure-LN record protects no funds).
+  static Future<List<LnTakeRecord>> loadAll() async {
+    List<Map<String, dynamic>> entries;
     try {
-      return LnTakeRecord.fromJson(jsonDecode(s) as Map<String, dynamic>);
+      entries = (await _list.readAll()).entries;
     } catch (_) {
-      // Undecodable: a pure-LN record protects no funds, so an unreadable blob is dropped rather than
-      // wedging the rail (deliberately unlike the on-chain stores, whose records carry reclaim material).
-      return null;
+      return const []; // undecodable blob: nothing recoverable rides on it (deliberately tolerant)
     }
+    final out = <LnTakeRecord>[];
+    for (final e in entries) {
+      try {
+        out.add(LnTakeRecord.fromJson(e));
+      } catch (_) {/* skip */}
+    }
+    return out;
   }
 
-  static Future<void> save(LnTakeRecord r) => _storage.write(key: _key, value: jsonEncode(r.toJson()));
-  static Future<void> clear() => _storage.delete(key: _key);
+  /// Compat single-record read: the most recent record (by [id] when given).
+  static Future<LnTakeRecord?> load({String? id}) async {
+    final all = await loadAll();
+    if (all.isEmpty) return null;
+    if (id != null && id.isNotEmpty) {
+      for (final r in all) {
+        if (r.id == id) return r;
+      }
+      return null;
+    }
+    return all.first;
+  }
+
+  static Future<void> save(LnTakeRecord r) => _list.upsert(r.toJson());
+
+  /// Remove ONE record by id.
+  static Future<void> remove(String id) => _list.removeById(id);
+
+  /// TEST-ONLY full wipe.
+  static Future<void> clear() => _list.wipeAll();
 }
 
 /// The /lnbook pre-check verdict: the pinned best offer (or null), and whether the book was SERVED at
@@ -232,7 +257,7 @@ class LnTakeService {
           status: 'Settled',
         );
       }
-      await LnTakeStore.clear();
+      await LnTakeStore.remove(rec.id);
       return r;
     } catch (e) {
       rec
@@ -243,16 +268,31 @@ class LnTakeService {
     }
   }
 
-  /// Resolve a persisted record on entry/restart. Returns null when there is nothing to surface:
-  ///   • no record, OR an in-flight record YOUNGER than the LSP's 90s timeout (a live POST in this
-  ///     process may still be racing it — its own sheet is the surface);
-  ///   • an old in-flight record whose receipt trail PROVES it settled (cleared silently, verdict
-  ///     [LnStaleVerdict.settled] so the caller may refresh balances).
-  /// Otherwise the verdict carries the record for the "did not settle · funds are safe" banner —
-  /// honest, because a pure-LN take commits nothing client-side.
+  /// Resolve EVERY persisted record on entry/restart (multi-record store). A record contributes no
+  /// verdict when:
+  ///   • it is in-flight and YOUNGER than the LSP's 90s timeout (a live POST in this process may still
+  ///     be racing it — its own sheet is the surface);
+  ///   • its receipt trail PROVES it settled (cleared silently; the settled verdict is returned so the
+  ///     caller may refresh balances).
+  /// Every other record yields the "did not settle · funds are safe" banner verdict — honest, because
+  /// a pure-LN take commits nothing client-side.
+  static Future<List<LnStaleVerdict>> resolveStaleAll({int? nowMs}) async {
+    final recs = await LnTakeStore.loadAll();
+    final out = <LnStaleVerdict>[];
+    for (final rec in recs) {
+      final v = await _resolveOne(rec, nowMs: nowMs);
+      if (v != null) out.add(v);
+    }
+    return out;
+  }
+
+  /// Compat single-verdict resolve: the first surfaced verdict, if any.
   static Future<LnStaleVerdict?> resolveStale({int? nowMs}) async {
-    final rec = await LnTakeStore.load();
-    if (rec == null) return null;
+    final all = await resolveStaleAll(nowMs: nowMs);
+    return all.isEmpty ? null : all.first;
+  }
+
+  static Future<LnStaleVerdict?> _resolveOne(LnTakeRecord rec, {int? nowMs}) async {
     if (!rec.failed) {
       final now = nowMs ?? DateTime.now().millisecondsSinceEpoch;
       if (now - rec.startedMs < kLnLspTimeoutMs) return null; // may still be live in-process
@@ -268,15 +308,15 @@ class LnTakeService {
       }
       final settled = receipts.any((r) => r.id.startsWith('ln:') && r.ts >= startedS - 2 && r.title.contains(tk));
       if (settled) {
-        await LnTakeStore.clear();
+        await LnTakeStore.remove(rec.id);
         return LnStaleVerdict(record: rec, settled: true);
       }
     }
     return LnStaleVerdict(record: rec, settled: false);
   }
 
-  /// Dismiss the surfaced record (nothing was committed — pure-LN holds no client-side funds).
-  static Future<void> dismiss() => LnTakeStore.clear();
+  /// Dismiss ONE surfaced record (nothing was committed — pure-LN holds no client-side funds).
+  static Future<void> dismiss(LnTakeRecord rec) => LnTakeStore.remove(rec.id);
 
   static double _pow10(int n) {
     var v = 1.0;

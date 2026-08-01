@@ -32,7 +32,6 @@
 import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
 import '../rust/api.dart' as core;
@@ -41,6 +40,7 @@ import 'config.dart';
 import 'lightning_service.dart';
 import 'lsp_client.dart';
 import 'seqob_client.dart' show CrossOffer;
+import 'trade_slots.dart';
 import 'subswap_service.dart'
     show
         bolt11AmountMsat,
@@ -82,6 +82,7 @@ enum BridgeState { starting, confirming, held, claiming, settled, failed, unknow
 /// time (persist-P-early), before any wire act, so a crash at any later point can still claim.
 class LspBridgeRecord {
   LspBridgeRecord({
+    String? id,
     required this.state,
     required this.asset,
     required this.assetAtoms,
@@ -103,8 +104,10 @@ class LspBridgeRecord {
     this.holdMinFinalCltv = 0,
     required this.startedMs,
     this.detail = '',
-  });
+  }) : id = id ?? newTradeId();
 
+  /// Stable per-record id (multi-record store): saves upsert on it, so records never clobber.
+  final String id;
   BridgeState state;
   final String asset;
   final BigInt assetAtoms; // the exact amounts the maker binds on (whole-offer)
@@ -137,6 +140,7 @@ class LspBridgeRecord {
       (state == BridgeState.held || state == BridgeState.claiming || state == BridgeState.unknown);
 
   Map<String, dynamic> toJson() => {
+        'id': id,
         'state': state.name,
         'asset': asset,
         'asset_atoms': assetAtoms.toString(),
@@ -161,6 +165,7 @@ class LspBridgeRecord {
       };
 
   static LspBridgeRecord fromJson(Map<String, dynamic> j) => LspBridgeRecord(
+        id: '${j['id'] ?? ''}'.isEmpty ? null : '${j['id']}',
         // Unrecognised persisted state -> NON-terminal [BridgeState.unknown]: a live record must never
         // read as done and get clobbered (mirror SubswapRecord.fromJson).
         state: BridgeState.values.firstWhere((s) => s.name == j['state'], orElse: () => BridgeState.unknown),
@@ -187,33 +192,54 @@ class LspBridgeRecord {
       );
 }
 
-/// Single-slot secure-storage store for the active payer-bridge (the XrSwapStore twin under its own
-/// key). load() returning null never deletes the blob; only an explicit [clear] does.
+/// Multi-record secure-storage store for the active payer-bridges (the XrSwapStore twin under its own
+/// keys), with one-time never-lossy adoption of the legacy single-slot record ('ambra.bridge.active').
+/// A read never deletes stored material; only an explicit per-record [remove] does.
 class LspBridgeStore {
   LspBridgeStore._();
-  static const _key = 'ambra.bridge.active';
-  static const _storage = FlutterSecureStorage();
+  static final TradeListStore _list =
+      TradeListStore(listKey: 'ambra.bridges', legacyKey: 'ambra.bridge.active');
 
-  static Future<LspBridgeRecord?> load() async {
-    final s = await _storage.read(key: _key);
-    if (s == null || s.isEmpty) return null;
-    try {
-      return LspBridgeRecord.fromJson(jsonDecode(s) as Map<String, dynamic>);
-    } catch (_) {
+  /// Every persisted bridge record. Undecodable entries are skipped but PRESERVED on disk.
+  static Future<List<LspBridgeRecord>> loadAll() async {
+    final read = await _list.readAll();
+    final out = <LspBridgeRecord>[];
+    for (final e in read.entries) {
+      try {
+        out.add(LspBridgeRecord.fromJson(e));
+      } catch (_) {/* preserved on disk; not drivable by this build */}
+    }
+    return out;
+  }
+
+  /// Compat single-record read: by [id] when given, else the first holding value, else the most recent.
+  static Future<LspBridgeRecord?> load({String? id}) async {
+    final all = await loadAll();
+    if (all.isEmpty) return null;
+    if (id != null && id.isNotEmpty) {
+      for (final r in all) {
+        if (r.id == id) return r;
+      }
       return null;
     }
+    for (final r in all) {
+      if (r.holdsOrMightHoldValue) return r;
+    }
+    return all.first;
   }
 
-  static Future<void> save(LspBridgeRecord r) => _storage.write(key: _key, value: jsonEncode(r.toJson()));
-  static Future<void> clear() => _storage.delete(key: _key);
+  static Future<void> save(LspBridgeRecord r) => _list.upsert(r.toJson());
 
-  /// A record the single-slot store must protect: non-terminal AND holding (or possibly holding) a
-  /// committed HELD payment keyed by this record's P. Callers guard on this before starting another.
-  static Future<LspBridgeRecord?> inFlightWithFunds() async {
-    final r = await load();
-    if (r == null) return null;
-    return r.holdsOrMightHoldValue ? r : null;
-  }
+  /// Remove ONE record by id (after the CLTV-gated abandon / pre-commitment cleanup).
+  static Future<void> remove(String id) => _list.removeById(id);
+
+  /// The records the store must protect: non-terminal AND holding (or possibly holding) a committed
+  /// HELD payment keyed by that record's P. Slot count + cards + resume iterate these.
+  static Future<List<LspBridgeRecord>> inFlightWithFunds() async =>
+      (await loadAll()).where((r) => r.holdsOrMightHoldValue).toList();
+
+  /// TEST-ONLY full wipe.
+  static Future<void> clear() => _list.wipeAll();
 }
 
 /// The chain + LSP seam every network/FFI touch goes through, so tests can mock the world. The live
@@ -302,16 +328,14 @@ class LspBridgeService {
     return seqTip >= 0 && rec.seqLocktime > 0 && seqTip >= rec.seqLocktime;
   }
 
-  /// Clear the slot, refused (false) while [canAbandon] says the record still protects value.
-  static Future<bool> abandon() async {
-    final rec = await LspBridgeStore.load();
-    if (rec == null) {
-      await LspBridgeStore.clear();
-      return true;
-    }
+  /// Clear ONE record, refused (false) while [canAbandon] says it still protects value. Judged on the
+  /// FRESH on-disk record by id; removes exactly that record.
+  static Future<bool> abandon(LspBridgeRecord record) async {
+    final rec = await LspBridgeStore.load(id: record.id);
+    if (rec == null) return true; // already gone
     final tip = await chain.seqTipHeight();
     if (!canAbandon(rec, seqTip: tip)) return false;
-    await LspBridgeStore.clear();
+    await LspBridgeStore.remove(rec.id);
     return true;
   }
 
@@ -323,10 +347,11 @@ class LspBridgeService {
   static Future<LspBridgeRecord> buy(CrossOffer offer, {void Function(String)? onStep}) async {
     void step(String s) => onStep?.call(s);
 
-    // Single-slot guard: never overwrite a record that still protects a HELD payment.
-    if (await LspBridgeStore.inFlightWithFunds() != null) {
-      throw Exception('You already have a bridged swap in progress · finish or resume it first.');
-    }
+    // SHARED SLOT GATE (web tradeSlotsFree): records upsert by id so a second bridge can never
+    // overwrite one protecting a HELD payment — the single-slot hard refusal is replaced by the
+    // bounded concurrent-trade count across all rail-crossing kinds.
+    final refusal = await TradeSlots.refusalIfFull();
+    if (refusal != null) throw Exception(refusal);
     if (offer.assetAtoms <= BigInt.zero || offer.btcSats <= BigInt.zero) {
       throw Exception('This offer has no amounts to bind - nothing was placed.');
     }
@@ -634,10 +659,31 @@ class LspBridgeService {
   ///   held / confirming (the hold may be HELD)     -> re-poll the job for the relayed leg, then the
   ///     full verify -> anchor -> window -> claim ladder. NEVER dropped.
   ///   starting (no job posted, no hold)            -> nothing committed; cleared.
-  /// Returns the record (possibly advanced), or null when nothing is persisted.
-  static Future<LspBridgeRecord?> resume({void Function(String)? onStep}) async {
-    final rec = await LspBridgeStore.load();
-    if (rec == null) return null;
+  /// Returns the record (possibly advanced), or null when nothing is persisted. With the multi-record
+  /// store, EVERY non-terminal record is resumed INDEPENDENTLY (one stuck job never blocks another
+  /// record's claim); [record] targets a specific one (the resume sheet). The return value is the
+  /// targeted record when given, else the first record touched (compat).
+  static Future<LspBridgeRecord?> resume({void Function(String)? onStep, LspBridgeRecord? record}) async {
+    if (record != null) {
+      final fresh = await LspBridgeStore.load(id: record.id) ?? record;
+      return _resumeOne(fresh, onStep: onStep);
+    }
+    List<LspBridgeRecord> recs;
+    try {
+      recs = await LspBridgeStore.loadAll();
+    } catch (_) {
+      return null;
+    }
+    LspBridgeRecord? first;
+    await Future.wait([
+      for (final r in recs)
+        if (!r.terminal)
+          _resumeOne(r, onStep: onStep).then((v) => first ??= v).catchError((Object _) => null),
+    ]);
+    return first;
+  }
+
+  static Future<LspBridgeRecord?> _resumeOne(LspBridgeRecord rec, {void Function(String)? onStep}) async {
     if (rec.terminal) return rec;
     if (rec.state == BridgeState.claiming && rec.legTxid.isNotEmpty && rec.legRedeem.isNotEmpty) {
       // (A) Re-claim idempotently (a crash between the window re-check and the claim must never strand
@@ -683,9 +729,10 @@ class LspBridgeService {
         return rec; // NEVER dropped — only a verified asset-in-our-key claim reveals P
       }
     }
-    // Pre-commitment (no job posted, hold never paid): the session is gone and nothing moved — clear.
+    // Pre-commitment (no job posted, hold never paid): the session is gone and nothing moved — remove
+    // exactly THIS record (never the whole store).
     if (!rec.holdsOrMightHoldValue) {
-      await LspBridgeStore.clear();
+      await LspBridgeStore.remove(rec.id);
       return null;
     }
     return rec;

@@ -30,7 +30,8 @@ import 'package:ambra/src/data/tx_flow.dart';
 
 const MethodChannel _channel = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
 const MethodChannel _authChannel = MethodChannel('plugins.flutter.io/local_auth');
-const String _storeKey = 'ambra.subswap.active';
+const String _storeKey = 'ambra.subswap.active'; // the LEGACY single-slot key (adopted on first read)
+const String _listKey = 'ambra.subswaps'; // the multi-record list key
 const String _mnemonicKey = 'ambra.mnemonic';
 
 /// Mock the local_auth plugin channel so [WalletRepository.requirePaymentAuth] resolves deterministically:
@@ -100,6 +101,15 @@ class _FakeSecureStorage {
   static void uninstall() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(_channel, null);
   }
+}
+
+/// Whether a persisted submarine record survives in EITHER slot — the multi-record list under
+/// [_listKey], or the not-yet-adopted legacy single-slot under [_storeKey]. The fund-safety intent of
+/// every "record preserved" assertion is location-blind: the record must exist SOMEWHERE on disk.
+bool _recordStored(_FakeSecureStorage fake) {
+  final list = fake.data[_listKey];
+  if (list != null && list.isNotEmpty && list != '[]') return true;
+  return fake.data.containsKey(_storeKey);
 }
 
 SubswapRecord _rec({
@@ -403,9 +413,11 @@ void main() {
       await expectLater(SubswapStore.load(), throwsA(isA<SubswapCorruptRecordException>()));
       expect(SubswapStore.hasInFlight, isTrue, reason: 'guard stays closed — never start a second swap over it');
       expect(SubswapStore.corrupt, isTrue, reason: 'surfaced via the guarded RECOVER affordance');
-      // Fund-safety: the raw record is still on disk (never dropped by the failing load).
-      expect(fake.data.containsKey(_storeKey), isTrue);
-      expect(fake.deletes, 0);
+      // Fund-safety: the record is still on disk (never dropped by the failing load). The one-time
+      // adoption MOVED it into the list (write-first-then-delete), so the legacy delete is expected —
+      // the payload itself survives verbatim, unknown state included.
+      expect(_recordStored(fake), isTrue);
+      expect(fake.data[_listKey], contains('a_state_from_a_newer_build'));
     });
   });
 
@@ -460,7 +472,7 @@ void main() {
       expect(SubswapStore.hasInFlight, isTrue);
       expect(SubswapStore.corrupt, isFalse);
       expect(SubswapStore.primeErrored, isFalse);
-      expect(fake.data.containsKey(_storeKey), isTrue);
+      expect(_recordStored(fake), isTrue);
     });
 
     test('save(terminal) opens the guard', () async {
@@ -475,7 +487,7 @@ void main() {
       await SubswapStore.clear();
       expect(SubswapStore.hasInFlight, isFalse);
       expect(SubswapStore.corrupt, isFalse);
-      expect(fake.data.containsKey(_storeKey), isFalse);
+      expect(_recordStored(fake), isFalse);
     });
   });
 
@@ -501,7 +513,7 @@ void main() {
       fake.data[_storeKey] = jsonEncode(_rec(state: SubState.starting).toJson());
       SubswapService.debugDriving = true;
       await SubswapService.resume(); // returns immediately; no storage access
-      expect(fake.data.containsKey(_storeKey), isTrue, reason: 'the concurrent drive must not clear it');
+      expect(_recordStored(fake), isTrue, reason: 'the concurrent drive must not clear it');
       expect(fake.reads, 0, reason: 'the guard short-circuits before any load');
       SubswapService.debugDriving = false;
     });
@@ -621,7 +633,7 @@ void main() {
 
       final cleared = await SubswapService.abandonUnfundedSell(rec, HtlcScanResult.empty);
       expect(cleared, isTrue, reason: 'empty pre-scan + fresh-reload-unchanged + not-driving + identity + STILL-empty re-scan -> the fund-safe clear proceeds');
-      expect(fake.data.containsKey(_storeKey), isFalse, reason: 'the never-funded record is dropped');
+      expect(_recordStored(fake), isFalse, reason: 'the never-funded record is dropped');
       expect(SubswapStore.hasInFlight, isFalse, reason: 'the guard resets — the rail is freed');
       expect(SubswapService.driving, isFalse, reason: 'the one-at-a-time guard is released after the decision');
       expect(fake.deletes, 1);
@@ -646,7 +658,7 @@ void main() {
 
       final cleared = await SubswapService.abandonUnfundedSell(rec, HtlcScanResult.empty); // pre-dialog scan was empty
       expect(cleared, isFalse, reason: 're-scan-before-clear now finds the funding — the stale empty pre-scan is NOT trusted');
-      expect(fake.data.containsKey(_storeKey), isTrue, reason: 'the now-funded record is preserved (resumable)');
+      expect(_recordStored(fake), isTrue, reason: 'the now-funded record is preserved (resumable)');
       expect(SubswapStore.hasInFlight, isTrue, reason: 'the guard stays closed — the swap can still settle/refund');
       expect(fake.deletes, 0, reason: 'nothing was cleared');
       expect(SubswapService.driving, isFalse, reason: 'the one-at-a-time guard is released after refusing');
@@ -668,7 +680,7 @@ void main() {
 
       final cleared = await SubswapService.abandonUnfundedSell(rec, HtlcScanResult.empty);
       expect(cleared, isFalse, reason: 'an unreadable re-scan fails closed — never clear on a stale pre-dialog empty');
-      expect(fake.data.containsKey(_storeKey), isTrue, reason: 'the record is preserved (resumable)');
+      expect(_recordStored(fake), isTrue, reason: 'the record is preserved (resumable)');
       expect(fake.deletes, 0);
       expect(SubswapService.driving, isFalse);
     });
@@ -723,7 +735,7 @@ void main() {
       );
       final cleared = await SubswapService.abandonUnfundedSell(stale, HtlcScanResult.empty);
       expect(cleared, isFalse, reason: 'the FRESH on-disk record advanced to settling (funded HTLC) — never clobber it');
-      expect(fake.data.containsKey(_storeKey), isTrue, reason: 'the funded record is preserved (resumable)');
+      expect(_recordStored(fake), isTrue, reason: 'the funded record is preserved (resumable)');
       expect(SubswapStore.hasInFlight, isTrue);
       expect(fake.deletes, 0);
     });
@@ -753,7 +765,7 @@ void main() {
       );
       final cleared = await SubswapService.abandonUnfundedSell(stale, HtlcScanResult.empty);
       expect(cleared, isFalse, reason: 'a persisted seqFundTxid is direct proof of funding — never abandonable, regardless of the scan');
-      expect(fake.data.containsKey(_storeKey), isTrue, reason: 'the funded record is preserved (resumable)');
+      expect(_recordStored(fake), isTrue, reason: 'the funded record is preserved (resumable)');
       expect(SubswapStore.hasInFlight, isTrue);
       expect(fake.deletes, 0);
     });
@@ -771,7 +783,7 @@ void main() {
       SubswapService.debugDriving = true; // a drive holds the one-at-a-time guard
       final cleared = await SubswapService.abandonUnfundedSell(rec, HtlcScanResult.empty);
       expect(cleared, isFalse, reason: 'never abandon a record a drive is actively settling');
-      expect(fake.data.containsKey(_storeKey), isTrue, reason: 'the record is preserved (resumable)');
+      expect(_recordStored(fake), isTrue, reason: 'the record is preserved (resumable)');
       expect(fake.deletes, 0);
       SubswapService.debugDriving = false;
     });
@@ -796,7 +808,7 @@ void main() {
       );
       final cleared = await SubswapService.abandonUnfundedSell(staleA, HtlcScanResult.empty);
       expect(cleared, isFalse, reason: 'the on-disk swap is a different offer than the one scanned — never clear it on a foreign scan');
-      expect(fake.data.containsKey(_storeKey), isTrue);
+      expect(_recordStored(fake), isTrue);
       expect(fake.deletes, 0);
     });
 
@@ -813,7 +825,7 @@ void main() {
 
       final cleared = await SubswapService.abandonUnfundedSell(rec, HtlcScanResult.funded);
       expect(cleared, isFalse, reason: 'never clear while an output may sit at the HTLC address (fund-safe)');
-      expect(fake.data.containsKey(_storeKey), isTrue, reason: 'the record is preserved (resumable)');
+      expect(_recordStored(fake), isTrue, reason: 'the record is preserved (resumable)');
       expect(SubswapStore.hasInFlight, isTrue, reason: 'the guard stays closed — the swap can still settle/refund');
       expect(fake.deletes, 0);
     });
@@ -831,7 +843,7 @@ void main() {
 
       final cleared = await SubswapService.abandonUnfundedSell(rec, HtlcScanResult.unreadable);
       expect(cleared, isFalse, reason: 'a transient/unreadable scan must NEVER enable the abandon (fund-safe)');
-      expect(fake.data.containsKey(_storeKey), isTrue, reason: 'the record is preserved (resumable)');
+      expect(_recordStored(fake), isTrue, reason: 'the record is preserved (resumable)');
       expect(SubswapStore.hasInFlight, isTrue);
       expect(fake.deletes, 0);
     });
@@ -843,7 +855,7 @@ void main() {
 
       final cleared = await SubswapService.abandonUnfundedSell(rec, HtlcScanResult.empty);
       expect(cleared, isFalse, reason: 'the fresh-reloaded record is settling (funded HTLC) — never abandonable');
-      expect(fake.data.containsKey(_storeKey), isTrue);
+      expect(_recordStored(fake), isTrue);
       expect(SubswapStore.hasInFlight, isTrue);
       expect(fake.deletes, 0);
     });
@@ -852,7 +864,7 @@ void main() {
       final rec = _rec(buy: true, state: SubState.funding, legTxid: '');
       await SubswapStore.save(rec);
       expect(await SubswapService.abandonUnfundedSell(rec, HtlcScanResult.empty), isFalse);
-      expect(fake.data.containsKey(_storeKey), isTrue);
+      expect(_recordStored(fake), isTrue);
     });
 
     test('abandonUnfundedSell on an already-cleared store (fresh reload null) returns false and clears nothing', () async {
