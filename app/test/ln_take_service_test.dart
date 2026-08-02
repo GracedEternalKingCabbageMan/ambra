@@ -3,10 +3,15 @@
 //   1. REVIEW SIZING — the offer-vs-typed mismatch math the Review sheet keys its loud note on
 //      (mirror web reviewLn's 5% threshold): within 5% -> no note; beyond -> note; nothing typed /
 //      unparsable -> no note (the review's amounts are already the whole truth).
-//   2. RECORD ROUND-TRIP — the persisted single-slot record ('ambra.ln.active') preserves every field
-//      through JSON and through the real secure-storage store; an unrecognised state decodes as
-//      'inflight' (never silently resolved).
-//   3. STALE RESOLUTION — a record younger than the LSP's 90s timeout is left alone (a live POST may
+//   2. SLICE PRICING — priceSlice, the one client-side authority mirroring the LSP's Go settlement
+//      driver EXACTLY: take = min(typed, offer); counter leg FLOOR on a buy / CEIL on a sell; BigInt
+//      exactness; the whole path reproduces the offer's legs VERBATIM (no derived rounding); a dust
+//      partial (counter leg = 0) refuses before anything persists or posts.
+//   3. RECORD ROUND-TRIP — the persisted single-slot record ('ambra.ln.active') preserves every field
+//      (take_atoms included; absent on legacy records = zero = a whole lift) through JSON and through
+//      the real secure-storage store; an unrecognised state decodes as 'inflight' (never silently
+//      resolved).
+//   4. STALE RESOLUTION — a record younger than the LSP's 90s timeout is left alone (a live POST may
 //      still be racing it); an old one with a matching 'ln:' receipt in the trail resolves SETTLED and
 //      clears; an old one without a receipt surfaces "did not settle" (honest: pure-LN commits nothing
 //      client-side); a failed record surfaces the same banner.
@@ -20,6 +25,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ambra/src/data/config.dart';
 import 'package:ambra/src/data/ln_take_service.dart';
+import 'package:ambra/src/data/lsp_client.dart';
 import 'package:ambra/src/data/trade_receipts.dart';
 
 const MethodChannel _channel = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
@@ -69,8 +75,16 @@ LnTakeRecord _rec({String state = 'inflight', int? startedMs}) => LnTakeRecord(
       makerPubkey: '02aa',
       assetAtoms: BigInt.from(200000),
       quoteAtoms: BigInt.from(1234),
+      takeAtoms: BigInt.from(200000),
       startedMs: startedMs ?? DateTime.now().millisecondsSinceEpoch,
       detail: 'd',
+    );
+
+LnOffer _offer({required int assetAtoms, required int btcSats}) => LnOffer(
+      offerId: 'off-1',
+      makerPubkey: '02aa',
+      assetAtoms: BigInt.from(assetAtoms),
+      btcAtoms: BigInt.from(btcSats),
     );
 
 void main() {
@@ -106,6 +120,86 @@ void main() {
     });
   });
 
+  group('slice pricing (priceSlice — the one authority, mirrors the Go settlement driver)', () {
+    test('null / non-positive / at-or-above the offer -> WHOLE: the offer\'s legs VERBATIM, no rounding', () {
+      final o = _offer(assetAtoms: 3, btcSats: 10);
+      for (final req in <BigInt?>[null, BigInt.zero, -BigInt.one, BigInt.from(3), BigInt.from(999)]) {
+        for (final side in const ['buy', 'sell']) {
+          final s = LnTakeService.priceSlice(side: side, offer: o, requestedAtoms: req);
+          expect(s.whole, isTrue, reason: 'req=$req side=$side');
+          expect(s.assetAtoms, BigInt.from(3)); // min(req, offer) caps at the offer
+          expect(s.quoteAtoms, BigInt.from(10)); // the offer's OWN counter leg, never re-derived
+          expect(s.dust, isFalse);
+        }
+      }
+    });
+
+    test('min(typed, offer): a smaller request takes exactly that base slice', () {
+      final s = LnTakeService.priceSlice(
+          side: 'sell', offer: _offer(assetAtoms: 200000, btcSats: 1234), requestedAtoms: BigInt.from(50000));
+      expect(s.whole, isFalse);
+      expect(s.assetAtoms, BigInt.from(50000));
+    });
+
+    test('the edge where floor and ceil DIFFER: a BUY floors (taker gives BTC), a SELL ceils (taker receives)', () {
+      final o = _offer(assetAtoms: 3, btcSats: 10); // 10*2/3 = 6.66…
+      final buy = LnTakeService.priceSlice(side: 'buy', offer: o, requestedAtoms: BigInt.two);
+      expect(buy.whole, isFalse);
+      expect(buy.assetAtoms, BigInt.two);
+      expect(buy.quoteAtoms, BigInt.from(6)); // FLOOR(10·2/3)
+      final sell = LnTakeService.priceSlice(side: 'sell', offer: o, requestedAtoms: BigInt.two);
+      expect(sell.quoteAtoms, BigInt.from(7)); // CEIL(10·2/3)
+    });
+
+    test('exact division: floor == ceil (no rounding artifact on either side)', () {
+      final o = _offer(assetAtoms: 4, btcSats: 10); // 10*2/4 = 5 exactly
+      for (final side in const ['buy', 'sell']) {
+        expect(LnTakeService.priceSlice(side: side, offer: o, requestedAtoms: BigInt.two).quoteAtoms,
+            BigInt.from(5));
+      }
+    });
+
+    test('BigInt exactness beyond double precision (legs past 2^53)', () {
+      final offerAsset = BigInt.parse('9007199254740993'); // 2^53 + 1: double math would corrupt this
+      final offerQuote = BigInt.parse('9007199254740995');
+      final req = BigInt.parse('9007199254740992');
+      final o = LnOffer(offerId: 'o', makerPubkey: '02aa', assetAtoms: offerAsset, btcAtoms: offerQuote);
+      final expectedFloor = (offerQuote * req) ~/ offerAsset;
+      final buy = LnTakeService.priceSlice(side: 'buy', offer: o, requestedAtoms: req);
+      expect(buy.assetAtoms, req);
+      expect(buy.quoteAtoms, expectedFloor);
+      // The division is inexact here, so the sell's CEIL is exactly one more.
+      expect((offerQuote * req) % offerAsset, isNot(BigInt.zero));
+      final sell = LnTakeService.priceSlice(side: 'sell', offer: o, requestedAtoms: req);
+      expect(sell.quoteAtoms, expectedFloor + BigInt.one);
+    });
+
+    test('dust: a partial pricing the counter leg to ZERO refuses (buy floors to 0; a sell ceils to 1)', () {
+      final o = _offer(assetAtoms: 1000, btcSats: 5);
+      final buy = LnTakeService.priceSlice(side: 'buy', offer: o, requestedAtoms: BigInt.one);
+      expect(buy.quoteAtoms, BigInt.zero);
+      expect(buy.dust, isTrue); // the caller must refuse before anything persists or posts
+      final sell = LnTakeService.priceSlice(side: 'sell', offer: o, requestedAtoms: BigInt.one);
+      expect(sell.quoteAtoms, BigInt.one); // CEIL of a positive product never dusts
+      expect(sell.dust, isFalse);
+    });
+
+    test('take() refuses a dust slice BEFORE persisting anything', () async {
+      _FakeSecureStorage().install();
+      await expectLater(
+        LnTakeService.take(
+          side: 'buy',
+          asset: kAsset,
+          offer: _offer(assetAtoms: 1000, btcSats: 5),
+          requestedAtoms: BigInt.one,
+          typedAmount: '1',
+        ),
+        throwsA(isA<Exception>()),
+      );
+      expect(await LnTakeStore.load(), isNull); // nothing persisted, nothing posted
+    });
+  });
+
   group('record round-trip', () {
     test('JSON round-trip preserves every field', () {
       final r = _rec(startedMs: 1234567);
@@ -118,8 +212,14 @@ void main() {
       expect(back.makerPubkey, '02aa');
       expect(back.assetAtoms, BigInt.from(200000));
       expect(back.quoteAtoms, BigInt.from(1234));
+      expect(back.takeAtoms, BigInt.from(200000));
       expect(back.startedMs, 1234567);
       expect(back.detail, 'd');
+    });
+
+    test('a legacy record without take_atoms decodes ZERO (= a whole lift, exactly what it was)', () {
+      final j = _rec().toJson()..remove('take_atoms');
+      expect(LnTakeRecord.fromJson(j).takeAtoms, BigInt.zero);
     });
 
     test('an unrecognised persisted state decodes as inflight (never silently resolved)', () {
