@@ -8,10 +8,12 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../data/api_client.dart';
+import '../data/asset_picker.dart';
 import '../data/book_levels.dart';
 import '../data/btc_state.dart';
 import '../data/config.dart';
 import '../data/format.dart';
+import '../data/hidden_assets.dart';
 import '../data/lightning_service.dart';
 import '../data/ln_rail.dart';
 import '../data/ln_take_service.dart';
@@ -85,6 +87,14 @@ class _SwapCache {
   /// A monotonic maker-payout index seed (avoids taproot credit collisions
   /// between resting orders within a session).
   static int makerIndexSeed = DateTime.now().millisecondsSinceEpoch % 100000;
+
+  /// Asset ids the user PASTED into a picker search box and PICKED (mirrors the
+  /// web's PASTED set). Session-only on purpose: an id that was never traded
+  /// needs no persistence, and one that WAS traded persists through balances +
+  /// receipts instead. Read by the payable/receivable sets so the user's own
+  /// pick survives validation (an unregistered, unheld id would otherwise be
+  /// dropped by the dedup and the composer would silently clear it).
+  static final Set<String> pastedIds = <String>{};
 }
 
 class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
@@ -503,6 +513,9 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     try {
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) return;
+      // The per-wallet hidden set gates the pickers' DEFAULT view (hidden assets stay
+      // searchable). Cheap when already loaded for this wallet; non-blocking either way.
+      unawaited(HiddenAssets.instance.loadFor(m));
       // Surface any in-flight cross-chain swap with locked BTC so its resume/refund
       // surface (XchainSwapScreen) is REACHABLE — the courier composer path no longer
       // opens that screen directly, so without this banner a mid-flight swap (and its
@@ -664,7 +677,20 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     return '0';
   }
 
-  bool _holds(String hex) => (BigInt.tryParse(_bal(hex)) ?? BigInt.zero) > BigInt.zero;
+  /// Spendable Lightning atoms for an asset (or BTC), from this wallet's OWN
+  /// provisioned channels. Zero when Lightning is dormant or there's no channel.
+  BigInt _lnAtoms(String hex) {
+    if (_lnChannels.isEmpty) return BigInt.zero;
+    final t = hex == kBtcSentinel
+        ? RailTarget.btc()
+        : RailTarget.asset(hex: hex, ticker: SeqAssets.labelFor(hex).ticker);
+    return legLiquidity(_lnChannels, t).spendable;
+  }
+
+  /// Held = a positive balance ON-CHAIN OR IN LIGHTNING — an asset fully moved
+  /// into a channel is still yours, so it must count as held (picker default view).
+  bool _holds(String hex) =>
+      (BigInt.tryParse(_bal(hex)) ?? BigInt.zero) > BigInt.zero || _lnAtoms(hex) > BigInt.zero;
 
   Set<String> _counterparts(String? other) {
     final set = <String>{};
@@ -733,6 +759,12 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
       ...SeqAssets.resolvedIds,
     });
     if (_btcOffered) out.add(kBtcSentinel); // BTC LAST so the default pay stays a Sequentia asset
+    // An asset id the user explicitly pasted + picked stays selectable for the session even with
+    // no registry entry and no balance — otherwise the resolved/held dedup above drops it and the
+    // cached-selection validation in _load would silently clear the user's own pick.
+    for (final h in _SwapCache.pastedIds) {
+      if (!out.contains(h)) out.add(h);
+    }
     return out;
   }
 
@@ -744,17 +776,27 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     if (pay == kBtcSentinel) {
       // Paying BTC: any Sequentia asset is a valid counterpart (buy it with Bitcoin). Not gated on a
       // pre-existing cross market — the cross/LN book may be empty until a maker posts.
-      return _dedupByTicker(<String>{
+      final out = _dedupByTicker(<String>{
         ..._counterparts(null),
         ..._btcMarketAssets(),
         ...SeqAssets.resolvedIds,
       });
+      // Pasted-and-picked ids survive here too (see _payableAssets).
+      for (final h in _SwapCache.pastedIds) {
+        if (!out.contains(h)) out.add(h);
+      }
+      return out;
     }
     final out = _dedupByTicker(<String>{
       ..._counterparts(pay),
       ...SeqAssets.resolvedIds,
     }..removeWhere((h) => h == pay));
     if (_btcOffered && pay != null) out.add(kBtcSentinel); // any Sequentia asset can be sold for Bitcoin
+    // Pasted-and-picked ids survive here too (see _payableAssets): any two distinct
+    // Sequentia assets form a startable same-chain market, keyed by raw hex.
+    for (final h in _SwapCache.pastedIds) {
+      if (h != pay && !out.contains(h)) out.add(h);
+    }
     return out;
   }
 
@@ -1146,7 +1188,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   // --- pickers ---------------------------------------------------------------
 
   Future<void> _pickPay() async {
-    final picked = await _assetSheet('Pay with', _payableAssets(), withBalance: true);
+    final picked = await _assetSheet('Pay with', _payableAssets(), withBalance: true, registrySearch: true);
     if (picked != null) {
       setState(() {
         _payAsset = picked;
@@ -1166,7 +1208,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   Future<void> _pickReceive() async {
     final recv = _receivableAssets();
     if (recv.isEmpty) return _snack('Nothing trades against ${_tk(_payAsset)} yet');
-    final picked = await _assetSheet('Receive', recv);
+    final picked = await _assetSheet('Receive', recv, withBalance: true, registrySearch: true);
     if (picked != null) {
       setState(() {
         _receiveAsset = picked;
@@ -1190,7 +1232,40 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     if (picked != null) setState(() => _feeAsset = picked);
   }
 
-  Future<String?> _assetSheet(String title, List<String> ids, {bool withBalance = false}) {
+  /// The composer's searchable asset sheet.
+  ///
+  /// With [registrySearch] (the pay/receive pickers): the DEFAULT (empty-search)
+  /// view shows ONLY assets this wallet holds — on-chain or in Lightning — plus
+  /// native BTC (first-class, listed even at 0), minus assets hidden on the
+  /// Balance tab; a hint row says how to reach the rest. Typing searches EVERY
+  /// candidate (the full registry, hidden included) by ticker/name/id, and a
+  /// pasted 64-hex id that matches nothing known synthesizes a selectable,
+  /// TRADEABLE row (id-prefix ticker, precision 8 — see [pickerMatches]); picking
+  /// it registers the id for the session so validation never drops it.
+  /// Without [registrySearch] (the fee picker): the plain filter over [ids] —
+  /// fee assets are whitelist-constrained, so synthesizing arbitrary ids there
+  /// would offer a fee the relay refuses.
+  Future<String?> _assetSheet(String title, List<String> ids,
+      {bool withBalance = false, bool registrySearch = false}) {
+    // Trailing balance = TOTAL holdings (on-chain + Lightning), so a fully-moved
+    // asset never reads "0" while listed as held.
+    String balStr(String id) {
+      final total = (BigInt.tryParse(_bal(id)) ?? BigInt.zero) + _lnAtoms(id);
+      return formatAtoms(total.toString(), SeqAssets.labelFor(id).precision);
+    }
+
+    // Candidate rows, built once per open. held/hidden feed pickerMatches'
+    // default-vs-search visibility (registrySearch mode only).
+    final rows = [
+      for (final id in ids)
+        AssetPickerItem(
+          hex: id,
+          ticker: SeqAssets.labelFor(id).ticker,
+          name: SeqAssets.labelFor(id).subtitle,
+          held: id == kBtcSentinel || _holds(id),
+          hidden: HiddenAssets.instance.isHidden(id),
+        ),
+    ];
     return showModalBottomSheet<String>(
       context: context,
       backgroundColor: AmbraColors.panel,
@@ -1206,53 +1281,74 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
             constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.7),
             child: StatefulBuilder(
               builder: (context, setSheet) {
-                final q = search.text.trim().toLowerCase();
-                // Filter by ticker OR name (subtitle), case-insensitive.
-                final shown = q.isEmpty
-                    ? ids
-                    : ids.where((id) {
-                        final l = SeqAssets.labelFor(id);
-                        return l.ticker.toLowerCase().contains(q) ||
-                            (l.subtitle?.toLowerCase().contains(q) ?? false);
-                      }).toList();
+                final q = search.text.trim();
+                final ql = q.toLowerCase();
+                // registrySearch: default = held + BTC − hidden; typed = full sweep + pasted-id
+                // synthesis. Plain mode: filter by ticker OR name, case-insensitive (unchanged).
+                final shown = registrySearch
+                    ? pickerMatches(rows, q)
+                    : (q.isEmpty
+                        ? rows
+                        : rows
+                            .where((it) =>
+                                it.ticker.toLowerCase().contains(ql) ||
+                                (it.name?.toLowerCase().contains(ql) ?? false))
+                            .toList());
                 return Column(mainAxisSize: MainAxisSize.min, children: [
                   Padding(padding: const EdgeInsets.all(16), child: Text(title, style: AmbraText.title)),
-                  // Search box — only when the list is long enough to warrant it.
-                  if (ids.length > 6)
+                  // Search box — always for a registry-searching picker (the registry is only
+                  // reachable by typing); otherwise only when the list warrants it.
+                  if (registrySearch || ids.length > 6)
                     Padding(
                       padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
                       child: TextField(
                         controller: search,
                         style: AmbraText.body,
-                        decoration: const InputDecoration(
-                          hintText: 'Search assets',
-                          prefixIcon: Icon(Icons.search, size: 20),
+                        decoration: InputDecoration(
+                          hintText: registrySearch ? 'Search assets, or paste an asset id' : 'Search assets',
+                          prefixIcon: const Icon(Icons.search, size: 20),
                           isDense: true,
                         ),
                         onChanged: (_) => setSheet(() {}),
                       ),
                     ),
-                  if (shown.isEmpty)
-                    Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Text(ids.isEmpty ? 'No assets available.' : 'No asset matches your search.',
-                          style: AmbraText.muted),
+                  if (shown.isEmpty && q.isNotEmpty)
+                    const Padding(
+                      padding: EdgeInsets.all(16),
+                      child: Text('No asset matches your search.', style: AmbraText.muted),
+                    )
+                  else if (shown.isEmpty && !registrySearch)
+                    const Padding(
+                      padding: EdgeInsets.all(16),
+                      child: Text('No assets available.', style: AmbraText.muted),
                     ),
                   Flexible(
                     child: ListView(
                       shrinkWrap: true,
                       padding: const EdgeInsets.only(bottom: 8),
                       children: [
-                        for (final id in shown)
+                        for (final it in shown)
                           ListTile(
-                            title: Text(SeqAssets.labelFor(id).ticker, style: AmbraText.body),
-                            subtitle: SeqAssets.labelFor(id).subtitle != null
-                                ? Text(SeqAssets.labelFor(id).subtitle!, style: AmbraText.sub)
-                                : null,
-                            trailing: withBalance
-                                ? Text(formatAtoms(_bal(id), SeqAssets.labelFor(id).precision), style: AmbraText.mono)
-                                : null,
-                            onTap: () => Navigator.pop(context, id),
+                            title: Text(it.ticker, style: AmbraText.body),
+                            subtitle: it.name != null
+                                ? Text(it.name!, style: AmbraText.sub)
+                                : (it.pasted
+                                    ? const Text('Unregistered asset · trades by id', style: AmbraText.sub)
+                                    : null),
+                            trailing: withBalance ? Text(balStr(it.hex), style: AmbraText.mono) : null,
+                            onTap: () {
+                              // A pasted-id pick is registered for the session so the payable/
+                              // receivable sets keep offering it and validation never clears it.
+                              if (it.pasted) _SwapCache.pastedIds.add(it.hex);
+                              Navigator.pop(context, it.hex);
+                            },
+                          ),
+                        // The default view holds only your assets + BTC: say how to reach the rest.
+                        if (registrySearch && q.isEmpty)
+                          const Padding(
+                            padding: EdgeInsets.fromLTRB(16, 8, 16, 8),
+                            child: Text('Type to search every registry asset, or paste an asset id.',
+                                style: AmbraText.sub),
                           ),
                       ],
                     ),

@@ -6,9 +6,11 @@ import 'package:qr_flutter/qr_flutter.dart';
 
 import '../rust/api.dart' as core;
 import '../data/api_client.dart';
+import '../data/asset_picker.dart';
 import '../data/btc_state.dart';
 import '../data/config.dart';
 import '../data/format.dart';
+import '../data/hidden_assets.dart';
 import '../data/lightning_service.dart';
 import '../data/ln_rail.dart';
 import '../data/lsp_client.dart';
@@ -143,6 +145,9 @@ class _BalanceTabState extends State<BalanceTab> {
   bool _loading = true;
   DateTime? _lastSync; // time of the last successful Sequentia sync (for the chip)
   bool _syncFailed = false; // the latest refresh errored (chip shows offline + last-sync time)
+  // Whether the collapsed "Hidden assets (N)" section is expanded. Session-only
+  // on purpose: it always starts collapsed (that's the decluttering).
+  bool _hiddenOpen = false;
 
   @override
   void initState() {
@@ -191,6 +196,9 @@ class _BalanceTabState extends State<BalanceTab> {
     try {
       final m = await WalletRepository.instance.readMnemonic();
       if (m == null) return;
+      // The per-wallet hidden set drives the visible/hidden row split below. A local
+      // prefs read, awaited so the first render already partitions correctly.
+      await HiddenAssets.instance.loadFor(m);
       // Scan both chains. Kick off the Bitcoin scan concurrently; a BTC failure
       // must not break the Sequentia balance, so it resolves to null on error.
       final btcF = () async {
@@ -310,7 +318,16 @@ class _BalanceTabState extends State<BalanceTab> {
             ...balances.where((b) => (BigInt.tryParse(b.atoms) ?? BigInt.zero) > BigInt.zero),
             ..._openamp,
           ];
+    // Headline total: computed over EVERY asset, hidden included (see below) — hiding
+    // is visual decluttering, not accounting, so the total never changes on hide.
     final total = balances == null ? null : _totalRef([...balances, ..._openamp]);
+    // Split the rows into the visible main list and the collapsed hidden section
+    // (AFTER the total above). BTC is never partitioned out — its row below carries
+    // no hide control at all. held is positive-balance-only already, so totalOf is
+    // the row's on-chain atoms.
+    final byId = {for (final b in held) b.assetId: b};
+    final part = partitionHidden(byId.keys, HiddenAssets.instance.hidden,
+        totalOf: (h) => BigInt.tryParse(byId[h]!.atoms) ?? BigInt.zero);
     // Bitcoin is first-class: shown when held (a 0 balance is hidden like any
     // asset). Resolve to the last-known balance if a fresh testnet4 scan failed.
     final btcSatsStr = _btc?.balanceSats ?? _btcCachedSats;
@@ -366,7 +383,26 @@ class _BalanceTabState extends State<BalanceTab> {
               padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 16),
               child: Column(children: [
                 if (hasBtc) _BtcRow(sats: btcSatsStr!, stale: _btcStale, channels: _lnChannels, onChanged: _refresh),
-                for (final b in held) _AssetRow(balance: b, channels: _lnChannels, onChanged: _refresh),
+                for (final h in part.visible)
+                  _AssetRow(
+                    balance: byId[h]!,
+                    channels: _lnChannels,
+                    onChanged: _refresh,
+                    onHide: () async {
+                      await HiddenAssets.instance.setHidden(h, true);
+                      if (mounted) setState(() {});
+                    },
+                  ),
+                if (part.hidden.isNotEmpty)
+                  _HiddenAssetsSection(
+                    rows: [for (final h in part.hidden) byId[h]!],
+                    open: _hiddenOpen,
+                    onToggle: () => setState(() => _hiddenOpen = !_hiddenOpen),
+                    onUnhide: (h) async {
+                      await HiddenAssets.instance.setHidden(h, false);
+                      if (mounted) setState(() {});
+                    },
+                  ),
               ]),
             ),
           ],
@@ -377,10 +413,13 @@ class _BalanceTabState extends State<BalanceTab> {
 }
 
 class _AssetRow extends StatelessWidget {
-  const _AssetRow({required this.balance, this.channels = const [], this.onChanged});
+  const _AssetRow({required this.balance, this.channels = const [], this.onChanged, this.onHide});
   final core.AssetBalance balance;
   final List<Map<dynamic, dynamic>> channels;
   final VoidCallback? onChanged;
+  // Per-asset Hide control (quiet trailing icon). null = no control — the BTC row
+  // ([_BtcRow]) has no such parameter at all: the parent-chain asset is never hideable.
+  final VoidCallback? onHide;
   @override
   Widget build(BuildContext context) {
     final label = SeqAssets.labelFor(balance.assetId);
@@ -418,6 +457,21 @@ class _AssetRow extends StatelessWidget {
                       style: AmbraText.sub),
                 ),
             ]),
+            if (onHide != null)
+              Padding(
+                padding: const EdgeInsets.only(left: 6),
+                child: Tooltip(
+                  message: 'Hide this asset. It still counts toward your total and stays findable by search.',
+                  child: InkWell(
+                    onTap: onHide,
+                    borderRadius: BorderRadius.circular(12),
+                    child: const Padding(
+                      padding: EdgeInsets.all(4),
+                      child: Icon(Icons.visibility_off_outlined, size: 16, color: AmbraColors.dim),
+                    ),
+                  ),
+                ),
+              ),
           ]),
         ),
       ),
@@ -435,6 +489,83 @@ class _AssetRow extends StatelessWidget {
           onChanged: onChanged,
         ),
     ]);
+  }
+}
+
+/// The collapsed "Hidden assets (N)" section at the bottom of the balance list —
+/// the only place a hidden balance is listed, and the way back (per-asset Unhide).
+/// These balances were already counted into the headline total: hiding never
+/// changes accounting, only what the main list shows.
+class _HiddenAssetsSection extends StatelessWidget {
+  const _HiddenAssetsSection({required this.rows, required this.open, required this.onToggle, required this.onUnhide});
+  final List<core.AssetBalance> rows;
+  final bool open;
+  final VoidCallback onToggle;
+  final Future<void> Function(String hex) onUnhide;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(children: [
+      InkWell(
+        onTap: onToggle,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          child: Row(children: [
+            Icon(open ? Icons.expand_more : Icons.chevron_right, size: 18, color: AmbraColors.dim),
+            const SizedBox(width: 6),
+            Text('Hidden assets (${rows.length})', style: AmbraText.sub),
+            const Spacer(),
+          ]),
+        ),
+      ),
+      if (open)
+        for (final b in rows) _hiddenRow(b),
+    ]);
+  }
+
+  Widget _hiddenRow(core.AssetBalance b) {
+    final label = SeqAssets.labelFor(b.assetId);
+    final approx = PriceService.instance.approx(label.ticker, b.atoms, label.precision);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Opacity(
+        opacity: 0.75,
+        child: Row(children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(label.ticker,
+                  style: const TextStyle(color: AmbraColors.txt, fontWeight: FontWeight.w600, fontSize: 14)),
+              const SizedBox(height: 2),
+              Text(label.subtitle ?? b.assetId,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: label.subtitle != null ? AmbraText.sub : AmbraText.mono.copyWith(fontSize: 11)),
+            ]),
+          ),
+          const SizedBox(width: 12),
+          Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
+            Text(formatAtoms(b.atoms, label.precision),
+                style: AmbraText.mono.copyWith(color: AmbraColors.txt, fontSize: 14, fontWeight: FontWeight.w700)),
+            if (approx != null)
+              Padding(padding: const EdgeInsets.only(top: 2), child: Text(approx, style: AmbraText.sub)),
+          ]),
+          Padding(
+            padding: const EdgeInsets.only(left: 6),
+            child: Tooltip(
+              message: 'Show this asset in the balance list and the default pickers again.',
+              child: InkWell(
+                onTap: () => onUnhide(b.assetId),
+                borderRadius: BorderRadius.circular(12),
+                child: const Padding(
+                  padding: EdgeInsets.all(4),
+                  child: Icon(Icons.visibility_outlined, size: 16, color: AmbraColors.dim),
+                ),
+              ),
+            ),
+          ),
+        ]),
+      ),
+    );
   }
 }
 
