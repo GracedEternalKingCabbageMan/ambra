@@ -72,6 +72,9 @@ class LspClient {
   /// pure-LN swap, or the user's BTC node for asset↔BTC. [quoteAsset] carries the REAL counter asset for
   /// a same-chain asset↔asset pure-LN swap (priority D). [offerId]/[makerPubkey] PIN the exact resting
   /// offer the user reviewed so the LSP lifts THIS one, not a relay-arbitrary one at a different price.
+  /// [takeAtoms] is the SLICE of the pinned offer to lift, as a wire-integer of base-ASSET ATOMS
+  /// (`take_atoms`); when > 0 the LSP passes it to the settlement driver and the maker re-rests the
+  /// remainder; null / 0 = lift the whole offer (the pre-slice wire shape, untouched).
   static Future<LspSwapResult> swap({
     required String side,
     required String asset,
@@ -81,6 +84,7 @@ class LspClient {
     String? quoteAsset,
     String? offerId,
     String? makerPubkey,
+    BigInt? takeAtoms,
   }) async {
     final body = <String, dynamic>{'side': side, 'asset': asset, 'amount': amount};
     if (quoteAsset != null && quoteAsset.isNotEmpty) body['quote_asset'] = quoteAsset;
@@ -88,6 +92,8 @@ class LspClient {
     if (counterNodeKey != null && counterNodeKey.isNotEmpty) body['counter_node_key'] = counterNodeKey;
     if (offerId != null && offerId.isNotEmpty) body['offer_id'] = offerId;
     if (makerPubkey != null && makerPubkey.isNotEmpty) body['maker_pubkey'] = makerPubkey;
+    // Integer on the wire (atoms are int64-ranged; BigInt only guards the intermediate math).
+    if (takeAtoms != null && takeAtoms > BigInt.zero) body['take_atoms'] = takeAtoms.toInt();
     final r = await client
         .post(Uri.parse('${Backend.lsp}/swap'), headers: _headers(), body: jsonEncode(body))
         .timeout(const Duration(seconds: 90));
@@ -96,8 +102,9 @@ class LspClient {
 
   /// The pure-LN order book for (base [asset], [quoteAsset]) sourced from the LSP's `/lnbook` (the
   /// pure-LN relay), the twin of the web wallet's `L.lnBook`. Distinct from [subassetBook] (the
-  /// sub-asset `/book`): the pure-LN rail lifts THIS book in full, so the composer pre-checks it before
-  /// enabling Review — never enable-then-fail. [quoteAsset] is null for asset↔BTC (BTC implied).
+  /// sub-asset `/book`): the pure-LN rail takes against THIS book (a slice of the best offer; any
+  /// remainder re-rests), so the composer pre-checks it before enabling Review — never
+  /// enable-then-fail. [quoteAsset] is null for asset↔BTC (BTC implied).
   /// TOLERANT: an unreachable / older LSP without `/lnbook` returns an EMPTY book (honest "no pure-LN
   /// liquidity"), never throws — mirroring the web's `.catch`.
   static Future<LnBook> lnBook(String asset, {String? quoteAsset}) async {
@@ -863,9 +870,10 @@ class SubSwapResult {
 }
 
 /// One resting PURE-LN offer from `/lnbook` (the twin of the web wallet's lnBook offers): the offer's
-/// real amounts (`assetAtoms` / `btcAtoms`) — the pure-LN rail lifts the WHOLE offer, so these are the
-/// amounts that actually move — plus its id/maker_pubkey so the composer PINS the exact offer the LSP
-/// then lifts (never a relay-arbitrary one at a different price).
+/// real amounts (`assetAtoms` in asset atoms / `btcAtoms` in BTC SATS — never msat; the one unit
+/// authority the slice math prices from), plus its id/maker_pubkey so the composer PINS the exact
+/// offer the LSP then lifts (never a relay-arbitrary one at a different price). A take lifts
+/// min(typed, offer) of it — `take_atoms` on the POST; the maker re-rests the remainder.
 class LnOffer {
   LnOffer({required this.offerId, required this.makerPubkey, required this.assetAtoms, required this.btcAtoms});
   final String? offerId;

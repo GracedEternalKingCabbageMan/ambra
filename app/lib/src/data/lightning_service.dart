@@ -181,8 +181,9 @@ class LightningService extends ChangeNotifier {
 
   /// Take a pure-LN offer. SELF-CUSTODY (mirror the web reviewLn): [nodeKey]/[counterNodeKey] name the
   /// user's OWN per-asset nodes so the LSP drives the swap on THEM (the device co-signs), [quoteAsset]
-  /// carries the real counter asset for a same-chain asset↔asset swap, and [offerId]/[makerPubkey] PIN
-  /// the exact reviewed offer. All optional, so the plain asset↔BTC call is unchanged.
+  /// carries the real counter asset for a same-chain asset↔asset swap, [offerId]/[makerPubkey] PIN
+  /// the exact reviewed offer, and [takeAtoms] carries the SLICE (integer base-asset atoms; null =
+  /// lift the whole offer). All optional, so the plain asset↔BTC call is unchanged.
   Future<LspSwapResult> swap({
     required String side,
     required String asset,
@@ -192,6 +193,7 @@ class LightningService extends ChangeNotifier {
     String? quoteAsset,
     String? offerId,
     String? makerPubkey,
+    BigInt? takeAtoms,
   }) =>
       LspClient.swap(
         side: side,
@@ -202,6 +204,7 @@ class LightningService extends ChangeNotifier {
         quoteAsset: quoteAsset,
         offerId: offerId,
         makerPubkey: makerPubkey,
+        takeAtoms: takeAtoms,
       );
 
   /// The pure-LN order book for (base [asset], [quoteAsset]) — a best-effort pre-check so the composer

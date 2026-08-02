@@ -5,15 +5,20 @@
 //
 //   • PIN the best resting offer from /lnbook BEFORE review, so the sheet prices the EXACT offer the
 //     LSP then lifts (offer_id + maker_pubkey travel on the POST) — never a relay-arbitrary one.
-//   • WHOLE-FILL truth: the LSP runs xpln, which lifts the pinned offer IN FULL. The review therefore
-//     shows the OFFER's amounts as "You pay / You receive" (never the typed amount), with a loud note
-//     when the executed size differs from the typed size by more than [kLnSizeNoteFractionPct].
+//   • SLICE truth: the take lifts min(typed, offer) of the pinned offer ([priceSlice] is the ONE
+//     authority for the slice math, mirroring the LSP's Go settlement driver exactly: the counter leg
+//     is FLOOR on a buy / CEIL on a sell of offerQuote·take/offerAsset). `take_atoms` carries the
+//     slice on the POST; absent/0 = the whole offer (the maker re-rests the remainder of a slice).
+//     The review shows the SLICE's amounts as "You pay / You receive" (review == execution); only a
+//     typed size AT/ABOVE the offer keeps the whole-offer display, with the loud cap note when it
+//     deviates by more than [kLnSizeNoteFractionPct].
 //   • PERSIST-BEFORE-POST: a single-slot record ('ambra.ln.active') is written BEFORE the irreversible
 //     POST and cleared on success (the receipt is written as before) or marked failed on error. Pure-LN
 //     commits nothing client-side — an unsettled take costs nothing — so a stale record resolves by
 //     re-checking the local receipt trail, never by inventing recovery machinery.
 //
-// Amounts are BigInt atoms of each leg's OWN asset; display formatting stays with the caller.
+// Amounts are BigInt atoms of each leg's OWN asset (BTC leg = sats — [LnOffer] carries sats, never
+// msat, so sats/atoms are the one unit authority end-to-end); display formatting stays with the caller.
 // ---------------------------------------------------------------------------
 
 import 'config.dart';
@@ -31,6 +36,36 @@ const int kLnLspTimeoutMs = 90 * 1000;
 /// (mirror web reviewLn's 0.05 threshold).
 const double kLnSizeNoteFractionPct = 5.0;
 
+/// The priced SLICE of a pinned pure-LN offer — what actually moves on the wire. THE one client-side
+/// authority for the partial-take math, mirroring the LSP's Go settlement driver EXACTLY (both sides
+/// derive the same legs from the signed offer):
+///
+///   take       = min(requestedAtoms, offer.assetAtoms)          (asset atoms; the base leg)
+///   counter    = FLOOR(offer.btcAtoms · take / offer.assetAtoms) when the taker BUYS (gives BTC/quote)
+///              = CEIL (offer.btcAtoms · take / offer.assetAtoms) when the taker SELLS (receives BTC/quote)
+///
+/// Units are exactly what [LnOffer] carries: asset atoms and BTC SATS (or quote-asset atoms for
+/// asset<->asset) — the offer model carries no msat, so no ×1000 shadow-unit ever enters the math.
+/// A [whole] slice reproduces the offer's OWN legs verbatim (no derived rounding): `take_atoms` then
+/// stays OFF the wire and the LSP lifts in full, exactly today's behavior.
+class LnSlice {
+  const LnSlice({required this.assetAtoms, required this.quoteAtoms, required this.whole});
+
+  /// The base leg that moves (asset atoms). Equals the offer's base leg when [whole].
+  final BigInt assetAtoms;
+
+  /// The counter leg that moves (BTC sats, or quote-asset atoms). Equals the offer's counter leg
+  /// verbatim when [whole]; floor/ceil-derived otherwise.
+  final BigInt quoteAtoms;
+
+  /// True = the whole offer lifts (`take_atoms` stays off the POST; today's wire shape).
+  final bool whole;
+
+  /// A partial slice whose counter leg priced to ZERO is dust — nothing can settle a 0-sat leg, so
+  /// the caller must refuse honestly BEFORE anything persists or posts.
+  bool get dust => !whole && quoteAtoms <= BigInt.zero;
+}
+
 /// The single-slot persisted state of one composer-native pure-LN take. Written BEFORE the POST; pure-LN
 /// commits nothing client-side, so the record exists only to make an interrupted take VISIBLE (settled
 /// via the receipt trail, or honestly "did not settle · funds are safe") — it holds no reclaim material.
@@ -45,9 +80,11 @@ class LnTakeRecord {
     this.makerPubkey,
     required this.assetAtoms,
     required this.quoteAtoms,
+    BigInt? takeAtoms,
     required this.startedMs,
     this.detail = '',
-  }) : id = id ?? newTradeId();
+  })  : takeAtoms = takeAtoms ?? BigInt.zero,
+        id = id ?? newTradeId();
 
   /// Stable per-record id (multi-record store).
   final String id;
@@ -57,8 +94,9 @@ class LnTakeRecord {
   final String? quoteAsset; // the counter asset for asset<->asset; null = BTC implied
   final String? offerId; // the pinned resting offer
   final String? makerPubkey;
-  final BigInt assetAtoms; // the pinned offer's base leg (what actually moves — whole-fill)
-  final BigInt quoteAtoms; // the pinned offer's counter leg (BTC sats, or quote-asset atoms)
+  final BigInt assetAtoms; // the base leg that actually moves (the slice's leg; = the offer's when whole)
+  final BigInt quoteAtoms; // the counter leg that actually moves (BTC sats, or quote-asset atoms)
+  final BigInt takeAtoms; // the `take_atoms` sent on the POST (zero = whole-offer lift, today's wire)
   final int startedMs; // wall-clock ms at persist (immediately before the POST)
   String detail;
 
@@ -74,6 +112,7 @@ class LnTakeRecord {
         'maker_pubkey': makerPubkey,
         'asset_atoms': assetAtoms.toString(),
         'quote_atoms': quoteAtoms.toString(),
+        'take_atoms': takeAtoms.toString(),
         'started_ms': startedMs,
         'detail': detail,
       };
@@ -90,6 +129,8 @@ class LnTakeRecord {
         makerPubkey: (j['maker_pubkey'] as String?)?.isEmpty ?? true ? null : j['maker_pubkey'] as String?,
         assetAtoms: BigInt.tryParse('${j['asset_atoms'] ?? 0}') ?? BigInt.zero,
         quoteAtoms: BigInt.tryParse('${j['quote_atoms'] ?? 0}') ?? BigInt.zero,
+        // Absent on legacy records = zero = a whole-offer lift (exactly what those takes were).
+        takeAtoms: BigInt.tryParse('${j['take_atoms'] ?? 0}') ?? BigInt.zero,
         startedMs: (j['started_ms'] as num?)?.toInt() ?? 0,
         detail: '${j['detail'] ?? ''}',
       );
@@ -181,6 +222,35 @@ class LnTakeService {
     return pct != null && pct > kLnSizeNoteFractionPct;
   }
 
+  /// Price the SLICE of [offer] that a request for [requestedAtoms] base-asset atoms lifts — the ONE
+  /// authority both the Review sheet and [take] consume (review == execution), mirroring the LSP's Go
+  /// settlement driver EXACTLY. PURE, BigInt throughout (no double ever touches the legs):
+  ///
+  ///   take = min(requestedAtoms, offer.assetAtoms); null / <= 0 / >= the offer lifts WHOLE — the
+  ///   offer's OWN legs verbatim, no derived rounding (today's behavior, `take_atoms` off the wire).
+  ///   Partial counter leg: [side] 'buy' (taker BUYS the asset, gives BTC/quote) = FLOOR of
+  ///   offer.btcAtoms·take/offer.assetAtoms; 'sell' (taker receives BTC/quote) = CEIL.
+  ///
+  /// Units = what [LnOffer] carries: asset atoms + BTC sats (or quote-asset atoms); never msat.
+  /// A partial whose counter leg prices to zero comes back [LnSlice.dust] — refuse it before anything
+  /// persists or posts.
+  static LnSlice priceSlice({required String side, required LnOffer offer, BigInt? requestedAtoms}) {
+    final offerAsset = offer.assetAtoms, offerQuote = offer.btcAtoms;
+    if (requestedAtoms == null ||
+        requestedAtoms <= BigInt.zero ||
+        offerAsset <= BigInt.zero ||
+        requestedAtoms >= offerAsset) {
+      // WHOLE: the offer's exact legs (the min() cap for an oversized request lands here too).
+      return LnSlice(assetAtoms: offerAsset, quoteAtoms: offerQuote, whole: true);
+    }
+    final take = requestedAtoms; // min(requested, offer) — the >= branch returned above
+    final prod = offerQuote * take;
+    final quote = side == 'buy'
+        ? prod ~/ offerAsset // taker gives BTC/quote: FLOOR
+        : (prod + offerAsset - BigInt.one) ~/ offerAsset; // taker receives BTC/quote: CEIL
+    return LnSlice(assetAtoms: take, quoteAtoms: quote, whole: false);
+  }
+
   /// PIN the best resting offer for (base [asset], [quoteAsset]) on [side] from the LSP's /lnbook —
   /// the pre-Review read whose offer the POST then lifts in full. Never throws (lnBook is tolerant).
   static Future<LnPinVerdict> pinBest({required String side, required String asset, String? quoteAsset}) async {
@@ -190,9 +260,12 @@ class LnTakeService {
 
   /// Execute the reviewed take: PERSIST the single-slot record, resolve the user's OWN node keys
   /// (self-custody — the LSP drives the swap on THEM), then POST /swap pinning [offer]. Clears the
-  /// record + writes the receipt on success; marks it failed on error and rethrows. [typedAmount] is
-  /// the display string the user typed (forwarded to the LSP as before; the lift is whole-offer
-  /// regardless, so the pinned offer's legs are what actually move). [offer] is null ONLY on the
+  /// record + writes the receipt on success; marks it failed on error and rethrows. [requestedAtoms]
+  /// is the typed base-asset size: [priceSlice] turns it into the slice that actually moves —
+  /// `take_atoms` rides the POST for a partial (the LSP passes it to the settlement driver; the maker
+  /// re-rests the remainder) and stays OFF the wire for a whole lift (today's shape). A dust slice
+  /// (counter leg priced to zero) throws BEFORE anything persists or posts. [typedAmount] is the
+  /// display string the user typed (forwarded to the LSP as before). [offer] is null ONLY on the
   /// legacy fall-through where the LSP's /lnbook is unreachable and the LSP does its own matching
   /// ([LightningSwapScreen]'s no-regression path); the composer always pins.
   static Future<LspSwapResult> take({
@@ -200,6 +273,7 @@ class LnTakeService {
     required String asset,
     String? quoteAsset,
     LnOffer? offer,
+    BigInt? requestedAtoms,
     String? typedAmount,
   }) async {
     final ln = LightningService.instance;
@@ -216,7 +290,16 @@ class LnTakeService {
                 ? offer.btcAtoms.toDouble() / _pow10(qprec)
                 : offer.assetAtoms.toDouble() / _pow10(aprec));
 
+    // THE slice (the one authority — the review sheet showed exactly this). Null offer = the legacy
+    // LSP-matches path, which stays whole (no offer to slice against). Dust refuses HERE, before the
+    // record persists and before anything posts — an honest client-side stop, nothing moved.
+    final slice = offer == null ? null : priceSlice(side: side, offer: offer, requestedAtoms: requestedAtoms);
+    if (slice != null && slice.dust) {
+      throw Exception('That amount is too small to price against the resting offer · enter a larger amount.');
+    }
+
     // PERSIST BEFORE THE IRREVERSIBLE POST: the record is what makes an interrupted take visible.
+    // The persisted legs are the SLICE's (what actually moves); take_atoms zero = a whole lift.
     final rec = LnTakeRecord(
       state: 'inflight',
       side: side,
@@ -224,8 +307,9 @@ class LnTakeService {
       quoteAsset: quoteAsset,
       offerId: offer?.offerId,
       makerPubkey: offer?.makerPubkey,
-      assetAtoms: offer?.assetAtoms ?? BigInt.zero,
-      quoteAtoms: offer?.btcAtoms ?? BigInt.zero,
+      assetAtoms: slice?.assetAtoms ?? BigInt.zero,
+      quoteAtoms: slice?.quoteAtoms ?? BigInt.zero,
+      takeAtoms: (slice != null && !slice.whole) ? slice.assetAtoms : BigInt.zero,
       startedMs: DateTime.now().millisecondsSinceEpoch,
     );
     await LnTakeStore.save(rec);
@@ -245,6 +329,8 @@ class LnTakeService {
         quoteAsset: quoteAsset,
         offerId: offer?.offerId,
         makerPubkey: offer?.makerPubkey,
+        // The slice on the wire: integer base-asset atoms; absent (null) = whole (today's behavior).
+        takeAtoms: rec.takeAtoms > BigInt.zero ? rec.takeAtoms : null,
       );
       // Receipt as before (keyed by the settle's preimage so it is recorded exactly once). The quote
       // ticker comes from the wallet's OWN asset metadata, never a server label (an LSP that does not

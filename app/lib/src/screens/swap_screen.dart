@@ -2033,8 +2033,9 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         BottomActionBar(children: [
           PrimaryButton(
             // The CTA label comes from the ROUTE (never a hardcoded rail promise): a pure-LN route in
-            // Limit mode cannot rest an order (a Lightning take fills the best resting offer), so the
-            // label says so instead of promising "Swap over Lightning" — pressing it explains by name.
+            // Limit mode cannot rest an order (a Lightning take fills against the best resting offer;
+            // any remainder stays on the book — it never rests YOUR order), so the label says so
+            // instead of promising "Swap over Lightning" — pressing it explains by name.
             label: !railsChosen
                 ? 'Choose how you pay & receive'
                 : r.kind == SwapRouteKind.ln && _mode == 'post'
@@ -2187,7 +2188,8 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
             const Expanded(
               child: Text(
                 'Pure-Lightning swap: both legs settle over Lightning, bound by one secret, on your own '
-                'nodes (non-custodial). Instant and final, nothing on-chain. Set a leg to On-chain to rest '
+                'nodes (non-custodial). Instant and final, nothing on-chain. Your amount fills against '
+                'the best resting offer · any remainder stays on the book. Set a leg to On-chain to rest '
                 'a durable limit order on the covenant book instead.',
                 style: AmbraText.sub,
               ),
@@ -2931,11 +2933,12 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     final asset = r.seqAsset;
     if (asset == null || !r.isValid) return;
 
-    // LIMIT on a PURE-LN route: refuse BY NAME (never a silent market take). A Lightning take fills the
-    // best resting offer in full; resting at your own price is the on-chain books' job.
+    // LIMIT on a PURE-LN route: refuse BY NAME (never a silent market take). A Lightning take fills
+    // against the best resting offer (any remainder stays on the book); resting at your OWN price is
+    // the on-chain books' job.
     if (r.kind == SwapRouteKind.ln && _mode == 'post') {
-      _snack('A Lightning take fills the best resting offer · switch to Market, or choose on-chain '
-          'rails to rest a limit order.');
+      _snack('A Lightning take fills against the best resting offer (any remainder stays on the book) '
+          '· switch to Market, or choose on-chain rails to rest a limit order.');
       return;
     }
 
@@ -3031,9 +3034,10 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
     }
 
     // PURE-LN (both legs over Lightning): COMPOSER-NATIVE take — pin the best resting /lnbook offer,
-    // review it (the OFFER's amounts; whole-fill on the wire), then POST /swap with the pin. No more
-    // takeover screen that re-asks side/asset/amount ([LightningSwapScreen] remains for other entry
-    // points but the composer no longer pushes it).
+    // review it (the SLICE's amounts — min(typed, offer); take_atoms on the wire, the maker re-rests
+    // the remainder), then POST /swap with the pin. No more takeover screen that re-asks
+    // side/asset/amount ([LightningSwapScreen] remains for other entry points but the composer no
+    // longer pushes it).
     if (r.kind == SwapRouteKind.ln) {
       await _startLnTake(r);
       return;
@@ -3236,21 +3240,24 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
   /// twin of the web wallet's findRoute `ln` + reviewLn. The counter (quote) asset takes BTC's
   /// structural place; the swap runs on the user's OWN per-asset nodes (self-custody), pinning the
   /// reviewed offer. payIsBtc here means "paying the quote" = a BUY of the base. A Limit refuses BY
-  /// NAME (a Lightning take fills the best resting offer) — never a silent market take.
+  /// NAME (a Lightning take fills against the best resting offer; it never rests) — never a silent
+  /// market take.
   Future<void> _dispatchSameChainLn(SwapRoute r) async {
     if (_mode == 'post') {
-      _snack('A Lightning take fills the best resting offer · switch to Market, or choose on-chain '
-          'rails to rest a limit order.');
+      _snack('A Lightning take fills against the best resting offer (any remainder stays on the book) '
+          '· switch to Market, or choose on-chain rails to rest a limit order.');
       return;
     }
     await _startLnTake(r);
   }
 
   /// The COMPOSER-NATIVE pure-LN take (BTC↔asset AND asset↔asset): pin the best resting offer from the
-  /// LSP's /lnbook, show the Review sheet — the OFFER's amounts as "You pay / You receive" (a pure-LN
-  /// take is WHOLE-FILL on the wire: the LSP runs xpln, which lifts the pinned offer in full), with a
-  /// loud note when the executed size differs from the typed size — then POST /swap pinning the offer
-  /// (persist-before-POST via [LnTakeService]). Honest refusals for every no-liquidity state.
+  /// LSP's /lnbook, show the Review sheet — the SLICE's amounts as "You pay / You receive"
+  /// ([LnTakeService.priceSlice] prices min(typed, offer) exactly as the LSP's settlement driver does;
+  /// review == execution; the maker re-rests the remainder), with the whole-offer display + loud cap
+  /// note only when the typed size is at/above the offer — then POST /swap pinning the offer with
+  /// `take_atoms` (persist-before-POST via [LnTakeService]). Honest refusals for every no-liquidity
+  /// state, and for a dust slice (a partial whose counter leg prices to zero) BEFORE anything posts.
   Future<void> _startLnTake(SwapRoute r) async {
     final base = r.seqAsset;
     if (base == null) return;
@@ -3282,6 +3289,15 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
           : 'The Lightning order book is unreachable right now · try again shortly, or choose on-chain rails.');
       return;
     }
+    // The typed BASE-asset size (the slice request). The slice is priced ONCE here (dust gate) and
+    // again identically inside the sheet + the take ([priceSlice] is the one authority).
+    final reqAtoms = _typedAssetAtoms(base, SeqAssets.labelFor(base).precision);
+    final slice = LnTakeService.priceSlice(side: side, offer: pin.offer!, requestedAtoms: reqAtoms);
+    if (slice.dust) {
+      // A partial whose counter leg prices to ZERO cannot settle — refuse honestly before anything posts.
+      _snack('That amount is too small to price against the resting offer · enter a larger amount.');
+      return;
+    }
     if (!mounted) return;
     final res = await showModalBottomSheet<LspSwapResult>(
       context: context,
@@ -3293,6 +3309,7 @@ class _SwapTabState extends State<SwapTab> with WidgetsBindingObserver {
         asset: base,
         quoteAsset: quote,
         offer: pin.offer!,
+        requestedAtoms: reqAtoms,
         payTyped: _payAmount.text,
         recvTyped: _recvAmount.text,
       ),
@@ -5075,18 +5092,20 @@ class _Row extends StatelessWidget {
       );
 }
 
-/// Review + execute a COMPOSER-NATIVE pure-LN take. The sheet states the PINNED OFFER's amounts as
-/// "You pay / You receive" — a pure-LN take is WHOLE-FILL on the wire (the LSP runs xpln, which lifts
-/// the pinned offer in full), so the offer's legs are what actually move, never the typed amount — with
-/// a loud note whenever a typed size differs from the executed leg by more than 5% (mirror web
-/// reviewLn). Confirm runs [LnTakeService.take] (persist-before-POST, self-custody node keys, the
-/// offer pinned on the wire) and pops with the settle.
+/// Review + execute a COMPOSER-NATIVE pure-LN take. The sheet states the SLICE's amounts as
+/// "You pay / You receive" — [LnTakeService.priceSlice] prices min(typed, offer) exactly as the LSP's
+/// settlement driver does (review == execution; `take_atoms` rides the POST and the maker re-rests
+/// the remainder). Only a typed size AT/ABOVE the offer keeps the whole-offer display, with the loud
+/// cap note when it deviates from the executed leg by more than 5% (mirror web reviewLn). Confirm
+/// runs [LnTakeService.take] (persist-before-POST, self-custody node keys, the offer + slice pinned
+/// on the wire) and pops with the settle.
 class _LnTakeReviewSheet extends StatefulWidget {
   const _LnTakeReviewSheet({
     required this.side,
     required this.asset,
     required this.quoteAsset,
     required this.offer,
+    required this.requestedAtoms,
     required this.payTyped,
     required this.recvTyped,
   });
@@ -5094,6 +5113,7 @@ class _LnTakeReviewSheet extends StatefulWidget {
   final String asset; // base asset hex
   final String? quoteAsset; // null = BTC implied
   final LnOffer offer;
+  final BigInt? requestedAtoms; // the typed BASE-asset slice (null = whole offer)
   final String payTyped; // the composer's typed amounts (display strings; may be empty)
   final String recvTyped;
   @override
@@ -5110,18 +5130,25 @@ class _LnTakeReviewSheetState extends State<_LnTakeReviewSheet> {
   String get _qtk => widget.quoteAsset == null ? 'BTC' : SeqAssets.labelFor(widget.quoteAsset!).ticker;
   int get _qprec => widget.quoteAsset == null ? 8 : SeqAssets.labelFor(widget.quoteAsset!).precision;
 
-  String get _assetStr => '${formatAtoms(widget.offer.assetAtoms.toString(), _aprec)} $_btk';
-  String get _quoteStr => '${formatAtoms(widget.offer.btcAtoms.toString(), _qprec)} $_qtk';
+  /// THE slice — the same [LnTakeService.priceSlice] call the take executes (review == execution).
+  LnSlice get _slice =>
+      LnTakeService.priceSlice(side: widget.side, offer: widget.offer, requestedAtoms: widget.requestedAtoms);
 
-  /// The loud offer-vs-typed note, or null when the typed sizes track the executed legs (<= 5% off).
-  /// Each composer field is judged against ITS OWN leg with its own precision.
+  String get _assetStr => '${formatAtoms(_slice.assetAtoms.toString(), _aprec)} $_btk';
+  String get _quoteStr => '${formatAtoms(_slice.quoteAtoms.toString(), _qprec)} $_qtk';
+
+  /// The loud offer-vs-typed cap note, or null. ONLY the whole-offer case carries it (typed at/above
+  /// the offer caps to the offer's size); a partial slice's amounts ARE the typed size, so the review
+  /// already states exactly what moves. Each composer field is judged against ITS OWN leg with its
+  /// own precision.
   String? get _sizeNote {
+    if (!_slice.whole) return null; // a slice executes the typed size — nothing to warn about
     final buy = widget.side == 'buy';
     // pay leg: buy -> quote; sell -> base. recv leg is the inverse.
-    final payExec = buy ? widget.offer.btcAtoms : widget.offer.assetAtoms;
+    final payExec = buy ? _slice.quoteAtoms : _slice.assetAtoms;
     final payPrec = buy ? _qprec : _aprec;
     final payLegStr = buy ? _quoteStr : _assetStr;
-    final recvExec = buy ? widget.offer.assetAtoms : widget.offer.btcAtoms;
+    final recvExec = buy ? _slice.assetAtoms : _slice.quoteAtoms;
     final recvPrec = buy ? _aprec : _qprec;
     final recvLegStr = buy ? _assetStr : _quoteStr;
     if (LnTakeService.needsSizeNote(execAtoms: payExec, precision: payPrec, typed: widget.payTyped)) {
@@ -5146,6 +5173,7 @@ class _LnTakeReviewSheetState extends State<_LnTakeReviewSheet> {
         asset: widget.asset,
         quoteAsset: widget.quoteAsset,
         offer: widget.offer,
+        requestedAtoms: widget.requestedAtoms,
         typedAmount: widget.payTyped,
       );
       if (mounted) Navigator.pop(context, r);
@@ -5163,6 +5191,7 @@ class _LnTakeReviewSheetState extends State<_LnTakeReviewSheet> {
   Widget build(BuildContext context) {
     final buy = widget.side == 'buy';
     final note = _sizeNote;
+    final whole = _slice.whole;
     return SafeArea(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
@@ -5174,10 +5203,15 @@ class _LnTakeReviewSheetState extends State<_LnTakeReviewSheet> {
             child: Column(children: [
               _Row('Route', 'Instant over Lightning · non-custodial, your keys stay on this device'),
               _Row('Direction', buy ? 'Buy $_btk with $_qtk' : 'Sell $_btk for $_qtk'),
-              // WHOLE-FILL truth: the OFFER's amounts, never the typed amount.
+              // SLICE truth: what actually moves (review == execution) — the typed slice of the
+              // pinned offer, or the whole offer when the typed size is at/above it (cap note then).
               _Row('You pay', buy ? _quoteStr : _assetStr),
               _Row('You receive', buy ? _assetStr : _quoteStr),
-              _Row('Pricing', 'Fills the best resting Lightning offer in full · the rate includes the spread (no separate network fee)'),
+              _Row(
+                  'Pricing',
+                  whole
+                      ? 'Fills the best resting Lightning offer in full · the rate includes the spread (no separate network fee)'
+                      : 'Fills against the best resting Lightning offer · the remainder stays on the book · the rate includes the spread (no separate network fee)'),
               _Row('Finality', LightningService.instance.finalityCopy()),
               _Row('If it stalls', 'Nothing moves · an unsettled Lightning take costs nothing.'),
             ]),
