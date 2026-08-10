@@ -1,0 +1,132 @@
+# Ambra
+
+Non-custodial dual-chain mobile wallet for Bitcoin (testnet4) and Sequentia: a Flutter UI
+over a shared Rust core. Android-first; `app/ios/` is a scaffold only.
+
+Everything here is testnet. Node and consensus conventions live in the
+[`Sequentia`](https://github.com/GracedEternalKingCabbageMan/Sequentia) repo, not here.
+
+## Layout
+
+| Path | What it is |
+|---|---|
+| `ambra_core/` | The Rust crate (`ambra_core`), `crate-type = ["cdylib", "staticlib", "lib"]`. FFI surface is `ambra_core/src/api/mod.rs` and `src/api/signer.rs`. |
+| `app/` | The Flutter app. **`pubspec.yaml` lives at `app/pubspec.yaml`, not at the repo root.** |
+| `app/lib/src/rust/` | Generated flutter_rust_bridge bindings. Committed, but never hand-edited. |
+| `docs/SPEC.md` | Product and design spec, including the finality-UX rules. |
+
+## It does not build standalone
+
+`ambra_core/Cargo.toml` takes a `path` dependency on `../../seqln/contrib/seqln-signer` and
+carries a `[patch.crates-io]` block redirecting `lwk_common`, `lwk_signer`, `lwk_wollet` and
+`elements` to `../../SWK/`. **SWK and seqln must be checked out as siblings of `ambra/`**, on
+the branches the README names:
+
+```sh
+git clone https://github.com/GracedEternalKingCabbageMan/ambra.git
+git clone -b sequentia https://github.com/GracedEternalKingCabbageMan/SWK.git
+git clone -b sequentia-stable https://github.com/GracedEternalKingCabbageMan/seqln.git
+```
+
+## Build and test
+
+Toolchain per the README: Linux host, Rust stable, Flutter with Dart SDK >= 3.12, Android SDK
+with NDK `29.0.14206865` (pinned in `app/android/app/build.gradle.kts`), `cargo-ndk`, and
+`flutter_rust_bridge_codegen` 2.12.0.
+
+```sh
+# Rust core (host build; also produces the cdylib the Flutter host tests load)
+cd ambra_core && cargo build
+
+# Cross-compile for Android
+rustup target add aarch64-linux-android
+cargo install cargo-ndk
+cargo ndk -t arm64-v8a -o ../app/android/app/src/main/jniLibs build --release
+
+# App
+cd ../app && flutter pub get
+flutter build apk --release        # or: flutter run
+```
+
+Tests, from `ambra_core/`:
+
+```sh
+cargo test --test smoke --test signer_conformance
+cargo test --test sync -- --nocapture
+```
+
+A bare `cargo test` runs the network tests too, so prefer the explicit forms offline.
+
+From `app/`:
+
+```sh
+flutter test test/lsp_client_test.dart   # pure-Dart, mocked HTTP, runs anywhere
+flutter test                             # host tests load the cdylib
+```
+
+The host tests resolve the core library from `$AMBRA_CORE_LIB`, defaulting to
+`../ambra_core/target/debug/libambra_core.so` (`app/test/widget_test.dart`), so build the host
+crate first or set that variable.
+
+`flutter analyze` is the standing gate; commit bodies record it.
+
+There is no CI in this repository. Nothing checks a build or a test for you.
+
+## Three things that get forgotten
+
+1. **Touching `ambra_core` means rebuilding the Android `.so`.**
+   `app/android/app/src/main/jniLibs/` is gitignored and never committed, so a stale `.so`
+   survives a `git pull` and the app silently runs old Rust. The tree carries three ABIs
+   (`arm64-v8a`, `armeabi-v7a`, `x86_64`); the README documents only the `arm64-v8a` command.
+   History records this going wrong ("x86_64 was stale"), which is why commit bodies state
+   whether Rust was touched.
+2. **Changing `ambra_core::api` means regenerating the bridge.** Run
+   `flutter_rust_bridge_codegen generate` from `app/` (config: `app/flutter_rust_bridge.yaml`).
+   The `flutter_rust_bridge` version is pinned to exactly 2.12.0 on both sides and the codegen
+   binary must match.
+3. **Never claim a change works until it has been exercised on-device.** Analyzer-clean plus
+   green Dart tests does not cover the FFI boundary or the native libs. Several commits exist
+   solely to fix things that passed everything except a real device.
+
+## Version
+
+`app/pubspec.yaml` carries the version (`0.x` = pre-mainnet, minor tracks the milestone, bump
+the build number every release, `1.0.0` at mainnet). Release commits are titled
+`ambra 0.X.Y: <summary>` and touch `app/pubspec.yaml` alone.
+
+`kAppVersion` in `app/lib/src/data/config.dart` is a *separate* constant, and it is what the UI
+footer renders (`app/lib/src/screens/shell.dart`). Bump both. It has drifted before, was fixed
+in `1e839c9`, and has drifted again.
+
+## Release signing
+
+`app/android/app/build.gradle.kts` loads `key.properties` from the Android root project and
+uses it for the `release` signing config. If that file is absent it falls back to the **debug**
+signing config without failing the build, so an unsigned-for-distribution APK looks like a
+successful release build. Release APKs signed with a machine-local debug key install as
+"package appears to be invalid" (fixed in `a85a9e9`); switching an already-installed app from
+debug to release signing requires one uninstall, after which updates apply cleanly.
+
+`key.properties`, `**/*.keystore` and `**/*.jks` are gitignored. Keep it that way.
+
+## Working in this repo
+
+- **Repository is public.** Never commit seeds, private keys, keystores, credentials, RPC
+  auth, `.env` files or tokens. Test fixtures use only the well-known all-zero BIP39 vector.
+- **Commit author:**
+  `GracedEternalKingCabbageMan <151803062+GracedEternalKingCabbageMan@users.noreply.github.com>`
+- **Always open a pull request, then merge it yourself immediately.** The PR exists so the
+  change and its reasoning are recorded, not because anyone is waiting to review it. There is
+  no review process. If you are ever told to leave one specific PR open, that applies to that
+  PR only and never becomes the default.
+- The remote default branch is `main`, but development has been happening on `terminal-rebuild`
+  (24 commits ahead of `main`, which still sits at 0.13.7). Check `git log` on both before
+  choosing a base; the README's "development happens on `main`" is out of date.
+
+## README drift
+
+The top-level `README.md` is useful but has known-stale claims: it says release builds are
+signed with the debug key (false since `a85a9e9`), names an old APK as the current release,
+says a LICENSE file has not been added (it exists), says the host tests use a hardcoded
+absolute path (they use `$AMBRA_CORE_LIB`), and documents only one Android ABI. Verify against
+the code before repeating anything from it.
