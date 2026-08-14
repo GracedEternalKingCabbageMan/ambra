@@ -37,6 +37,42 @@ the affected transaction un-settles. The two places anchoring surfaces explicitl
 
 Staked tSEQ is shown LOCKED and excluded from spendable.
 
+### Rail-crossing sell abandon (fund-safety, clock-free)
+
+A rail-crossing SELL that signalled its broadcast intent but never landed the
+asset-HTLC funding tx (a hard-kill in the millisecond gap before broadcast, or a
+definitive broadcast rejection) cannot be auto-cleared, so the swap rail can wedge
+on "swap in progress" with no funds actually at stake. The manual Abandon escape
+frees it, but only behind layered fund-safety gates so it can never clear over a
+funded HTLC. The whole decision is now FULLY CLOCK-FREE — no DateTime.now() anywhere
+on the fund-safety path. The gates are: not-driving, a fresh on-disk reload of the
+same swap, swap identity, the seqFundTxid guard (a recorded fund txid is never
+abandonable), an explicit human warning, and — carrying the entire staleness AND
+anchor-reorg margin — a CLOCK-FREE height proof. The height proof trusts an empty
+on-chain HTLC scan only when the backend's current tip HEIGHT has advanced at least
+~240 Sequentia blocks (≈2h at 30s slots) past the height recorded at broadcast.
+That single depth is deliberately deep because it is the SOLE margin: it is well
+past any funding-confirmation depth AND past any realistic Bitcoin-anchored reorg
+depth (Sequentia reorgs whenever Bitcoin reorgs, so heights are monotonic only
+modulo anchor reorgs; and a reorg deep enough to revert past the broadcast height
+would also unconfirm the funding tx, so an empty scan then is correct). Heights are
+monotonic and independent of any wall clock, so a slow or fast device clock —
+including a forward jump — cannot make a stale backend read as fresh (the flaw the
+earlier wall-clock age gate and block-time check both had, now removed).
+
+Honest residual (the ONLY one, now that the decision is clock-free): the "nothing
+was funded" authority rests on ONE esplora oracle. There is no independent second
+Sequentia-UTXO source in the client, so a single backend behind a load balancer
+could in principle route the utxo read to a lagging replica while the tip-height
+read hits a fresh one — a single-oracle replica split that false-empties a funded
+HTLC. This irreducible trust root is mitigated by reading the tip height first (a
+same/catching-up replica that passes the height gate has already indexed the funding
+block) plus the seqFundTxid guard, a fresh reload, the not-driving guard, swap
+identity, and the explicit human warning, and is strictly safer than the web
+wallet's auto-clear (which has no gates and no confirmation). It is a bounded
+best-effort escape, not an unconditional guarantee; a truly independent second UTXO
+oracle would be the only full fix (out of scope, shared with the web).
+
 ## Balance model (no privileged asset)
 
 The Balance headline is the total portfolio value across every held asset, valued

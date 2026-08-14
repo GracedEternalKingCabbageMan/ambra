@@ -85,6 +85,9 @@ class CrossOffer {
     required this.btcSats,
     required this.makerPubkey,
     this.verified = false,
+    this.interactive = false,
+    this.btcLn = false,
+    this.assetOnchain = true,
   });
   final String offerId;
   final String seqAsset;
@@ -93,6 +96,18 @@ class CrossOffer {
   final BigInt btcSats;
   final String makerPubkey;
   final bool verified; // maker signature checked in Rust; crossBook only returns verified offers
+
+  /// The maker's SIGNED settlement capabilities (unified-book meta.caps), read by [chooseSettlementPath]
+  /// to route a rail crossing: [interactive] = the maker is online + speaks the courier — this defaults
+  /// FALSE when the signed caps OMIT it, so a P2P submarine is routed ONLY when interactive is EXPLICITLY
+  /// signed true (mirror the web, where caps.interactive undefined routes to the honest-disabled LSP
+  /// leg-bridge, NEVER to a P2P submarine); [btcLn] = the maker can itself accept BTC over Lightning (the
+  /// signal that promotes a submarine crossing to a DIRECT peer-to-peer path instead of the LSP leg-bridge
+  /// fallback); [assetOnchain] = the asset leg is a single on-chain HTLC (false when the maker rests the
+  /// asset over Lightning, which makes a submarine crossing unsupported).
+  final bool interactive;
+  final bool btcLn;
+  final bool assetOnchain;
 
   /// BTC sats per 1 asset atom (the price). Lower = cheaper asset.
   double get btcPerAssetAtom => assetAtoms > BigInt.zero ? btcSats.toDouble() / assetAtoms.toDouble() : 0;
@@ -262,6 +277,18 @@ class SeqObClient {
             verified = false;
           }
           if (!verified) continue;
+          // The maker's SIGNED settlement caps (unified-book meta.caps), read by chooseSettlementPath to
+          // route a rail crossing. CONSERVATIVE defaults when a cap is ABSENT: interactive=FALSE and
+          // btc_ln=FALSE, so a P2P submarine is routed ONLY when BOTH are EXPLICITLY signed true — an offer
+          // with {btc_ln:true} but no interactive (or vice-versa) honest-disables to the LSP leg-bridge
+          // instead of navigating to a P2P submarine (mirror the web's caps.interactive-undefined -> lsp-
+          // bridge). asset_onchain defaults TRUE (a plain HTLC cross leg is on-chain unless signed otherwise).
+          final caps = (o['caps'] ?? (o['meta'] is Map ? (o['meta'] as Map)['caps'] : null)) as Map?;
+          bool capBool(String snake, String camel, bool dflt) {
+            if (caps == null) return dflt;
+            final v = caps[snake] ?? caps[camel];
+            return v == null ? dflt : v == true;
+          }
           out.add(CrossOffer(
             offerId: '${pick(o, ['offer_id', 'offerId']) ?? ''}',
             seqAsset: seqAsset,
@@ -270,11 +297,59 @@ class SeqObClient {
             btcSats: btcSats,
             makerPubkey: '${pick(o, ['maker_pubkey', 'makerPubkey']) ?? ''}',
             verified: true,
+            interactive: capBool('interactive', 'interactive', false),
+            btcLn: capBool('btc_ln', 'btcLn', false),
+            assetOnchain: capBool('asset_onchain', 'assetOnchain', true),
           ));
         }
       } catch (_) {/* best-effort per orientation */}
     }
     out.sort((a, b) => a.btcPerAssetAtom.compareTo(b.btcPerAssetAtom));
+    return out;
+  }
+
+  /// The resting SBTC silent-peg covenants for [seqAsset] — funded, fillable covenants that LOCK SBTC
+  /// but ADVERTISE as a BTC offer (base_asset = BTC) so they rest in the asset/BTC market. A taker
+  /// SELLING the asset for BTC lifts one with the covenant FILL primitive (paying the asset, receiving
+  /// SBTC), then pegs the SBTC OUT to real BTC.
+  ///
+  /// Distinct from [crossBook], which returns interactive HTLC cross offers (they carry a `cross_chain`
+  /// field) and DROPS covenants: this returns ONLY fillable covenants on the `BTC/<asset>` shelf. Every
+  /// offer's maker signature is checked locally (the relay is untrusted) and the FILL re-derives + checks
+  /// the covenant against its on-chain scriptPubKey, so a lying relay cannot forge one. Cheapest
+  /// asset-per-BTC first (best for the seller). Never throws (returns []).
+  ///
+  /// FUND-SAFETY (spec §5, web P1-W5): a covenant advertised as BTC is treated as PEGGED BTC only when
+  /// it genuinely LOCKS the known SBTC asset ([sbtcAssetId], `covenant.asset_a`). A BTC-advertised
+  /// covenant that locks any OTHER asset would let a lying/hostile maker collect the taker's asset while
+  /// the taker is promised real BTC on redeem but receives something else — a mis-sell. Such offers are
+  /// REFUSED here (dropped), so the pegged-covenant shelf can never carry a non-SBTC lock. When SBTC is
+  /// not registered on this network ([sbtcAssetId] == null) there is nothing to trust, so this returns [].
+  static Future<List<SeqObOffer>> peggedBtcCovenants(String seqAsset, {required String? sbtcAssetId}) async {
+    final sbtc = (sbtcAssetId ?? '').toLowerCase();
+    if (sbtc.isEmpty) return const []; // SBTC unavailable on this network -> no pegged covenants to trust
+    final out = <SeqObOffer>[];
+    final nowUnix = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    try {
+      final j = await _get('/v1/market/BTC/$seqAsset/orderbook');
+      final list = (j['offers'] as List?) ?? (j['Offers'] as List?) ?? const [];
+      for (final e in list) {
+        if (e is! Map) continue;
+        final o = Map<String, dynamic>.from(e);
+        final exp = _big(pick(o, ['expires_at_unix', 'expiresAtUnix'])).toInt();
+        if (exp > 0 && exp <= nowUnix) continue; // drop expired
+        final offer = await _parseOffer(o);
+        if (offer == null || !offer.verified) continue; // the relay is untrusted
+        if (!offer.isFillableCovenant) continue; // covenants only (advertised BTC, locks SBTC)
+        if (offer.baseAtoms <= BigInt.zero) continue;
+        // MIS-SELL BINDING: require the covenant to actually lock SBTC (asset_a == the known SBTC id).
+        // Refuse a BTC-advertised covenant that locks anything else — we must never fill it as "pegged BTC".
+        final lockedAsset = (pick(offer.covenant ?? const {}, ['asset_a', 'assetA'])?.toString() ?? '').toLowerCase();
+        if (lockedAsset != sbtc) continue;
+        out.add(offer);
+      }
+    } catch (_) {/* best-effort */}
+    out.sort((a, b) => a.priceAtomsPerBase.compareTo(b.priceAtomsPerBase));
     return out;
   }
 

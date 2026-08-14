@@ -11,8 +11,12 @@ import 'config.dart';
 /// moves sealed bytes.
 class XcType {
   static const termsRequest = 'terms_request';
-  static const terms = 'terms';
-  static const btcLegFunded = 'btc_leg_funded';
+  static const terms = 'terms'; // forward: maker's per-lift terms
+  static const btcLegFunded = 'btc_leg_funded'; // forward: taker funded the BTC leg
+  static const seqLegLocked = 'seq_leg_locked'; // forward: maker locked the SEQ leg
+  static const btcLegLocked = 'btc_leg_locked'; // reverse: maker locked the BTC leg
+  static const seqLegFunded = 'seq_leg_funded'; // reverse: taker funded the SEQ leg
+  static const secretRevealed = 'secret_revealed'; // reverse: maker reveals s after claiming SEQ
   static const fail = 'fail';
 }
 

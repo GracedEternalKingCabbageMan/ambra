@@ -4,6 +4,7 @@
 //   cd app && flutter test test/swap_route_test.dart
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:ambra/src/data/seqob_client.dart';
 import 'package:ambra/src/data/swap_route.dart';
 
 const seqA = '3a0f9192219db59f8d7f87d93ac6311095dfe1255d149727b87baaa7d2cc71a1'; // e.g. GOLD
@@ -54,16 +55,74 @@ void main() {
     expect(sell.recvRail, 'chain'); // BTC leg on-chain
   });
 
-  test('BTC leg on Lightning + asset on-chain (submarine) is unbuilt -> degrades to cross', () {
-    // Submarine BUY: pay BTC over Lightning, receive the asset on-chain. Not yet built on mobile, so
-    // it must fall back to the proven on-chain cross rail — NEVER misroute to a sub-asset screen.
+  test('BTC leg on Lightning + asset on-chain -> mixed (submarine), NO silent degrade to cross', () {
+    // Submarine BUY: pay BTC over Lightning, receive the asset on-chain. The route now returns the REAL
+    // shape (mixed/submarine) for BOTH directions — no silent degrade to cross (which used to misroute a
+    // submarine onto the on-chain cross rail). [isSubmarine] distinguishes it from the sub-asset shape.
     final buy = route(btc, seqA, payRailLn: true, recvRailLn: false, lnAvailable: true);
-    expect(buy.kind, SwapRouteKind.cross);
-    expect(buy.payRail, 'chain');
-    expect(buy.recvRail, 'chain');
-    // Submarine SELL: pay the asset on-chain, receive BTC over Lightning. Same degradation.
+    expect(buy.kind, SwapRouteKind.mixed);
+    expect(buy.isSubmarine, isTrue);
+    expect(buy.isSubAsset, isFalse);
+    expect(buy.payRail, 'ln'); // BTC leg over Lightning
+    expect(buy.recvRail, 'chain'); // asset leg on-chain
+    // Submarine SELL: pay the asset on-chain, receive BTC over Lightning.
     final sell = route(seqA, btc, payRailLn: false, recvRailLn: true, lnAvailable: true);
-    expect(sell.kind, SwapRouteKind.cross);
+    expect(sell.kind, SwapRouteKind.mixed);
+    expect(sell.isSubmarine, isTrue);
+    expect(sell.payRail, 'chain'); // asset leg on-chain
+    expect(sell.recvRail, 'ln'); // BTC leg over Lightning
+  });
+
+  test('chooseSettlementPath routes a submarine by the maker caps', () {
+    final buy = route(btc, seqA, payRailLn: true, recvRailLn: false, lnAvailable: true); // submarine BUY
+    // Interactive + accepts BTC-LN -> a DIRECT peer-to-peer submarine (ln_direction 1 = buy).
+    final p2p = chooseSettlementPath(buy, makerInteractive: true, makerBtcLn: true);
+    expect(p2p.path, SettlementPath.p2pSubmarine);
+    expect(p2p.lnDirection, 1);
+    expect(p2p.lnSide, 'payer');
+    // Not BTC-LN-capable -> the LSP leg-bridge fallback (honest-disabled at dispatch).
+    expect(chooseSettlementPath(buy, makerInteractive: true, makerBtcLn: false).path, SettlementPath.lspBridge);
+    // The maker rests the asset over Lightning too -> the crossing has no on-chain asset leg -> unsupported.
+    expect(
+        chooseSettlementPath(buy, makerInteractive: true, makerBtcLn: true, makerAssetOnchain: false).path,
+        SettlementPath.unsupported);
+    // A SELL submarine -> ln_direction 0, receiver side.
+    final sell = route(seqA, btc, payRailLn: false, recvRailLn: true, lnAvailable: true);
+    final sp = chooseSettlementPath(sell, makerInteractive: true, makerBtcLn: true);
+    expect(sp.path, SettlementPath.p2pSubmarine);
+    expect(sp.lnDirection, 0);
+    expect(sp.lnSide, 'receiver');
+    // A non-submarine shape is native to the composer's proven paths.
+    final subAsset = route(btc, seqA, payRailLn: false, recvRailLn: true, lnAvailable: true);
+    expect(chooseSettlementPath(subAsset, makerInteractive: true, makerBtcLn: true).path, SettlementPath.native);
+  });
+
+  test('CrossOffer caps default conservative: btc_ln without interactive does NOT route P2P (Task 3)', () {
+    final buy = route(btc, seqA, payRailLn: true, recvRailLn: false, lnAvailable: true); // submarine BUY
+    // A cross offer whose SIGNED caps OMIT `interactive` must default it FALSE, so even WITH btc_ln the
+    // route is the honest-disabled LSP leg-bridge, never a P2P submarine (mirror the web, where
+    // caps.interactive undefined routes to the lsp-bridge).
+    final noInteractive = CrossOffer(
+      offerId: 'x', seqAsset: seqA, makerSellsAsset: true,
+      assetAtoms: BigInt.from(100), btcSats: BigInt.from(1000), makerPubkey: '03aa',
+      btcLn: true, // interactive OMITTED -> defaults false
+    );
+    expect(noInteractive.interactive, isFalse, reason: 'interactive defaults FALSE when the caps omit it');
+    expect(
+      chooseSettlementPath(buy, makerInteractive: noInteractive.interactive, makerBtcLn: noInteractive.btcLn).path,
+      SettlementPath.lspBridge,
+      reason: '{btc_ln:true} with no interactive must NOT navigate to a P2P submarine',
+    );
+    // EXPLICIT interactive:true + btc_ln:true -> the DIRECT P2P submarine.
+    final both = CrossOffer(
+      offerId: 'x', seqAsset: seqA, makerSellsAsset: true,
+      assetAtoms: BigInt.from(100), btcSats: BigInt.from(1000), makerPubkey: '03aa',
+      interactive: true, btcLn: true,
+    );
+    expect(
+      chooseSettlementPath(buy, makerInteractive: both.interactive, makerBtcLn: both.btcLn).path,
+      SettlementPath.p2pSubmarine,
+    );
   });
 
   test('pure-LN route carries ln on both legs', () {
@@ -83,5 +142,95 @@ void main() {
   test('LN rails are ignored when Lightning is unavailable -> proven cross route', () {
     final r = route(btc, seqA, payRailLn: true, recvRailLn: true, lnAvailable: false);
     expect(r.kind, SwapRouteKind.cross, reason: 'no Lightning -> both legs on-chain regardless of stale rail state');
+  });
+
+  group('same-chain asset<->asset pure-LN (priority D)', () {
+    test('both legs Lightning + a known quote -> pure-LN asset<->asset route (not the covenant book)', () {
+      // seqB is the canonical quote; seqA the base. Paying the base, both rails LN.
+      final r = route(seqA, seqB, payRailLn: true, recvRailLn: true, lnAvailable: true, sameChainQuote: seqB);
+      expect(r.kind, SwapRouteKind.ln);
+      expect(r.assetAsset, isTrue);
+      expect(r.seqAsset, seqA, reason: 'the base leg');
+      expect(r.quoteAsset, seqB, reason: 'the counter asset takes BTC\'s structural place');
+      expect(r.payIsBtc, isFalse, reason: 'paying the base = a SELL of the base for the quote');
+      expect(r.payRail, 'ln');
+      expect(r.recvRail, 'ln');
+    });
+
+    test('paying the QUOTE asset over LN -> payIsBtc true (structural BUY of the base)', () {
+      final r = route(seqB, seqA, payRailLn: true, recvRailLn: true, lnAvailable: true, sameChainQuote: seqB);
+      expect(r.kind, SwapRouteKind.ln);
+      expect(r.payIsBtc, isTrue);
+      expect(r.seqAsset, seqA);
+      expect(r.quoteAsset, seqB);
+    });
+
+    test('both legs LN but no known quote -> stays same-chain covenant (never guesses the frame)', () {
+      expect(route(seqA, seqB, payRailLn: true, recvRailLn: true, lnAvailable: true).kind, SwapRouteKind.same);
+    });
+
+    test('both legs LN but Lightning unavailable -> same-chain covenant', () {
+      expect(route(seqA, seqB, payRailLn: true, recvRailLn: true, lnAvailable: false, sameChainQuote: seqB).kind,
+          SwapRouteKind.same);
+    });
+  });
+
+  group('MIXED same-chain (one leg Lightning + one on-chain; the sub-asset construction with the quote '
+      'asset in BTC\'s structural place)', () {
+    test('BUY orientation: pay the QUOTE on-chain, receive the base over Lightning', () {
+      // seqB is the canonical quote. Paying it on-chain + receiving seqA over LN = a BUY of seqA.
+      final r = route(seqB, seqA, payRailLn: false, recvRailLn: true, lnAvailable: true, sameChainQuote: seqB);
+      expect(r.kind, SwapRouteKind.mixed);
+      expect(r.assetAsset, isTrue);
+      expect(r.seqAsset, seqA, reason: 'the base leg');
+      expect(r.quoteAsset, seqB, reason: 'the on-chain leg\'s REAL asset');
+      expect(r.payIsBtc, isTrue, reason: 'paying the quote = the structural analog of paying BTC');
+      expect(r.payRail, 'chain');
+      expect(r.recvRail, 'ln');
+      expect(r.isSubAsset, isTrue, reason: 'the base (asset) leg is on Lightning -> the wired shape');
+      expect(r.isSubmarine, isFalse);
+    });
+
+    test('SELL orientation: pay the base over Lightning, receive the QUOTE on-chain', () {
+      final r = route(seqA, seqB, payRailLn: true, recvRailLn: false, lnAvailable: true, sameChainQuote: seqB);
+      expect(r.kind, SwapRouteKind.mixed);
+      expect(r.assetAsset, isTrue);
+      expect(r.seqAsset, seqA);
+      expect(r.quoteAsset, seqB);
+      expect(r.payIsBtc, isFalse, reason: 'paying the base = a SELL of the base');
+      expect(r.payRail, 'ln');
+      expect(r.recvRail, 'chain');
+      expect(r.isSubAsset, isTrue);
+    });
+
+    test('the mirror orientations (QUOTE leg on Lightning) classify mixed too — refused at dispatch, '
+        'never a silent covenant fall-through', () {
+      // BUY paying the quote over LN, base on-chain.
+      final buy = route(seqB, seqA, payRailLn: true, recvRailLn: false, lnAvailable: true, sameChainQuote: seqB);
+      expect(buy.kind, SwapRouteKind.mixed);
+      expect(buy.assetAsset, isTrue);
+      expect(buy.isSubmarine, isTrue, reason: 'the quote (structural-BTC) leg is the Lightning one');
+      expect(buy.isSubAsset, isFalse);
+      // SELL paying the base on-chain, quote over LN.
+      final sell = route(seqA, seqB, payRailLn: false, recvRailLn: true, lnAvailable: true, sameChainQuote: seqB);
+      expect(sell.kind, SwapRouteKind.mixed);
+      expect(sell.isSubmarine, isTrue);
+    });
+
+    test('an unselected rail -> same-chain covenant (no default; spec §6.5)', () {
+      expect(route(seqA, seqB, payRailLn: true, recvRailLn: null, lnAvailable: true, sameChainQuote: seqB).kind,
+          SwapRouteKind.same);
+      expect(route(seqA, seqB, payRailLn: null, recvRailLn: false, lnAvailable: true, sameChainQuote: seqB).kind,
+          SwapRouteKind.same);
+    });
+
+    test('an unknown quote -> same-chain covenant (never guesses the frame)', () {
+      expect(route(seqA, seqB, payRailLn: true, recvRailLn: false, lnAvailable: true).kind, SwapRouteKind.same);
+    });
+
+    test('Lightning unavailable -> the LN preference degrades and the pair stays covenant', () {
+      expect(route(seqA, seqB, payRailLn: true, recvRailLn: false, lnAvailable: false, sameChainQuote: seqB).kind,
+          SwapRouteKind.same);
+    });
   });
 }

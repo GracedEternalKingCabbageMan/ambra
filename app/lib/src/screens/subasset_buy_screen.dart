@@ -25,17 +25,25 @@ final BigInt _kBtcMinerHeadroomSats = BigInt.from(1000);
 /// preimage (asset in + preimage revealed for the maker to claim the BTC); if the maker never pays,
 /// the BTC is refunded via its CLTV timeout. The preimage reveal happens ONLY after `held`.
 class SubassetBuyScreen extends StatefulWidget {
-  const SubassetBuyScreen({super.key, required this.asset});
+  const SubassetBuyScreen({super.key, required this.asset, this.quoteAsset, this.recordId});
 
   /// The Sequentia asset to buy (received over Lightning).
   final String asset;
+
+  /// MIXED same-chain: the pair's QUOTE asset — the on-chain leg is a Sequentia HTLC on it, standing in
+  /// BTC's structural place, and every "BTC" position carries quote atoms. Null = the BTC shape.
+  final String? quoteAsset;
+
+  /// A specific persisted record to open (the composer's in-flight card taps pass it). Null = the
+  /// first in-flight buy of this asset, if any (multi-record store).
+  final String? recordId;
 
   @override
   State<SubassetBuyScreen> createState() => _SubassetBuyScreenState();
 }
 
 class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
-  final _amount = TextEditingController(); // BTC to spend (blank => take the whole offer)
+  final _amount = TextEditingController(); // quote amount to spend (blank => take the whole offer)
   SubBuyRecord? _rec;
   SubOffer? _offer;
   bool _refundReady = false;
@@ -46,6 +54,10 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
   Timer? _poll;
 
   String get _ticker => SeqAssets.labelFor(widget.asset).ticker;
+
+  // The quote leg's own ticker + precision: never "BTC"/"sats" on the mixed same-chain rails.
+  String get _qtk => widget.quoteAsset != null ? SeqAssets.labelFor(widget.quoteAsset!).ticker : 'BTC';
+  int get _qprec => widget.quoteAsset != null ? SeqAssets.labelFor(widget.quoteAsset!).precision : 8;
 
   @override
   void initState() {
@@ -62,10 +74,24 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
 
   Future<void> _load() async {
     try {
-      final rec = await SubBuyStore.load();
+      // A tapped in-flight card opens ITS record; otherwise adopt the first in-flight buy of THIS
+      // asset (multi-record store: other assets' buys are their own cards, not this screen's).
+      SubBuyRecord? rec;
+      if (widget.recordId != null && widget.recordId!.isNotEmpty) {
+        rec = await SubBuyStore.load(id: widget.recordId);
+      } else {
+        final all = await SubBuyStore.activeAll();
+        for (final r in all) {
+          if (r.asset == widget.asset) {
+            rec = r;
+            break;
+          }
+        }
+      }
       SubOffer? offer;
       try {
-        final book = await LightningService.instance.subassetBook(widget.asset);
+        // The book is keyed per (base, quote) pair: mixed same-chain reads pass the REAL quote.
+        final book = await LightningService.instance.subassetBook(widget.asset, quote: widget.quoteAsset);
         if (book.buyOffers.isNotEmpty) offer = book.buyOffers.first;
       } catch (_) {/* the offer may have rested away; begin() re-checks */}
       if (!mounted) return;
@@ -103,7 +129,8 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
     return '${formatAtoms(atoms.toString(), l.precision)} ${l.ticker}';
   }
 
-  String _btc(BigInt sats) => '${formatAtoms(sats.toString(), 8)} BTC';
+  /// A quote-leg amount in the quote asset's OWN units + ticker (BTC only on the BTC shape).
+  String _btc(BigInt sats) => '${formatAtoms(sats.toString(), _qprec)} $_qtk';
 
   void _snack(String m) => ScaffoldMessenger.of(context).showSnackBar(ambraSnack(m));
 
@@ -131,24 +158,29 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
   Future<void> _begin() async {
     final offer = _offer;
     if (offer == null) return _snack('No resting $_ticker buy offer right now; try again shortly.');
-    final reqBtcSats = parseAtoms(_amount.text, 8); // blank / invalid => whole offer
+    final reqBtcSats = parseAtoms(_amount.text, _qprec); // quote atoms; blank / invalid => whole offer
     await _run('Preparing your buy…', () async {
-      final rec = await SubassetBuyService.begin(asset: widget.asset, offer: offer, reqBtcSats: reqBtcSats);
-      // Affordability pre-check: funding the BTC HTLC needs the locked amount PLUS an on-chain miner
-      // fee, so require a little headroom. Block here (nothing has moved yet) instead of failing later
-      // at fund/btcPrepare. Best-effort: skip when the BTC balance isn't known yet. No money moved, so
-      // discard the secretReady stub before bailing.
-      final bal = BigInt.tryParse(BtcState.instance.last?.balanceSats ?? '');
-      if (bal != null && rec.btcSats + _kBtcMinerHeadroomSats > bal) {
-        await SubBuyStore.clear();
-        throw Exception(
-            'You only hold ${_btc(bal)}. Locking ${_btc(rec.btcSats)} plus an on-chain fee needs more; reduce the amount.');
+      final rec = await SubassetBuyService.begin(
+          asset: widget.asset, offer: offer, reqBtcSats: reqBtcSats, quoteAsset: widget.quoteAsset);
+      // Affordability pre-check (BTC shape only): funding the BTC HTLC needs the locked amount PLUS an
+      // on-chain miner fee, so require a little headroom. Block here (nothing has moved yet) instead of
+      // failing later at fund/btcPrepare. Best-effort: skip when the BTC balance isn't known yet. The
+      // quote shape has no cached quote-asset balance here; its buildSendTx fails closed BEFORE any
+      // broadcast on insufficient funds. No money moved, so discard the secretReady stub before bailing.
+      if (widget.quoteAsset == null) {
+        final bal = BigInt.tryParse(BtcState.instance.last?.balanceSats ?? '');
+        if (bal != null && rec.btcSats + _kBtcMinerHeadroomSats > bal) {
+          // discard only THIS never-funded stub
+          await SubBuyStore.remove(rec.id, reason: 'affordability pre-check failed before funding (never-funded stub)');
+          throw Exception(
+              'You only hold ${_btc(bal)}. Locking ${_btc(rec.btcSats)} plus an on-chain fee needs more; reduce the amount.');
+        }
       }
       if (mounted) setState(() => _rec = rec);
     });
   }
 
-  Future<void> _fundBtc() => _run('Locking BTC…', () async {
+  Future<void> _fundBtc() => _run('Locking $_qtk…', () async {
         try {
           final rec = await SubassetBuyService.fund(_rec!);
           if (mounted) setState(() => _rec = rec);
@@ -159,7 +191,7 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
           // re-shows "Lock BTC", and a re-tap would re-fund (different UTXOs) and DOUBLE-LOCK the BTC.
           // On a pre-save throw (auth / invoice / prepare) the persisted step is unchanged, so the Lock
           // button correctly remains. Rethrow so _run surfaces the error; recovery is the poll/refund.
-          final saved = await SubBuyStore.load();
+          final saved = await SubBuyStore.load(id: _rec!.id);
           if (saved != null && mounted) setState(() => _rec = saved);
           rethrow;
         }
@@ -200,7 +232,9 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
       });
 
   Future<void> _reset() async {
-    await SubBuyStore.clear();
+    final r = _rec;
+    // drop only THIS record; others keep their handles
+    if (r != null) await SubBuyStore.remove(r.id, reason: 'user cleared the finished/abandoned buy card');
     _poll?.cancel();
     if (mounted) {
       setState(() {
@@ -231,7 +265,10 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
   List<Widget> _body() {
     final r = _rec;
     final children = <Widget>[
-      Text('Lock Bitcoin (testnet4) in an on-chain HTLC, receive $_ticker over Lightning, bound by one secret.',
+      Text(
+          widget.quoteAsset == null
+              ? 'Lock Bitcoin (testnet4) in an on-chain HTLC, receive $_ticker over Lightning, bound by one secret.'
+              : 'Lock $_qtk in an on-chain HTLC on Sequentia, receive $_ticker over Lightning, bound by one secret.',
           style: AmbraText.sub),
       const SizedBox(height: 16),
     ];
@@ -262,8 +299,18 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
         child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           Text('Best resting offer: ${_amt(o.assetAmount, widget.asset)} for ${_btc(o.btcSats)}.',
               style: AmbraText.sub),
+          const SizedBox(height: 8),
+          // HONEST SPEED LABEL, stated BEFORE commit: the BTC shape waits on the taker's OWN on-chain
+          // Bitcoin lock confirming before the maker pays the asset; the same-chain quote shape has no
+          // Bitcoin-confirmation wait and settles at Sequentia speed.
+          Text(
+              widget.quoteAsset == null
+                  ? 'How long · your Bitcoin lock waits on Bitcoin confirmations before the $_ticker '
+                      'arrives over Lightning, typically 10-60+ minutes on testnet4.'
+                  : 'How long · settles at Sequentia speed, typically about a minute.',
+              style: AmbraText.sub),
           const SizedBox(height: 10),
-          AmbraField(label: 'Bitcoin to spend (blank = whole offer)', controller: _amount, hint: '0.0'),
+          AmbraField(label: '$_qtk to spend (blank = whole offer)', controller: _amount, hint: '0.0'),
         ]),
       ),
       const SizedBox(height: 16),
@@ -288,7 +335,7 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
         w.addAll([
           AmbraCard(
             child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-              const SectionLabel('Lock your Bitcoin'),
+              SectionLabel('Lock your $_qtk'),
               const SizedBox(height: 8),
               Text('Funds ${_btc(r.btcSats)} into the on-chain lock address:', style: AmbraText.sub),
               const SizedBox(height: 6),
@@ -296,16 +343,18 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
             ]),
           ),
           const SizedBox(height: 14),
-          PrimaryButton(label: 'Lock BTC', busy: _busy, icon: Icons.lock, onPressed: _busy ? null : _fundBtc),
+          PrimaryButton(label: 'Lock $_qtk', busy: _busy, icon: Icons.lock, onPressed: _busy ? null : _fundBtc),
         ]);
         break;
       case SubBuyStep.funding:
-        w.add(const _Waiting('Waiting for the Bitcoin lock to confirm (~1 block)…'));
+        w.add(_Waiting(widget.quoteAsset == null
+            ? 'Waiting for the Bitcoin lock to confirm (~1 block)…'
+            : 'Handing your $_qtk lock to the seller (no confirmation wait)…'));
         w.add(_checkButton(_pollFund));
         break;
       case SubBuyStep.funded:
-        w.add(_Waiting('Bitcoin locked. Waiting for the maker to pay you $_ticker over Lightning…'));
-        if (r.fundingTxid.isNotEmpty) w.add(_txRow('BTC lock', r.fundingTxid));
+        w.add(_Waiting('$_qtk locked. Waiting for the maker to pay you $_ticker over Lightning…'));
+        if (r.fundingTxid.isNotEmpty) w.add(_txRow('$_qtk lock', r.fundingTxid));
         w.add(_checkButton(_drive));
         break;
       case SubBuyStep.holding:
@@ -314,15 +363,15 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
         break;
       case SubBuyStep.settled:
         w.add(AmbraCard(
-            child: Text('Swap complete. Your Bitcoin bought ${_amt(r.assetAtoms, r.asset)}, received over Lightning.',
+            child: Text('Swap complete. Your $_qtk bought ${_amt(r.assetAtoms, r.asset)}, received over Lightning.',
                 style: AmbraText.body)));
         w.add(const SizedBox(height: 10));
         w.add(SecondaryButton(label: 'Done', icon: Icons.check, onPressed: _reset));
         break;
       case SubBuyStep.refunded:
-        w.add(const AmbraCard(
-            child: Text('The maker didn\'t pay in time; your Bitcoin was refunded on-chain.', style: AmbraText.body)));
-        if (r.refundTxid.isNotEmpty) w.add(_txRow('BTC refund', r.refundTxid));
+        w.add(AmbraCard(
+            child: Text('The maker didn\'t pay in time; your $_qtk was refunded on-chain.', style: AmbraText.body)));
+        if (r.refundTxid.isNotEmpty) w.add(_txRow('$_qtk refund', r.refundTxid));
         w.add(const SizedBox(height: 10));
         w.add(SecondaryButton(label: 'Done', icon: Icons.check, onPressed: _reset));
         break;
@@ -340,13 +389,13 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
         const SizedBox(height: 6),
         Text(
           _refundReady
-              ? 'The lock timeout has passed; you can refund your BTC if the maker never paid.'
-              : 'If the maker stalls, your BTC becomes refundable after the lock timeout (block ${r.tBtc}).',
+              ? 'The lock timeout has passed; you can refund your $_qtk if the maker never paid.'
+              : 'If the maker stalls, your $_qtk becomes refundable after the lock timeout (block ${r.tBtc}).',
           style: AmbraText.sub,
         ),
         const SizedBox(height: 8),
         SecondaryButton(
-          label: _refundReady ? 'Refund my BTC' : 'Refund (waiting for timeout)',
+          label: _refundReady ? 'Refund my $_qtk' : 'Refund (waiting for timeout)',
           icon: Icons.undo,
           onPressed: (_busy || !_refundReady) ? null : _refund,
         ),
@@ -377,9 +426,9 @@ class _SubassetBuyScreenState extends State<SubassetBuyScreen> {
       );
 
   String _stepLabel(SubBuyStep s) => switch (s) {
-        SubBuyStep.secretReady => 'Ready to lock BTC',
-        SubBuyStep.funding => 'Locking BTC',
-        SubBuyStep.funded => 'BTC locked · awaiting the maker',
+        SubBuyStep.secretReady => 'Ready to lock $_qtk',
+        SubBuyStep.funding => 'Locking $_qtk',
+        SubBuyStep.funded => '$_qtk locked · awaiting the maker',
         SubBuyStep.holding => 'Payment received · settling',
         SubBuyStep.settled => 'Complete',
         SubBuyStep.refunded => 'Refunded',

@@ -24,6 +24,15 @@ class PlacedCovenant {
   final bool posted; // true once the relay accepted the offer
   final int createdMs;
 
+  /// SBTC silent peg: this covenant LOCKS SBTC (`pay`) but was ADVERTISED as
+  /// [advertiseAs] (the BTC sentinel) so it rests in the asset/BTC market (the ONE
+  /// place SBTC touches the DEX). Tagged so the cancel/reclaim path knows to peg the
+  /// reclaimed SBTC back OUT to real BTC — the user paid BTC and expects BTC back.
+  /// Absent (false / null) for ordinary same-chain covenant orders. Mirrors the web
+  /// wallet's PLACED `pegged`/`advertiseAs` tag (swap.js placeCovenant).
+  final bool pegged;
+  final String? advertiseAs;
+
   PlacedCovenant({
     required this.covTxid,
     required this.covVout,
@@ -38,6 +47,8 @@ class PlacedCovenant {
     required this.expiryLocktime,
     required this.posted,
     required this.createdMs,
+    this.pegged = false,
+    this.advertiseAs,
   });
 
   /// Stable identity: the funding outpoint (known the instant the covenant is funded).
@@ -57,6 +68,8 @@ class PlacedCovenant {
         'expiryLocktime': expiryLocktime,
         'posted': posted,
         'createdMs': createdMs,
+        'pegged': pegged,
+        'advertiseAs': advertiseAs,
       };
 
   factory PlacedCovenant.fromJson(Map<String, dynamic> j) => PlacedCovenant(
@@ -73,6 +86,8 @@ class PlacedCovenant {
         expiryLocktime: (j['expiryLocktime'] as num?)?.toInt() ?? 0,
         posted: j['posted'] as bool? ?? false,
         createdMs: (j['createdMs'] as num?)?.toInt() ?? 0,
+        pegged: j['pegged'] as bool? ?? false,
+        advertiseAs: j['advertiseAs'] as String?,
       );
 
   PlacedCovenant copyWith({String? offerId, bool? posted}) => PlacedCovenant(
@@ -89,6 +104,8 @@ class PlacedCovenant {
         expiryLocktime: expiryLocktime,
         posted: posted ?? this.posted,
         createdMs: createdMs,
+        pegged: pegged,
+        advertiseAs: advertiseAs,
       );
 }
 
