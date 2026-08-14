@@ -2,13 +2,16 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:crypto/crypto.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:http/http.dart' as http;
 
 import '../rust/api.dart' as core;
+import 'api_client.dart';
 import 'config.dart';
 import 'lightning_service.dart';
 import 'lsp_client.dart';
 import 'trade_receipts.dart';
+import 'store_log.dart';
+import 'trade_slots.dart';
 import 'wallet_repository.dart';
 
 /// A conservative fee (sats) for the legacy-P2SH BTC HTLC claim spend (~200 vB at ~2 sat/vB),
@@ -33,10 +36,12 @@ enum SubSellStep {
 
 class SubSellRecord {
   SubSellRecord({
+    String? id,
     required this.step,
     required this.asset,
     required this.ticker,
     required this.expectedBtc,
+    this.quoteAsset,
     this.preimage = '',
     this.hashHex = '',
     this.btcLeg,
@@ -48,11 +53,19 @@ class SubSellRecord {
     this.startedMs,
     this.claimTxid = '',
     this.shortfall = false,
-  });
+  }) : id = id ?? newTradeId();
 
+  /// Stable per-record id (multi-record store): every save upserts on it, so a second sell can never
+  /// overwrite this record's preimage/HTLC terms (the recovery handle).
+  final String id;
   SubSellStep step;
   final String asset; // the Sequentia asset paid over Lightning
   final String ticker;
+
+  /// MIXED same-chain: the claim leg's REAL asset — the maker's HTLC is on this Sequentia asset instead
+  /// of Bitcoin, with [expectedBtc] / [SubBtcHtlc.amount] carrying QUOTE ATOMS and [SubBtcHtlc.tBtc] a
+  /// SEQUENTIA height (the LSP contract labels them btc_* regardless). Null = the BTC shape, unchanged.
+  final String? quoteAsset;
   final String preimage; // NOT HD-derivable — the recovery-critical secret (claims the BTC); '' at 'paying'
   final String hashHex; // '' until the maker returns it (known from 'claiming' on)
   final SubBtcHtlc? btcLeg; // the maker's BTC HTLC the taker claims with [preimage]; null at 'paying'
@@ -73,9 +86,11 @@ class SubSellRecord {
   BigInt get gotBtc => btcLeg?.amount ?? BigInt.zero;
 
   Map<String, dynamic> toJson() => {
+        'id': id,
         'step': step.name,
         'asset': asset,
         'ticker': ticker,
+        'quoteAsset': quoteAsset,
         'preimage': preimage,
         'hashHex': hashHex,
         'btcLeg': btcLeg?.toJson(),
@@ -91,9 +106,13 @@ class SubSellRecord {
       };
 
   static SubSellRecord fromJson(Map<String, dynamic> j) => SubSellRecord(
+        id: '${j['id'] ?? ''}'.isEmpty ? null : '${j['id']}',
         step: SubSellStep.values.firstWhere((s) => s.name == j['step'], orElse: () => SubSellStep.failed),
         asset: '${j['asset']}',
         ticker: '${j['ticker']}',
+        quoteAsset: (j['quoteAsset'] is String && (j['quoteAsset'] as String).isNotEmpty)
+            ? j['quoteAsset'] as String
+            : null,
         preimage: '${j['preimage'] ?? ''}',
         hashHex: '${j['hashHex'] ?? ''}',
         btcLeg: j['btcLeg'] is Map ? SubBtcHtlc.fromJson(j['btcLeg'] as Map) : null,
@@ -114,25 +133,66 @@ class SubSellRecord {
   bool get inFlight => step == SubSellStep.claiming || step == SubSellStep.paying;
 }
 
-/// Persists the single active sub-asset SELL. It carries the preimage (the only thing that claims the
-/// BTC), so it lives in secure storage. A distinct key from the BUY store so the two never clobber.
+/// Persists the active sub-asset SELLs — a MULTI-RECORD list (web SELLS array) under a NEW key, with
+/// one-time never-lossy adoption of the legacy single-slot record ('ambra.subasset.sell.active'). Each
+/// record carries the preimage (the only thing that claims the BTC), so it lives in secure storage;
+/// every save upserts by [SubSellRecord.id]. A distinct key from the BUY store so the two never mix.
 class SubSellStore {
   SubSellStore._();
-  static const _key = 'ambra.subasset.sell.active';
-  static const _storage = FlutterSecureStorage();
+  static final TradeListStore _list =
+      TradeListStore(listKey: 'ambra.subasset.sells', legacyKey: 'ambra.subasset.sell.active');
 
-  static Future<SubSellRecord?> load() async {
-    final s = await _storage.read(key: _key);
-    if (s == null || s.isEmpty) return null;
-    try {
-      return SubSellRecord.fromJson(jsonDecode(s) as Map<String, dynamic>);
-    } catch (_) {
-      return null;
+  /// Every persisted sell record. Undecodable entries are skipped here but PRESERVED on disk.
+  static Future<List<SubSellRecord>> loadAll() async {
+    final read = await _list.readAll();
+    final out = <SubSellRecord>[];
+    for (final e in read.entries) {
+      try {
+        out.add(SubSellRecord.fromJson(e));
+      } catch (_) {/* preserved on disk; not drivable by this build */}
     }
+    return out;
   }
 
-  static Future<void> save(SubSellRecord r) => _storage.write(key: _key, value: jsonEncode(r.toJson()));
-  static Future<void> clear() => _storage.delete(key: _key);
+  /// The sells still protecting a recovery handle (paying/claiming) — guard + cards + resume iterate these.
+  static Future<List<SubSellRecord>> activeAll() async =>
+      (await loadAll()).where((r) => r.inFlight).toList();
+
+  /// Compat single-record read: by [id] when given, else the first in-flight, else the most recent.
+  static Future<SubSellRecord?> load({String? id}) async {
+    final all = await loadAll();
+    if (all.isEmpty) return null;
+    if (id != null && id.isNotEmpty) {
+      for (final r in all) {
+        if (r.id == id) return r;
+      }
+      return null;
+    }
+    for (final r in all) {
+      if (r.inFlight) return r;
+    }
+    return all.first;
+  }
+
+  static Future<void> save(SubSellRecord r) => _list.upsert(r.toJson());
+
+  /// Remove ONE record by id (a finished sell, or a definitively-dead 'paying' stub). [reason] is
+  /// logged loudly by the substrate — a sell-record removal must never be silent.
+  static Future<void> remove(String id, {String reason = 'unspecified'}) =>
+      _list.removeById(id, reason: reason);
+
+  /// Drop terminal records before starting a new sell (bounded-list hygiene). A record still in
+  /// flight — even 'paying' (asset possibly paid) — is NEVER pruned.
+  static Future<void> pruneSettled() => _list.removeWhere(reason: 'pruneSettled: finished sell', (e) {
+        try {
+          return !SubSellRecord.fromJson(e).inFlight;
+        } catch (_) {
+          return false; // undecodable: keep — it may represent a live trade
+        }
+      });
+
+  /// TEST-ONLY full wipe.
+  static Future<void> clear() => _list.wipeAll();
 }
 
 /// Drives the sub-asset SELL from LOCAL state: pay the asset over Lightning, then CLAIM the maker's
@@ -188,18 +248,17 @@ class SubassetSellService {
         s.contains('connection refused');
   }
 
-  /// True while a sell is persisted with its BTC claim not yet confirmed — the single-active guard +
-  /// the screen's gating both read this so a second sell can never overwrite the recovery handle.
-  static Future<bool> hasInFlight() async {
-    final r = await SubSellStore.load();
-    return r != null && r.inFlight;
-  }
+  /// True while any sell is persisted with its BTC claim not yet confirmed. With the multi-record
+  /// store this no longer hard-blocks a second sell (records upsert by id); the shared [TradeSlots]
+  /// bound gates new dispatches.
+  static Future<bool> hasInFlight() async => (await SubSellStore.activeAll()).isNotEmpty;
 
   /// Pay the asset over Lightning, learn the preimage + the maker's BTC HTLC terms, PERSIST them, then
   /// claim the BTC on-chain. FUND-SAFETY: the asset is paid inside [LightningService.swapSub]; the
   /// moment it settles we hold the only recovery handle (the preimage), so we persist BEFORE the first
   /// claim and [resume] re-attempts it. Refuses to start while another sell's BTC claim is unconfirmed.
-  static Future<SubSellRecord> begin({required String asset, required num amount, SubOffer? offer}) async {
+  static Future<SubSellRecord> begin(
+      {required String asset, required num amount, SubOffer? offer, String? quoteAsset}) async {
     // FUND-SAFETY self-guard: a second sell would pay the asset again + overwrite the persisted
     // preimage/HTLC — the single handle to the claimable BTC. The sync sentinel is checked-and-set
     // atomically (no await between) so a concurrent begin can't slip through before the persist below.
@@ -208,15 +267,22 @@ class SubassetSellService {
     }
     _starting = true;
     try {
-      if (await hasInFlight()) {
-        throw Exception('You already have a sub-asset sell in progress (claiming your BTC). '
-            'Finish or retry it first.');
-      }
+      // SHARED SLOT GATE (web buySlotsFree): a second sell can no longer overwrite the persisted
+      // preimage/HTLC (records upsert by id), so the single-slot hard refusal is replaced by the
+      // bounded concurrent-trade count. Prune finished records first so they never eat a slot.
+      await SubSellStore.pruneSettled();
+      final refusal = await TradeSlots.refusalIfFull();
+      if (refusal != null) throw Exception(refusal);
       final m = await _mnemonic();
       final ticker = SeqAssets.labelFor(asset).ticker;
-      // The device CLAIM key — only we can claim the maker's BTC HTLC. The maker embeds it as the
-      // IF/claim key so the LSP (keyless) can never take the BTC.
-      final btcClaimPub = await core.xchainBtcClaimPubkey(mnemonic: m);
+      final qh = (quoteAsset != null && quoteAsset.isNotEmpty) ? quoteAsset : null;
+      // The device CLAIM key — only we can claim the maker's on-chain HTLC. The maker embeds it as the
+      // IF/claim key so the LSP (keyless) can never take the funds. MIXED same-chain: the claim leg is
+      // the QUOTE asset on Sequentia, so the key is the wallet's canonical SEQ claim key (mirror web
+      // startSell's `qh ? seqLeg.claimKey() : btcLeg.claimKey()`).
+      final btcClaimPub = qh != null
+          ? await core.xchainSeqClaimPubkey(mnemonic: m)
+          : await core.xchainBtcClaimPubkey(mnemonic: m);
       // Bring our OWN hosted asset node's device signer online so the LSP can command the LN pay.
       final nodeKey = await LightningService.instance.connectNode(m, asset: asset);
       // FUND-SAFETY: the asset is paid INSIDE swapSub. Persist a PENDING ('paying') record carrying a
@@ -224,18 +290,20 @@ class SubassetSellService {
       // after the LSP already paid the asset, resume() re-calls with this SAME nonce and the LSP
       // returns the settled result idempotently (it never re-pays for a stored nonce).
       final swapNonce = _newSwapNonce();
-      await SubSellStore.save(SubSellRecord(
+      final paying = SubSellRecord(
         step: SubSellStep.paying,
         asset: asset,
         ticker: ticker,
         expectedBtc: offer?.btcSats ?? BigInt.zero,
+        quoteAsset: qh,
         swapNonce: swapNonce,
         amount: amount,
         btcClaimPub: btcClaimPub,
         offerId: offer?.offerId,
         makerPubkey: offer?.makerPubkey,
         startedMs: DateTime.now().millisecondsSinceEpoch,
-      ));
+      );
+      await SubSellStore.save(paying);
       var paidCallStarted = false;
       try {
         // Pay the asset over Lightning; on settle the maker reveals the preimage, returned WITH the BTC
@@ -254,14 +322,17 @@ class SubassetSellService {
           offerId: offer?.offerId,
           makerPubkey: offer?.makerPubkey,
           swapNonce: swapNonce,
+          quoteAsset: qh, // mixed same-chain: the claim leg's REAL asset (absent = BTC)
         );
         final s = resp.settle;
         if (!(s.settled && s.preimage.isNotEmpty && s.btcHtlc != null)) {
           throw Exception('The sell did not settle over Lightning.');
         }
         // PERSIST BEFORE the on-chain claim: the asset is now paid, so the BTC claim is the fund step and
-        // MUST survive a reload — resume() re-attempts it from here.
+        // MUST survive a reload — resume() re-attempts it from here. SAME id as the 'paying' record, so
+        // the upsert REPLACES it in place (never a second record for the same trade).
         final rec = SubSellRecord(
+          id: paying.id,
           step: SubSellStep.claiming,
           asset: asset,
           ticker: ticker,
@@ -269,6 +340,7 @@ class SubassetSellService {
           hashHex: s.hashHex.isNotEmpty ? s.hashHex : s.btcHtlc!.raw['hash_h']?.toString() ?? '',
           btcLeg: s.btcHtlc!,
           expectedBtc: offer?.btcSats ?? BigInt.zero,
+          quoteAsset: qh,
           swapNonce: swapNonce,
         );
         await SubSellStore.save(rec);
@@ -277,10 +349,14 @@ class SubassetSellService {
       } catch (e) {
         // A LOST RESPONSE (network error after we may have paid) KEEPS the 'paying' record so resume()
         // recovers via the nonce; a DEFINITIVE rejection (LSP ok:false — the sell never settled) means
-        // NO asset was paid, so discard it (else it blocks future sells + re-runs on the next resume).
+        // NO asset was paid, so discard THIS record by id (never the whole store — other sells' records
+        // are their own trades' recovery handles).
         if (paidCallStarted && !_payMayHaveCompleted(e)) {
-          final cur = await SubSellStore.load();
-          if (cur != null && cur.step == SubSellStep.paying) await SubSellStore.clear();
+          final cur = await SubSellStore.load(id: paying.id);
+          if (cur != null && cur.step == SubSellStep.paying) {
+            await SubSellStore.remove(paying.id,
+                reason: 'begin: pay call failed before the asset could have been paid');
+          }
         }
         rethrow;
       }
@@ -297,6 +373,46 @@ class SubassetSellService {
     final m = await _mnemonic();
     final h = rec.btcLeg;
     if (h == null) throw Exception('No BTC HTLC to verify (the sell has not settled yet).');
+    // The preimage must hash to H on BOTH shapes — never claim with a secret that can't spend the leg.
+    final digest = sha256.convert(_hexBytes(rec.preimage)).toString();
+    if (digest.toLowerCase() != rec.hashHex.toLowerCase()) {
+      throw Exception('The revealed preimage does not hash to H.');
+    }
+    if (rec.quoteAsset != null) {
+      // MIXED same-chain: the claim leg is the QUOTE asset on Sequentia (mirror web claimSell's qh
+      // branch). Rebuild the forward HTLC from OUR inputs (claim = our canonical SEQ key), then bind
+      // the reported outpoint to a REAL on-chain output: script + asset + amount, from OUR esplora.
+      final ours = (await core.xchainSeqClaimPubkey(mnemonic: m)).toLowerCase();
+      if (h.takerClaimPubkey.toLowerCase() != ours) {
+        throw Exception('The on-chain lock is not bound to this wallet\'s claim key.');
+      }
+      final rebuilt = await core.xchainSeqHtlcForward(
+        mnemonic: m,
+        hashHex: rec.hashHex,
+        makerSeqRefundPubHex: h.makerRefundPubkey,
+        seqLocktime: h.tBtc,
+      );
+      if (rebuilt.redeemScriptHex.toLowerCase() != h.redeemScript.toLowerCase()) {
+        throw Exception('The on-chain lock\'s redeem script does not match H + the claim/refund keys.');
+      }
+      // A READ FAILURE IS NOT A MISMATCH: an unindexed tx is transient (the claim retries), a real
+      // disagreement is fatal. The read is explicit-only, so a blinded/absent output fails closed.
+      final out = await _seqOutput(h.txid, h.vout);
+      if (out == null) {
+        throw Exception('Could not read the counterparty\'s on-chain lock yet; retrying automatically.');
+      }
+      if ('${out['scriptpubkey'] ?? ''}'.toLowerCase() != rebuilt.p2ShSpkHex.toLowerCase()) {
+        throw Exception('The counterparty\'s on-chain lock does not match this trade; not claiming.');
+      }
+      if ('${out['asset'] ?? ''}'.toLowerCase() != rec.quoteAsset!.toLowerCase()) {
+        throw Exception('The counterparty\'s on-chain lock is in the wrong asset; not claiming.');
+      }
+      final value = BigInt.tryParse('${out['value'] ?? ''}');
+      if (value == null || value != h.amount) {
+        throw Exception('The counterparty\'s on-chain lock has the wrong amount; not claiming.');
+      }
+      return;
+    }
     final ours = (await core.xchainBtcClaimPubkey(mnemonic: m)).toLowerCase();
     if (h.takerClaimPubkey.toLowerCase() != ours) {
       throw Exception('The BTC HTLC is not locked to this wallet\'s claim key.');
@@ -309,10 +425,6 @@ class SubassetSellService {
     );
     if (rebuilt.redeemScriptHex.toLowerCase() != h.redeemScript.toLowerCase()) {
       throw Exception('The BTC HTLC redeem script does not match H + the claim/refund keys.');
-    }
-    final digest = sha256.convert(_hexBytes(rec.preimage)).toString();
-    if (digest.toLowerCase() != rec.hashHex.toLowerCase()) {
-      throw Exception('The revealed preimage does not hash to H.');
     }
     final f = await core.xchainFindBtcFunding(t4Api: Backend.testnet4, txid: h.txid, p2ShSpkHex: rebuilt.p2ShSpkHex);
     if (f.vout != h.vout) {
@@ -341,36 +453,88 @@ class SubassetSellService {
     final h = rec.btcLeg;
     if (h == null) throw Exception('No BTC HTLC to claim (the sell has not settled yet).');
     final dest = await core.receiveAddress(mnemonic: m); // our own tb1
-    final hex = await core.xchainBtcClaim(
-      mnemonic: m,
-      btcTxid: h.txid,
-      btcVout: h.vout,
-      btcAmountSats: h.amount,
-      destAddress: dest,
-      feeSats: _kClaimFeeSats,
-      redeemScriptHex: h.redeemScript,
-      preimageHex: rec.preimage,
-    );
-    final txid = await core.btcBroadcast(t4Api: Backend.testnet4, txHex: hex);
+    final String txid;
+    if (rec.quoteAsset != null) {
+      // MIXED same-chain: claim the QUOTE-asset HTLC on Sequentia with the preimage, the fee sized
+      // per-asset from the published rate and paid in the claimed asset (the HTLC holds no native
+      // tSEQ). Fail-closed fee sizing: an unmineable claim would linger while the maker's refund
+      // matures — the throw keeps the record 'claiming' and the claim retries.
+      final fee = await _seqClaimFee(rec.quoteAsset!, h.amount);
+      final hex = await core.xchainSeqClaim(
+        mnemonic: m,
+        seqTxid: h.txid,
+        seqVout: h.vout,
+        seqAmount: h.amount,
+        seqAssetId: rec.quoteAsset!,
+        destAddress: dest,
+        hashHex: rec.hashHex,
+        makerSeqRefundPubHex: h.makerRefundPubkey,
+        seqLocktime: h.tBtc,
+        fee: fee,
+        preimageHex: rec.preimage,
+      );
+      txid = await core.xchainSeqBroadcast(seqEsplora: Backend.esplora, txHex: hex);
+    } else {
+      final hex = await core.xchainBtcClaim(
+        mnemonic: m,
+        btcTxid: h.txid,
+        btcVout: h.vout,
+        btcAmountSats: h.amount,
+        destAddress: dest,
+        feeSats: _kClaimFeeSats,
+        redeemScriptHex: h.redeemScript,
+        preimageHex: rec.preimage,
+      );
+      txid = await core.btcBroadcast(t4Api: Backend.testnet4, txHex: hex);
+    }
     rec
       ..claimTxid = txid
       ..step = SubSellStep.done;
     await SubSellStore.save(rec);
+    final qtk = rec.quoteAsset != null ? SeqAssets.labelFor(rec.quoteAsset!).ticker : 'BTC';
     TradeReceipts.log(
       id: 'subsell:${rec.hashHex}',
-      title: 'Sold ${rec.ticker} for BTC',
-      status: rec.shortfall ? 'BTC claimed (below quote)' : 'BTC claimed',
+      title: 'Sold ${rec.ticker} for $qtk',
+      status: rec.shortfall ? '$qtk claimed (below quote)' : '$qtk claimed',
       txid: rec.claimTxid,
+      pair: '${rec.ticker}/$qtk',
+      side: 'sell',
+      price: _fillPrice(rec),
     ).ignore();
     return rec;
   }
 
-  /// On wallet load / cold start: if a sell paid the asset but its BTC claim never confirmed, re-attempt
-  /// the claim (the preimage + HTLC terms are persisted). The fund-recovery path. Leaves the record in
-  /// place on success (terminal 'done'); a failure keeps it 'claiming' for the next retry.
+  /// The fill price in quote UNITS per base UNIT (receipt display). Null when a side is unknown.
+  static double? _fillPrice(SubSellRecord rec) {
+    final qprec = rec.quoteAsset != null ? SeqAssets.labelFor(rec.quoteAsset!).precision : 8;
+    var q = 1.0;
+    for (var i = 0; i < qprec; i++) {
+      q *= 10;
+    }
+    final got = rec.gotBtc.toDouble() / q;
+    final amt = (rec.amount ?? 0).toDouble();
+    return (got > 0 && amt > 0) ? got / amt : null;
+  }
+
+  /// On wallet load / cold start: for EVERY persisted in-flight sell, re-attempt the claim (asset paid,
+  /// preimage known) or the nonce-recovery (asset possibly paid, response lost). The fund-recovery
+  /// path. Records are driven INDEPENDENTLY (concurrently) so one stuck counterparty never blocks
+  /// another's claim (the web resumeSell over activeSells).
   static Future<void> resume() async {
-    final rec = await SubSellStore.load();
-    if (rec == null) return;
+    List<SubSellRecord> recs;
+    try {
+      recs = await SubSellStore.activeAll();
+    } catch (e) {
+      storeLog('sub-asset SELL resume: store UNREADABLE ($e) - nothing driven, records stay persisted');
+      return; // unreadable store: records stay persisted for the next resume
+    }
+    storeLog('sub-asset SELL resume: ${recs.length} active record(s)'
+        '${recs.isEmpty ? '' : ' [${recs.map((r) => '${r.id}:${r.step.name}').join(', ')}]'}');
+    await Future.wait([for (final r in recs) _resumeOne(r).catchError((Object _) {})]);
+  }
+
+  /// Resume ONE persisted sell (the old single-record resume body, per record).
+  static Future<void> _resumeOne(SubSellRecord rec) async {
     // (A) Asset paid + response received: preimage + HTLC persisted -> re-attempt the on-chain claim.
     if (rec.step == SubSellStep.claiming && rec.preimage.isNotEmpty) {
       try {
@@ -390,16 +554,21 @@ class SubassetSellService {
       // still-'paying' record this old can't complete — clear it rather than re-attempt (or re-run) forever.
       final startedMs = rec.startedMs ?? 0;
       if (startedMs > 0 && DateTime.now().millisecondsSinceEpoch - startedMs > _kPayingTtlMs) {
-        await SubSellStore.clear();
+        // only THIS dead record; others keep their handles
+        await SubSellStore.remove(rec.id,
+            reason: 'resume: stale paying record past the Lightning-leg TTL - cannot complete');
         return;
       }
       try {
         final m = await _mnemonic();
         final asset = rec.asset;
-        // Re-derive our claim key + bring our node online the SAME way begin does (deterministic).
+        // Re-derive our claim key + bring our node online the SAME way begin does (deterministic):
+        // the SEQ claim key for a mixed same-chain sell, the BTC claim key otherwise.
         final btcClaimPub = (rec.btcClaimPub != null && rec.btcClaimPub!.isNotEmpty)
             ? rec.btcClaimPub!
-            : await core.xchainBtcClaimPubkey(mnemonic: m);
+            : (rec.quoteAsset != null
+                ? await core.xchainSeqClaimPubkey(mnemonic: m)
+                : await core.xchainBtcClaimPubkey(mnemonic: m));
         final nodeKey = await LightningService.instance.connectNode(m, asset: asset);
         final resp = await LightningService.instance.swapSub(
           side: 'sell',
@@ -412,10 +581,12 @@ class SubassetSellService {
           offerId: rec.offerId,
           makerPubkey: rec.makerPubkey,
           swapNonce: rec.swapNonce,
+          quoteAsset: rec.quoteAsset,
         );
         final s = resp.settle;
         if (!(s.settled && s.preimage.isNotEmpty && s.btcHtlc != null)) return; // not settled yet; keep for a later retry
         final claiming = SubSellRecord(
+          id: rec.id, // upsert REPLACES the 'paying' record in place
           step: SubSellStep.claiming,
           asset: asset,
           ticker: rec.ticker,
@@ -423,6 +594,7 @@ class SubassetSellService {
           hashHex: s.hashHex.isNotEmpty ? s.hashHex : s.btcHtlc!.raw['hash_h']?.toString() ?? '',
           btcLeg: s.btcHtlc!,
           expectedBtc: rec.expectedBtc,
+          quoteAsset: rec.quoteAsset,
           swapNonce: rec.swapNonce,
         );
         await SubSellStore.save(claiming);
@@ -432,6 +604,47 @@ class SubassetSellService {
       }
       return;
     }
+  }
+
+  // -- Sequentia-side helpers (mixed same-chain claim leg) --------------------
+
+  /// Output [vout] of Sequentia tx [txid] from OUR OWN esplora: `{scriptpubkey, asset, value}`.
+  /// Null while the tx is unindexed / unreadable (transient — the caller retries), so a lagging
+  /// backend is never reported as a mismatch.
+  static Future<Map<String, dynamic>?> _seqOutput(String txid, int vout) async {
+    try {
+      final resp = await http
+          .get(Uri.parse('${Backend.esplora}/tx/$txid'), headers: Backend.authHeaders)
+          .timeout(const Duration(seconds: 20));
+      if (resp.statusCode != 200) return null;
+      final tx = jsonDecode(resp.body) as Map<String, dynamic>;
+      final vouts = (tx['vout'] as List?) ?? const [];
+      if (vout < 0 || vout >= vouts.length) return null;
+      final o = vouts[vout];
+      return o is Map ? Map<String, dynamic>.from(o) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// The claim fee in atoms of the CLAIMED quote asset: the native policy fee converted at the asset's
+  /// published rate, min 1 atom, capped at half the output. FAIL-CLOSED on a missing rate — an
+  /// under-fee'd claim sits unmined while the maker's refund matures; the throw keeps the record
+  /// 'claiming' and the claim retries (mirror XchainSwapService._seqClaimFee).
+  static Future<BigInt> _seqClaimFee(String assetHex, BigInt amount) async {
+    final ticker = SeqAssets.labelFor(assetHex).ticker;
+    final rates = await ApiClient.feeRates();
+    final scale = BigInt.from(100000000);
+    final rate = rates[ticker] ?? rates[assetHex];
+    if (rate == null || rate <= BigInt.zero) {
+      throw Exception('No Sequentia fee rate for $ticker, so the claim fee cannot be sized safely; retrying.');
+    }
+    final native = BigInt.from(400); // ~vbytes at 1 sat/vB, matching the cross-swap sizing
+    var fee = (native * scale + rate - BigInt.one) ~/ rate; // ceil(native * scale / rate)
+    if (fee < BigInt.one) fee = BigInt.one;
+    final half = amount ~/ BigInt.two;
+    if (half >= BigInt.one && fee > half) fee = half;
+    return fee;
   }
 }
 

@@ -18,7 +18,7 @@ import '../widgets/widgets.dart';
 /// direction). So once the LN pay settles, the preimage + the maker's BTC HTLC terms are persisted
 /// BEFORE the on-chain claim, and the claim is retried (here and on cold start) until it confirms.
 class SubassetSellScreen extends StatefulWidget {
-  const SubassetSellScreen({super.key, required this.asset, this.assetAmount});
+  const SubassetSellScreen({super.key, required this.asset, this.assetAmount, this.quoteAsset, this.recordId});
 
   /// The Sequentia asset to sell for Bitcoin (paid over Lightning).
   final String asset;
@@ -26,6 +26,14 @@ class SubassetSellScreen extends StatefulWidget {
   /// Optional composer seed: prefill the amount of [asset] to sell (a display
   /// string). Ignored when a swap is already in flight (never clobbers a resume).
   final String? assetAmount;
+
+  /// MIXED same-chain: the pair's QUOTE asset — the claim leg is a Sequentia HTLC on it, standing in
+  /// BTC's structural place, and every "BTC" position carries quote atoms. Null = the BTC shape.
+  final String? quoteAsset;
+
+  /// A specific persisted record to open (the composer's in-flight card taps pass it). Null = the
+  /// first in-flight sell of this asset, if any (multi-record store).
+  final String? recordId;
 
   @override
   State<SubassetSellScreen> createState() => _SubassetSellScreenState();
@@ -43,6 +51,10 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
 
   String get _ticker => SeqAssets.labelFor(widget.asset).ticker;
 
+  // The quote leg's own ticker + precision: never "BTC"/"sats" on the mixed same-chain rails.
+  String get _qtk => widget.quoteAsset != null ? SeqAssets.labelFor(widget.quoteAsset!).ticker : 'BTC';
+  int get _qprec => widget.quoteAsset != null ? SeqAssets.labelFor(widget.quoteAsset!).precision : 8;
+
   @override
   void initState() {
     super.initState();
@@ -58,11 +70,25 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
 
   Future<void> _load() async {
     try {
-      final rec = await SubSellStore.load();
+      // A tapped in-flight card opens ITS record; otherwise adopt the first in-flight sell of THIS
+      // asset (multi-record store: other assets' sells are their own cards, not this screen's).
+      SubSellRecord? rec;
+      if (widget.recordId != null && widget.recordId!.isNotEmpty) {
+        rec = await SubSellStore.load(id: widget.recordId);
+      } else {
+        final all = await SubSellStore.activeAll();
+        for (final r in all) {
+          if (r.asset == widget.asset) {
+            rec = r;
+            break;
+          }
+        }
+      }
       // Best-effort: source the best resting sell offer for the economic gate (expected BTC).
       SubOffer? offer;
       try {
-        final book = await LightningService.instance.subassetBook(widget.asset);
+        // The book is keyed per (base, quote) pair: mixed same-chain reads pass the REAL quote.
+        final book = await LightningService.instance.subassetBook(widget.asset, quote: widget.quoteAsset);
         if (book.sellOffers.isNotEmpty) offer = book.sellOffers.first;
       } catch (_) {/* rail-agnostic: a sell can proceed without a pinned offer */}
       if (!mounted) return;
@@ -99,7 +125,8 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
     return '${formatAtoms(atoms.toString(), l.precision)} ${l.ticker}';
   }
 
-  String _btc(BigInt sats) => '${formatAtoms(sats.toString(), 8)} BTC';
+  /// A quote-leg amount in the quote asset's OWN units + ticker (BTC only on the BTC shape).
+  String _btc(BigInt sats) => '${formatAtoms(sats.toString(), _qprec)} $_qtk';
 
   void _snack(String m) => ScaffoldMessenger.of(context).showSnackBar(ambraSnack(m));
 
@@ -130,14 +157,22 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
     if (amt == null || amt <= 0) return _snack('Enter an amount of ${l.ticker} to sell');
     await _run('Paying ${l.ticker} over Lightning…', () async {
       try {
-        final rec = await SubassetSellService.begin(asset: widget.asset, amount: amt, offer: _offer);
+        final rec = await SubassetSellService.begin(
+            asset: widget.asset, amount: amt, offer: _offer, quoteAsset: widget.quoteAsset);
         if (mounted) setState(() => _rec = rec);
       } catch (_) {
         // FUND-SAFETY: begin() pays the asset over Lightning, then persists the preimage + HTLC terms
         // at 'claiming' BEFORE the on-chain claim. If the claim (or anything after the pay) throws,
         // reload the PERSISTED record so the UI reflects that the asset is paid and the BTC is
-        // claimable — never re-show the "Sell" form (a re-tap must not re-pay the asset).
-        final saved = await SubSellStore.load();
+        // claimable — never re-show the "Sell" form (a re-tap must not re-pay the asset). Multi-record:
+        // adopt the first in-flight sell of THIS asset (its id was minted inside begin()).
+        SubSellRecord? saved;
+        for (final r in await SubSellStore.activeAll()) {
+          if (r.asset == widget.asset) {
+            saved = r;
+            break;
+          }
+        }
         if (saved != null && mounted) setState(() => _rec = saved);
         rethrow;
       }
@@ -146,14 +181,16 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
 
   Future<void> _retryClaim() async {
     if (_busy || _rec?.step != SubSellStep.claiming) return;
-    await _run('Claiming your BTC on-chain…', () async {
+    await _run('Claiming your $_qtk on-chain…', () async {
       final rec = await SubassetSellService.claim(_rec!);
       if (mounted) setState(() => _rec = rec);
     });
   }
 
   Future<void> _reset() async {
-    await SubSellStore.clear();
+    final r = _rec;
+    // drop only THIS record; others keep their handles
+    if (r != null) await SubSellStore.remove(r.id, reason: 'user cleared the finished/abandoned sell card');
     _poll?.cancel();
     if (mounted) {
       setState(() {
@@ -184,7 +221,10 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
   List<Widget> _body() {
     final r = _rec;
     final children = <Widget>[
-      Text('Pay $_ticker over Lightning, receive Bitcoin (testnet4) on-chain, bound by one secret.',
+      Text(
+          widget.quoteAsset == null
+              ? 'Pay $_ticker over Lightning, receive Bitcoin (testnet4) on-chain, bound by one secret.'
+              : 'Pay $_ticker over Lightning, receive $_qtk on-chain on Sequentia, bound by one secret.',
           style: AmbraText.sub),
       const SizedBox(height: 16),
     ];
@@ -213,6 +253,16 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
             Text('Best resting bid locks ${_btc(_offer!.btcSats)} for ${_amt(_offer!.assetAmount, widget.asset)}.',
                 style: AmbraText.sub),
           ],
+          const SizedBox(height: 8),
+          // HONEST SPEED LABEL, stated BEFORE commit: the swap itself settles fast (you pay over
+          // Lightning against a verified lock), but on the BTC shape the claim that lands the Bitcoin in
+          // your wallet is an on-chain testnet4 transaction that still has to confirm.
+          Text(
+              widget.quoteAsset == null
+                  ? 'How long · your $_ticker pays over Lightning in about a minute; the Bitcoin then '
+                      'arrives as an on-chain claim, typically confirming in 10-60+ minutes on testnet4.'
+                  : 'How long · settles at Sequentia speed, typically about a minute.',
+              style: AmbraText.sub),
         ]),
       ),
       const SizedBox(height: 16),
@@ -226,8 +276,8 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
       AmbraCard(
         child: Column(children: [
           _Row('You sell', _ticker),
-          _Row('You receive', 'Bitcoin (on-chain HTLC)'),
-          if (r.gotBtc > BigInt.zero) _Row('BTC amount', _btc(r.gotBtc)),
+          _Row('You receive', widget.quoteAsset == null ? 'Bitcoin (on-chain HTLC)' : '$_qtk (on-chain HTLC)'),
+          if (r.gotBtc > BigInt.zero) _Row('$_qtk amount', _btc(r.gotBtc)),
           _Row('Status', _stepLabel(r.step)),
         ]),
       ),
@@ -239,12 +289,12 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
         w.add(const _Waiting('Paying the asset over Lightning…'));
         break;
       case SubSellStep.claiming:
-        w.add(const _Waiting('Asset paid over Lightning. Claiming your Bitcoin on-chain…'));
+        w.add(_Waiting('Asset paid over Lightning. Claiming your $_qtk on-chain…'));
         if (r.shortfall) {
           w.add(Padding(
             padding: const EdgeInsets.only(top: 12),
             child: WarnCallout(
-                'The Bitcoin HTLC is worth ${_btc(r.gotBtc)}, less than the quoted amount. Claiming it anyway.'),
+                'The on-chain lock is worth ${_btc(r.gotBtc)}, less than the quoted amount. Claiming it anyway.'),
           ));
         }
         w.add(Padding(
@@ -261,10 +311,10 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
         if (r.shortfall) {
           w.add(const Padding(
             padding: EdgeInsets.only(top: 12),
-            child: WarnCallout('The claimed Bitcoin came in below the quoted amount.'),
+            child: WarnCallout('The claimed amount came in below the quote.'),
           ));
         }
-        if (r.claimTxid.isNotEmpty) w.add(_txRow('BTC claim', r.claimTxid));
+        if (r.claimTxid.isNotEmpty) w.add(_txRow('$_qtk claim', r.claimTxid));
         w.add(const SizedBox(height: 10));
         w.add(SecondaryButton(label: 'Done', icon: Icons.check, onPressed: _reset));
         break;
@@ -294,7 +344,7 @@ class _SubassetSellScreenState extends State<SubassetSellScreen> {
 
   String _stepLabel(SubSellStep s) => switch (s) {
         SubSellStep.paying => 'Paying over Lightning',
-        SubSellStep.claiming => 'Claiming your BTC',
+        SubSellStep.claiming => 'Claiming your $_qtk',
         SubSellStep.done => 'Complete',
         SubSellStep.failed => 'Failed',
       };

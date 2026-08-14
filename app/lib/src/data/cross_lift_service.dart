@@ -12,17 +12,26 @@ class CrossLiftService {
   /// against the offer. Returns the LIVE session + validated terms — nothing has been spent. On any
   /// mismatch/timeout it tells the maker (fail), closes the session, and throws an honest message. The
   /// caller MUST later [CrossLiftQuote.close] the returned quote (or complete the lift), or the WS leaks.
-  static Future<CrossLiftQuote> requestAndValidateTerms(CrossOffer offer) async {
+  ///
+  /// PARTIAL FILLS (spec §4, priority C): [requestedAtoms], when smaller than the offer, asks the maker
+  /// (seqdex `xlift -amount`) to quote just that slice at the PROPORTIONAL BTC (forward CEIL). The take
+  /// amount couriered in `start_lift` becomes the slice, and [validateCrossTerms] binds the maker to
+  /// `slice` asset + `CEIL(offerBtc·slice/offerAsset)` sat — so a taker who typed "buy 10 of a 43" locks
+  /// BTC for exactly 10, never the whole 43 (invariant §2.4). A null / ≥offer value is a whole fill.
+  static Future<CrossLiftQuote> requestAndValidateTerms(CrossOffer offer, {BigInt? requestedAtoms}) async {
+    final whole =
+        requestedAtoms == null || requestedAtoms <= BigInt.zero || requestedAtoms >= offer.assetAtoms;
+    final takeAmount = whole ? offer.assetAtoms : requestedAtoms; // the slice the maker must quote
     final courier = await CrossCourier.open(
       offerId: offer.offerId,
       makerPubHex: offer.makerPubkey,
-      takeAmount: offer.assetAtoms, // whole-fill: take the offer's asset size (the base leg)
+      takeAmount: takeAmount,
     );
     try {
       await courier.send({'type': XcType.termsRequest});
       final t = await courier.recv(XcType.terms, timeout: const Duration(seconds: 30));
       final terms = _parseTerms(t);
-      final err = validateCrossTerms(offer: offer, terms: terms);
+      final err = validateCrossTerms(offer: offer, terms: terms, requestedAtoms: whole ? null : requestedAtoms);
       if (err != null) {
         await courier.fail('terms_mismatch', err); // tell the maker + close; nothing was spent
         throw Exception(err);

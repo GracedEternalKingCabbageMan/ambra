@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../data/config.dart';
 import '../data/format.dart';
 import '../data/placed_orders.dart';
+import '../data/sbtc_peg_service.dart';
 import '../data/seqob_client.dart';
 import '../data/trade_receipts.dart';
 import '../data/wallet_repository.dart';
@@ -114,16 +115,26 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> {
         feeAtoms: BigInt.from(2000),
       );
       final txid = await core.xchainSeqBroadcast(seqEsplora: Backend.esplora, txHex: built.rawHex);
+      // SBTC silent peg: the reclaimed asset is SBTC, but the maker paid BTC and expects BTC back. Redeem
+      // it to real BTC (best-effort; on failure the user simply holds redeemable SBTC — fund-safe).
+      // Mirrors the web wallet's reclaim peg-out (pegs the full sellAtoms).
+      if (rec.pegged) {
+        try {
+          await SbtcPegService.pegOutReceivedSbtc(mnemonic: m, atoms: BigInt.parse(rec.sellAtoms));
+        } catch (_) {/* non-fatal: the reclaim already landed; the SBTC is redeemable */}
+      }
       await PlacedOrders.remove(rec.key);
       final tk = SeqAssets.labelFor(rec.pay).ticker;
       await TradeReceipts.log(
         id: 'reclaim:${rec.covTxid}',
-        title: 'Reclaimed $tk order',
+        title: rec.pegged ? 'Reclaimed BTC order' : 'Reclaimed $tk order',
         status: 'Reclaimed',
         txid: txid,
       );
       if (!mounted) return;
-      _snack('Order reclaimed · ${txid.substring(0, txid.length < 16 ? txid.length : 16)}…');
+      _snack(rec.pegged
+          ? 'Order reclaimed · redeeming your SBTC to BTC at the bridge…'
+          : 'Order reclaimed · ${txid.substring(0, txid.length < 16 ? txid.length : 16)}…');
       await _load();
     } catch (e) {
       if (mounted) setState(() => _error = e.toString().replaceFirst('Exception: ', ''));
@@ -189,7 +200,14 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> {
       padding: const EdgeInsets.only(bottom: 12),
       child: AmbraCard(
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('Sell ${formatAtoms(o.sellAtoms, payL.precision)} ${payL.ticker}', style: AmbraText.body),
+          // A pegged order LOCKS SBTC but the maker paid (and gets back) real BTC — show it as a BTC bid,
+          // not "Sell N SBTC", so the copy matches what the user did (SBTC is the mechanism, not the ask).
+          Text(
+            o.pegged
+                ? 'Pay ${formatAtoms(o.sellAtoms, 8)} BTC'
+                : 'Sell ${formatAtoms(o.sellAtoms, payL.precision)} ${payL.ticker}',
+            style: AmbraText.body,
+          ),
           Text('for ${formatAtoms(o.recvAtoms, recvL.precision)} ${recvL.ticker}', style: AmbraText.sub),
           const SizedBox(height: 8),
           Text(status, style: AmbraText.sub.copyWith(color: matured ? AmbraColors.amber : AmbraColors.dim)),

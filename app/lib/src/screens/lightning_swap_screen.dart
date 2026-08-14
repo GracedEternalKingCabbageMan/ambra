@@ -2,8 +2,8 @@ import 'package:flutter/material.dart';
 
 import '../data/config.dart';
 import '../data/lightning_service.dart';
+import '../data/ln_take_service.dart';
 import '../data/lsp_client.dart';
-import '../data/trade_receipts.dart';
 import '../theme/theme.dart';
 import '../widgets/widgets.dart';
 
@@ -18,17 +18,23 @@ import '../widgets/widgets.dart';
 /// so there is no per-keystroke quote round-trip — pick a direction + asset +
 /// amount and settle; the exact base/quote amounts come back in the response.
 class LightningSwapScreen extends StatefulWidget {
-  const LightningSwapScreen({super.key, this.initialSide, this.initialAsset, this.initialAmount});
+  const LightningSwapScreen(
+      {super.key, this.initialSide, this.initialAsset, this.initialQuoteAsset, this.initialAmount});
 
-  /// Optional composer seed: 'buy' (BTC -> asset) or 'sell' (asset -> BTC).
+  /// Optional composer seed: 'buy' (BTC/quote -> asset) or 'sell' (asset -> BTC/quote).
   final String? initialSide;
 
   /// Optional composer seed: preselect this asset id/ticker (added to the picker
   /// if the hosted node did not report it).
   final String? initialAsset;
 
+  /// Optional composer seed for a SAME-CHAIN asset↔asset pure-LN swap (priority D): the COUNTER (quote)
+  /// asset the base is priced against, which takes BTC's structural place. Null = an ordinary asset↔BTC
+  /// pure-LN swap (BTC implied). When set, the swap runs on the user's OWN base + counter asset nodes.
+  final String? initialQuoteAsset;
+
   /// Optional composer seed: prefill the amount field (a display string). The unit
-  /// follows the side: BTC to spend for 'buy', asset to sell for 'sell'.
+  /// follows the side: quote to spend for 'buy', asset to sell for 'sell'.
   final String? initialAmount;
 
   @override
@@ -39,13 +45,17 @@ class _LightningSwapScreenState extends State<LightningSwapScreen> {
   final _amount = TextEditingController();
   final _ln = LightningService.instance;
 
-  String _side = 'buy'; // 'buy' = BTC -> asset; 'sell' = asset -> BTC
-  String? _asset; // asset id (hex) or LSP-reported ticker
+  String _side = 'buy'; // 'buy' = quote -> asset; 'sell' = asset -> quote
+  String? _asset; // base asset id (hex) or LSP-reported ticker
+  String? _quoteAsset; // the counter asset for a same-chain asset↔asset swap (null = BTC)
   List<String> _assets = [];
   bool _loading = true;
   bool _busy = false;
   String? _error;
   LspSwapResult? _result;
+
+  /// The counter-leg ticker: BTC for asset↔BTC, else the quote asset's ticker (asset↔asset, priority D).
+  String get _quoteTk => _quoteAsset == null ? 'BTC' : SeqAssets.labelFor(_quoteAsset!).ticker;
 
   @override
   void initState() {
@@ -87,6 +97,10 @@ class _LightningSwapScreenState extends State<LightningSwapScreen> {
     setState(() {
       _assets = assets;
       _asset = asset;
+      // SAME-CHAIN asset↔asset (priority D): the counter asset takes BTC's structural place. Pin it so the
+      // swap posts quote_asset + drives the user's OWN counter node (self-custody).
+      final seedQuote = widget.initialQuoteAsset;
+      _quoteAsset = (seedQuote != null && seedQuote.isNotEmpty && seedQuote != 'BTC') ? seedQuote : null;
       if (widget.initialSide == 'buy' || widget.initialSide == 'sell') _side = widget.initialSide!;
       _loading = false;
     });
@@ -123,26 +137,36 @@ class _LightningSwapScreenState extends State<LightningSwapScreen> {
       _result = null;
     });
     try {
-      // The device co-signs the hosted node's commitment updates over the wss
-      // link in the background during this call.
-      // TODO(device-verify): needs a device + a running hosted LSP to settle a
-      // real swap; the call + settle rendering are wired here.
-      final r = await _ln.swap(side: _side, asset: asset, amount: amt);
+      // PRE-CHECK /lnbook liquidity so we PIN the exact offer the LSP then lifts (never a relay-arbitrary
+      // one at a different price) and never enable-then-fail. A served-but-empty book is an honest "no
+      // liquidity"; an unreachable / older LSP without /lnbook returns an empty raw -> fall through to the
+      // LSP's own matching (no hard regression). The pin + request building live in [LnTakeService] (the
+      // ONE authority the composer uses too), so the wire shape can never drift between entry points.
+      final pin = await LnTakeService.pinBest(side: _side, asset: asset, quoteAsset: _quoteAsset);
+      if (pin.offer == null && pin.served) {
+        if (mounted) {
+          setState(() {
+            _busy = false;
+            _error = 'No resting Lightning offer for ${_tk(asset)}/$_quoteTk yet · switch to the on-chain rail to trade the book.';
+          });
+        }
+        return;
+      }
+      // The shared take persists the single-slot in-flight record BEFORE the POST, resolves the user's
+      // OWN node keys (self-custody — the device co-signs over the wss link during the call), and writes
+      // the settle receipt keyed by the preimage.
+      final r = await LnTakeService.take(
+        side: _side,
+        asset: asset,
+        quoteAsset: _quoteAsset,
+        offer: pin.offer,
+        typedAmount: _amount.text,
+      );
       if (!mounted) return;
       setState(() {
         _busy = false;
         _result = r;
       });
-      // Log the settled swap to the shared DEX activity log (only a real settlement
-      // carries a preimage). Keyed by preimage so it is recorded exactly once.
-      if (r.preimage.isNotEmpty) {
-        final tk = SeqAssets.labelFor(asset).ticker;
-        TradeReceipts.log(
-          id: 'ln:${r.preimage}',
-          title: r.direction == 'sold' ? 'Sold $tk for BTC (Lightning)' : 'Bought $tk with BTC (Lightning)',
-          status: 'Settled',
-        ).ignore();
-      }
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -174,10 +198,12 @@ class _LightningSwapScreenState extends State<LightningSwapScreen> {
   List<Widget> _body() {
     if (_result != null) return _settledView(_result!);
     final assetTk = _tk(_asset);
-    final amountLabel = _side == 'buy' ? 'Amount of BTC to spend' : 'Amount of $assetTk to sell';
+    final amountLabel = _side == 'buy' ? 'Amount of $_quoteTk to spend' : 'Amount of $assetTk to sell';
     return [
-      const Text(
-        'Swap Bitcoin and a Sequentia asset over Lightning. Non-custodial: your keys stay on this device.',
+      Text(
+        _quoteAsset == null
+            ? 'Swap Bitcoin and a Sequentia asset over Lightning. Non-custodial: your keys stay on this device.'
+            : 'Swap $assetTk and $_quoteTk over Lightning, bound by one secret. Non-custodial: your keys stay on this device.',
         style: AmbraText.sub,
       ),
       const SizedBox(height: 16),
