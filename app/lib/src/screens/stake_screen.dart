@@ -1,4 +1,9 @@
+import 'dart:convert';
+
+import 'package:shared_preferences/shared_preferences.dart';
+
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 
 import '../rust/api.dart' as core;
 import '../data/config.dart';
@@ -151,6 +156,8 @@ class _StakeScreenState extends State<StakeScreen> {
                 'Staked tSEQ leaves your visible balance once it confirms and is locked for '
                 '~15 days. Unbonding is not available yet; only stake what you can lock.',
               ),
+              const SizedBox(height: 26),
+              const _PoolSection(),
             ]),
           ),
           BottomActionBar(children: [
@@ -174,4 +181,403 @@ class _Kv extends StatelessWidget {
           Expanded(child: Text(v, textAlign: TextAlign.right, style: AmbraText.mono)),
         ]),
       );
+}
+
+
+/// A pool as the public board reports it.
+class _Pool {
+  _Pool(this.signer, this.weight, this.delegators, this.payout, this.reliability,
+      this.eligible, this.pendingBlocks, this.pendingMode);
+  final String signer;
+  final BigInt weight;
+  final int delegators;
+  final String payout;
+  final double? reliability;
+  final bool eligible;
+  final int? pendingBlocks;
+  final String? pendingMode;
+
+  static _Pool? parse(dynamic j) {
+    if (j is! Map) return null;
+    final signer = j['signer'];
+    if (signer is! String) return null;
+    final pending = (j['policy_pending'] is List && (j['policy_pending'] as List).isNotEmpty)
+        ? (j['policy_pending'] as List).first
+        : null;
+    return _Pool(
+      signer,
+      BigInt.tryParse('${j['weight']}') ?? BigInt.zero,
+      (j['delegators'] as num?)?.toInt() ?? 0,
+      (j['payout'] as String?) ?? '',
+      (j['reliability'] as num?)?.toDouble(),
+      j['eligible'] != false,
+      pending is Map ? (pending['blocks_away'] as num?)?.toInt() : null,
+      pending is Map ? pending['mode'] as String? : null,
+    );
+  }
+}
+
+/// Joining, moving between and leaving staking pools.
+///
+/// Delegating lends this wallet's stake WEIGHT to a pool's signer. The staked
+/// coins are never touched and the pool can never spend them: its key appears
+/// nowhere in the staking output's spending condition. Leaving is unilateral,
+/// which is why it is always one tap away here and never behind a confirmation
+/// that could fail.
+///
+/// Starting a pool is deliberately absent. Announcing a payout policy binds
+/// every block a key ever produces and needs that key online on the machine
+/// producing them, which a phone cannot promise, so it lives only in the node
+/// wallet.
+class _PoolSection extends StatefulWidget {
+  const _PoolSection();
+  @override
+  State<_PoolSection> createState() => _PoolSectionState();
+}
+
+/// Signers this device has delegated to. A HINT for finding a record again, not
+/// a source of truth: a pool with no weight and no announced policy never
+/// appears on the board, so nothing else would remember its key.
+const _hintKey = 'seq.staking.signerHints';
+
+Future<List<String>> _loadHints() async {
+  try {
+    final p = await SharedPreferences.getInstance();
+    return p.getStringList(_hintKey) ?? const [];
+  } catch (_) { return const []; }
+}
+
+Future<void> _rememberSigner(String signer) async {
+  try {
+    final p = await SharedPreferences.getInstance();
+    final seen = p.getStringList(_hintKey) ?? <String>[];
+    if (seen.contains(signer)) return;
+    await p.setStringList(_hintKey, [signer, ...seen].take(20).toList());
+  } catch (_) { /* a hint that cannot be stored simply is not used */ }
+}
+
+class _PoolSectionState extends State<_PoolSection> {
+  List<_Pool> _pools = const [];
+  BigInt _networkWeight = BigInt.zero;
+  int _blockSeconds = 60;
+  core.DelegationRecord? _deleg;
+  String? _selected;
+  bool _busy = false;
+  bool _loading = true;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  void _snack(String s) {
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(s)));
+  }
+
+  Future<void> _load() async {
+    setState(() => _loading = true);
+    // The board and the wallet's own delegation are independent: a board that is
+    // briefly away must never hide the Leave button, because leaving is the one
+    // thing that has to work at all times.
+    try {
+      final r = await http.get(Uri.parse(Backend.pools)).timeout(const Duration(seconds: 20));
+      if (r.statusCode == 200) {
+        final j = jsonDecode(r.body);
+        final list = (j['pools'] as List?) ?? const [];
+        final parsed = <_Pool>[];
+        for (final e in list) {
+          final p = _Pool.parse(e);
+          if (p != null) parsed.add(p);
+        }
+        if (mounted) {
+          setState(() {
+            _pools = parsed;
+            _networkWeight = BigInt.tryParse('${j['network_weight']}') ?? BigInt.zero;
+            _blockSeconds = (j['block_seconds'] as num?)?.toInt() ?? 60;
+          });
+        }
+      }
+    } catch (_) {
+      // keep whatever was showing; the card says when it has no list
+    }
+    try {
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m != null) {
+        final d = await core.findDelegation(
+            mnemonic: m, esploraUrl: Backend.esplora, probeSigners: await _probeSigners());
+        if (mounted) setState(() => _deleg = d);
+      }
+      if (mounted) setState(() => _error = null);
+    } catch (e) {
+      if (mounted) setState(() => _error = friendlyError(e));
+    }
+    if (mounted) setState(() => _loading = false);
+  }
+
+  /// Everything worth probing for a record of ours: the board's pools, plus the
+  /// signers this device has used before.
+  Future<List<String>> _probeSigners() async {
+    final out = <String>{...await _loadHints()};
+    for (final p in _pools) {
+      out.add(p.signer);
+    }
+    return out.toList();
+  }
+
+  _Pool? get _currentPool {
+    final d = _deleg;
+    if (d == null) return null;
+    for (final p in _pools) {
+      if (p.signer == d.signer) return p;
+    }
+    return null;
+  }
+
+  Future<void> _delegate() async {
+    final target = _selected;
+    if (target == null) return _snack('Choose a pool first');
+    final d = _deleg;
+    if (d != null && d.signer == target) return _snack('You are already in that pool');
+
+    final moving = d != null;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: AmbraColors.panel,
+        title: Text(moving ? 'Move to this pool?' : 'Delegate to this pool?', style: AmbraText.title),
+        content: Text(
+          'Your stake’s block-signing rights go to ${target.substring(0, 16)}…\n\n'
+          'Your coins do NOT move, and this pool can never spend them: only this wallet can. '
+          'You can take the rights back at any time, immediately, without the pool’s cooperation.\n\n'
+          'What you are trusting it for is the reward. Check what it has committed to paying.',
+          style: AmbraText.muted,
+        ),
+        actions: [
+          GhostButton(label: 'Cancel', onPressed: () => Navigator.pop(context, false)),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: Text(moving ? 'Move' : 'Delegate',
+                style: const TextStyle(color: AmbraColors.amber2, fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+
+    setState(() => _busy = true);
+    await _rememberSigner(target);
+    try {
+      if (moving) {
+        // Moving spends the old record and creates the new one in ONE
+        // transaction: consensus permits at most one live record per staking
+        // key, so two loose transactions could be mined in the order that
+        // invalidates a block.
+        final m = await WalletRepository.instance.readMnemonic();
+        if (m == null) throw Exception('wallet unavailable');
+        final raw = await core.buildDelegationSpend(
+            mnemonic: m, esploraUrl: Backend.esplora, rotateTo: target,
+            probeSigners: await _probeSigners());
+        final txid = await core.xchainSeqBroadcast(seqEsplora: Backend.esplora, txHex: raw);
+        _snack('Moving pool · ${txid.substring(0, 16)}…');
+      } else {
+        final txid = await authorizeBuildBroadcast((m) => core.buildDelegateTx(
+              mnemonic: m,
+              esploraUrl: Backend.esplora,
+              signerPubkey: target,
+            ));
+        _snack('Delegated · ${txid.substring(0, 16)}…');
+      }
+      await _load();
+    } catch (e) {
+      _snack('Failed: ${friendlyError(e)}');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _leave() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: AmbraColors.panel,
+        title: const Text('Leave this pool?', style: AmbraText.title),
+        content: const Text(
+          'Your stake’s weight counts for you again from the next confirmation, and the pool loses it.\n\n'
+          'This does NOT unstake: your coins were never moved by delegating and are not moved now.',
+          style: AmbraText.muted,
+        ),
+        actions: [
+          GhostButton(label: 'Cancel', onPressed: () => Navigator.pop(context, false)),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Leave',
+                style: TextStyle(color: AmbraColors.amber2, fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    setState(() => _busy = true);
+    try {
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) throw Exception('wallet unavailable');
+      final raw = await core.buildDelegationSpend(
+          mnemonic: m, esploraUrl: Backend.esplora, rotateTo: null,
+          probeSigners: await _probeSigners());
+      final txid = await core.xchainSeqBroadcast(seqEsplora: Backend.esplora, txHex: raw);
+      _snack('Left the pool · ${txid.substring(0, 16)}…');
+      await _load();
+    } catch (e) {
+      _snack('Failed: ${friendlyError(e)}');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// What a delegator most needs to see, and would otherwise have to go looking
+  /// for: a pool that has promised nothing, and a promise about to change.
+  List<String> get _warnings {
+    final d = _deleg;
+    if (d == null) return const [];
+    final out = <String>[];
+    if (!d.confirmed) {
+      out.add('This change has not confirmed yet. Until it does, your weight still counts for you.');
+    }
+    final p = _currentPool;
+    if (p == null) {
+      out.add('This pool is not on the board right now, so what it has committed to cannot be shown. '
+          'Leaving always works.');
+      return out;
+    }
+    if (p.payout.contains('no policy committed')) {
+      out.add('This pool has committed to no payout policy, so by default it keeps everything its '
+          'blocks earn. Nothing on-chain obliges it to pay you.');
+    } else if (p.payout.startsWith('pays a committed address')) {
+      out.add('This pool pays a committed address. The chain stops it redirecting the reward '
+          'silently, but does not check that address shares anything with you.');
+    }
+    final away = p.pendingBlocks;
+    if (away != null) {
+      final when = DateTime.now().add(Duration(seconds: away * _blockSeconds));
+      out.add('This pool has announced a NEW payout policy (${p.pendingMode ?? 'changed'}) binding in '
+          '$away blocks, around ${when.toLocal()}. If you do not accept it, leave before then: '
+          'leaving is immediate and needs nobody’s permission.');
+    }
+    if ((p.reliability ?? 1) < 0.5) {
+      out.add('This pool has produced far fewer blocks than its weight is owed. While that lasts, '
+          'your delegated weight is earning you nothing.');
+    }
+    return out;
+  }
+
+  String _share(BigInt w) {
+    if (_networkWeight == BigInt.zero) return '';
+    final pct = w * BigInt.from(1000) ~/ _networkWeight;
+    return ' · ${(pct.toInt() / 10).toStringAsFixed(1)}% of the network';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final d = _deleg;
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      const Text('Staking pool', style: AmbraText.title),
+      const SizedBox(height: 8),
+      const Text(
+        'A pool produces blocks on your behalf, so a stake too small to win blocks often, or a '
+        'wallet you would rather keep closed, still earns. Your coins never move and the pool can '
+        'never spend them: it is lent only the right to sign with your weight. You can take that '
+        'back at any moment, without asking anyone.',
+        style: AmbraText.muted,
+      ),
+      const SizedBox(height: 14),
+      AmbraCard(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Column(children: [
+          _Kv('Status',
+              d == null ? 'Not delegating' : (d.confirmed ? 'Delegated' : 'Waiting to confirm')),
+          if (d != null) _Kv('Pool', '${d.signer.substring(0, 16)}…'),
+          if (d != null) _Kv('In the record', '${formatAtoms(d.value.toString(), 8)} tSEQ'),
+        ]),
+      ),
+      for (final w in _warnings) ...[
+        const SizedBox(height: 10),
+        WarnCallout(w),
+      ],
+      if (_error != null) ...[
+        const SizedBox(height: 10),
+        WarnCallout('Could not read your delegation: $_error'),
+      ],
+      const SizedBox(height: 16),
+      Row(children: [
+        const Expanded(child: Text('Choose a pool', style: AmbraText.title)),
+        IconButton(
+          onPressed: _loading ? null : _load,
+          icon: const Icon(Icons.refresh, color: AmbraColors.dim, size: 20),
+          tooltip: 'Refresh',
+        ),
+      ]),
+      const Text(
+        '"Pays out" is what each pool has committed to on-chain. A pool that has committed to '
+        'nothing keeps every fee its blocks earn.',
+        style: AmbraText.muted,
+      ),
+      const SizedBox(height: 10),
+      if (_loading && _pools.isEmpty)
+        const Padding(padding: EdgeInsets.all(12), child: Text('Loading pools…', style: AmbraText.muted))
+      else if (_pools.isEmpty)
+        const Padding(
+            padding: EdgeInsets.all(12),
+            child: Text('No pools to show right now.', style: AmbraText.muted))
+      else
+        for (final p in _pools)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: InkWell(
+              onTap: () => setState(() => _selected = p.signer),
+              child: AmbraCard(
+                padding: const EdgeInsets.all(14),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Row(children: [
+                    Expanded(child: Text('${p.signer.substring(0, 16)}…', style: AmbraText.mono)),
+                    if (_selected == p.signer || (d != null && d.signer == p.signer))
+                      const Icon(Icons.check_circle, color: AmbraColors.amber2, size: 18),
+                  ]),
+                  const SizedBox(height: 6),
+                  Text(
+                    '${formatAtoms(p.weight.toString(), 8)} tSEQ${_share(p.weight)} · '
+                    '${p.delegators} delegator(s)'
+                    '${p.reliability == null ? '' : ' · produces ${p.reliability!.toStringAsFixed(2)} of its share'}',
+                    style: AmbraText.sub,
+                  ),
+                  const SizedBox(height: 4),
+                  Text(p.payout, style: AmbraText.sub),
+                  if (p.pendingBlocks != null) ...[
+                    const SizedBox(height: 4),
+                    Text('⚠ has announced a payout change binding in ${p.pendingBlocks} blocks',
+                        style: const TextStyle(color: AmbraColors.amber2, fontSize: 12)),
+                  ],
+                  if (!p.eligible) ...[
+                    const SizedBox(height: 4),
+                    const Text('below the network minimum stake, so it cannot produce yet',
+                        style: TextStyle(color: Colors.redAccent, fontSize: 12)),
+                  ],
+                ]),
+              ),
+            ),
+          ),
+      const SizedBox(height: 12),
+      PrimaryButton(
+        label: d == null ? 'Delegate to the selected pool' : 'Move to the selected pool',
+        busy: _busy,
+        icon: Icons.groups_outlined,
+        onPressed: _busy || _selected == null ? null : _delegate,
+      ),
+      if (d != null) ...[
+        const SizedBox(height: 10),
+        GhostButton(label: 'Leave this pool', onPressed: _busy ? null : _leave),
+      ],
+    ]);
+  }
 }
