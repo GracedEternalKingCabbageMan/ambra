@@ -187,8 +187,12 @@ class _Kv extends StatelessWidget {
 /// A pool as the public board reports it.
 class _Pool {
   _Pool(this.signer, this.weight, this.delegators, this.payout, this.reliability,
-      this.eligible, this.pendingBlocks, this.pendingMode);
+      this.eligible, this.pendingBlocks, this.pendingMode, this.declared);
   final String signer;
+  /// Whether this signer declared itself a pool by committing a payout policy.
+  /// The feed carries every staker so the screen can describe whichever one this
+  /// wallet is lent to; only declared ones are offered to join.
+  final bool declared;
   final BigInt weight;
   final int delegators;
   final String payout;
@@ -213,6 +217,7 @@ class _Pool {
       j['eligible'] != false,
       pending is Map ? (pending['blocks_away'] as num?)?.toInt() : null,
       pending is Map ? pending['mode'] as String? : null,
+      j['declared'] != false,
     );
   }
 }
@@ -259,6 +264,7 @@ Future<void> _rememberSigner(String signer) async {
 class _PoolSectionState extends State<_PoolSection> {
   List<_Pool> _pools = const [];
   BigInt _networkWeight = BigInt.zero;
+  int _stakers = 0;
   int _blockSeconds = 60;
   core.DelegationRecord? _deleg;
   String? _selected;
@@ -296,6 +302,7 @@ class _PoolSectionState extends State<_PoolSection> {
             _pools = parsed;
             _networkWeight = BigInt.tryParse('${j['network_weight']}') ?? BigInt.zero;
             _blockSeconds = (j['block_seconds'] as num?)?.toInt() ?? 60;
+            _stakers = (j['stakers'] as num?)?.toInt() ?? 0;
           });
         }
       }
@@ -456,7 +463,11 @@ class _PoolSectionState extends State<_PoolSection> {
           'Leaving always works.');
       return out;
     }
-    if (p.payout.contains('no policy committed')) {
+    if (!p.declared) {
+      out.add('This signer has not declared itself a pool: it has committed to no payout policy and never '
+          'asked for delegations. It keeps everything its blocks earn, and nothing on-chain obliges it to '
+          'pay you.');
+    } else if (p.payout.contains('no policy committed')) {
       out.add('This pool has committed to no payout policy, so by default it keeps everything its '
           'blocks earn. Nothing on-chain obliges it to pay you.');
     } else if (p.payout.startsWith('pays a committed address')) {
@@ -531,12 +542,15 @@ class _PoolSectionState extends State<_PoolSection> {
       const SizedBox(height: 10),
       if (_loading && _pools.isEmpty)
         const Padding(padding: EdgeInsets.all(12), child: Text('Loading pools…', style: AmbraText.muted))
-      else if (_pools.isEmpty)
-        const Padding(
-            padding: EdgeInsets.all(12),
-            child: Text('No pools to show right now.', style: AmbraText.muted))
+      else if (!_pools.any((p) => p.declared))
+        Padding(
+            padding: const EdgeInsets.all(12),
+            child: Text(
+                'No pool has declared itself yet. $_stakers signer(s) are producing blocks for themselves; '
+                'a staker becomes a pool by committing a payout policy on-chain, and appears here when it does.',
+                style: AmbraText.muted))
       else
-        for (final p in _pools)
+        for (final p in _pools.where((p) => p.declared))
           Padding(
             padding: const EdgeInsets.only(bottom: 8),
             child: InkWell(
