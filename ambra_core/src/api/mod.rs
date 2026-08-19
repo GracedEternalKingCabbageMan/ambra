@@ -1929,6 +1929,369 @@ pub fn build_stake_tx(
     })
 }
 
+
+// --- SEQUENTIA staking pools -------------------------------------------------
+//
+// Delegating lends this wallet's stake WEIGHT to a pool's signer. The staked
+// coins are never touched, and the pool can never spend them: its key appears
+// nowhere in the staking output's spending condition. What is lent lives in one
+// small bare output, the delegation record, which only this wallet's staking key
+// (m/2/0, the same key the stake is bonded to) can spend. That is why leaving is
+// unilateral, and why the wallet must be able to spend a bare script at all:
+// offering "join a pool" without "leave a pool" would be a one-way door.
+//
+// Starting a pool is deliberately NOT here. Announcing a payout policy binds
+// every block a key ever produces and needs that key online on the machine
+// producing them, which a phone cannot promise, so it lives only in the node.
+
+/// This wallet's delegation record, as found on-chain.
+#[derive(Debug, Clone)]
+pub struct DelegationRecord {
+    /// The transaction that funded the record.
+    pub txid: String,
+    /// Its output index.
+    pub vout: u32,
+    /// Its value in atoms, recoverable in full (less the fee) by leaving.
+    pub value: u64,
+    /// The pool signer this delegation currently points at (33-byte hex).
+    pub signer: String,
+    /// A delegation is not in force until its record confirms.
+    pub confirmed: bool,
+}
+
+/// The record's own value: enough to clear the dust floor and pay the fee for a
+/// handful of moves between pools, since each move takes its fee out of the
+/// record. All of it comes back when the delegation is reclaimed.
+const DELEGATION_RECORD_ATOMS: u64 = 100_000; // 0.001 tSEQ
+
+/// The fee for a record spend, in atoms. The transaction's shape is fixed (one
+/// bare input, one output, one fee output, about 230 vB), so this is that size
+/// at the wallet's default rate rather than a guess.
+const DELEGATION_SPEND_FEE_ATOMS: u64 = 500;
+
+/// The controller's private key: m/2/0, the staking key. It alone can spend a
+/// delegation record.
+fn staker_secret(mnemonic: &str) -> Result<lwk_wollet::elements::secp256k1_zkp::SecretKey> {
+    let signer = SwSigner::new(mnemonic, false).map_err(rerr)?;
+    let path = DerivationPath::from(vec![
+        ChildNumber::Normal { index: 2 },
+        ChildNumber::Normal { index: 0 },
+    ]);
+    let xprv = signer.derive_xprv(&path).map_err(rerr)?;
+    lwk_wollet::elements::secp256k1_zkp::SecretKey::from_slice(&xprv.private_key.secret_bytes())
+        .map_err(rerr)
+}
+
+/// Lend this wallet's stake weight to `signer_pubkey` (33-byte hex) by funding a
+/// delegation record. Returns an unsigned PSET for the normal review-and-sign
+/// flow ([`finalize_and_broadcast`]).
+///
+/// This creates a FIRST delegation. Moving to another pool must spend the old
+/// record and create the new one in one transaction, because consensus permits
+/// at most one live record per staking key; use [`build_delegation_spend`].
+pub fn build_delegate_tx(
+    mnemonic: String,
+    esplora_url: String,
+    signer_pubkey: String,
+    fee_rate_sat_kvb: Option<f32>,
+    fee_asset: Option<FeeAsset>,
+) -> Result<String> {
+    let signer_bytes = lwk_wollet::sequentia_delegation::delegation_pubkey_from_hex(
+        &signer_pubkey,
+        "pool signer",
+    )
+    .map_err(rerr)?;
+    let controller_hex = staker_public_key(mnemonic.clone())?;
+    let controller = lwk_wollet::sequentia_delegation::delegation_pubkey_from_hex(
+        &controller_hex,
+        "controller",
+    )
+    .map_err(rerr)?;
+    if controller == signer_bytes {
+        return Err(err(
+            "that is this wallet's own staking key; delegating to yourself is what already happens with no pool at all"
+                .to_string(),
+        ));
+    }
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let b = TxBuilder::new(crate::sequentia_testnet()).add_delegation_output(
+            &controller,
+            &signer_bytes,
+            DELEGATION_RECORD_ATOMS,
+        );
+        apply_fee_and_finish(b, wollet, fee_rate_sat_kvb, fee_asset.as_ref())
+    })
+}
+
+/// The Electrum-style scripthash this explorer indexes by: the FORWARD sha256 of
+/// the scriptPubKey.
+///
+/// Verified against the deployed esplora rather than assumed. The reversed form
+/// is the more common convention and returns an empty list here, which would
+/// look exactly like "you are not delegating" -- the worst possible wrong answer
+/// for a feature whose whole promise is that you can always leave.
+fn delegation_scripthash(script: &lwk_wollet::elements::Script) -> String {
+    use lwk_wollet::elements::hashes::{sha256, Hash};
+    tohex(sha256::Hash::hash(script.as_bytes()).as_byte_array())
+}
+
+/// Unspent outputs at a scripthash, as (txid, vout, value, height).
+fn scripthash_utxos(esplora_url: &str, scripthash: &str) -> Result<Vec<(String, u32, u64, Option<u32>)>> {
+    let url = format!("{}/scripthash/{}/utxo", esplora_url.trim_end_matches('/'), scripthash);
+    let mut req = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(rerr)?
+        .get(&url);
+    if let Some(auth) = crate::auth_header() {
+        req = req.header("Authorization", auth);
+    }
+    let resp = req.send().map_err(rerr)?;
+    if !resp.status().is_success() {
+        return Ok(Vec::new()); // an unavailable probe is not a failed lookup
+    }
+    let list: serde_json::Value = resp.json().map_err(rerr)?;
+    let mut out = Vec::new();
+    for u in list.as_array().cloned().unwrap_or_default() {
+        let txid = match u.get("txid").and_then(|v| v.as_str()) { Some(t) => t.to_string(), None => continue };
+        let vout = match u.get("vout").and_then(|v| v.as_u64()) { Some(v) => v as u32, None => continue };
+        let value = u.get("value").and_then(|v| v.as_u64()).unwrap_or(0);
+        let confirmed = u.pointer("/status/confirmed").and_then(|v| v.as_bool()).unwrap_or(false);
+        let height = if confirmed {
+            u.pointer("/status/block_height").and_then(|v| v.as_u64()).map(|h| h as u32)
+        } else {
+            None
+        };
+        out.push((txid, vout, value, height));
+    }
+    Ok(out)
+}
+
+/// This wallet's live delegation, or `None`.
+///
+/// Two ways of looking, because neither alone is enough:
+///
+///  * the wallet's own history finds the record it FUNDED, since that
+///    transaction spent this wallet's coins. It cannot find one created by a
+///    MOVE: that transaction spends only the old bare record and pays only the
+///    new one, so nothing in it belongs to this wallet and no scan will ever
+///    download it.
+///  * asking the explorer for unspent outputs at the record script, for each
+///    signer worth trying, finds it whatever created it, and survives a restore
+///    onto a device that has never seen any of this.
+///
+/// `probe_signers` is what to try in the second pass: the pool board's signers,
+/// plus any this device has used before. They are a HINT, never a source of
+/// truth -- a pool with no weight and no announced policy is not on the board at
+/// all.
+///
+/// The record is a bare script, so the wallet cannot answer either question by
+/// itself.
+pub fn find_delegation(
+    mnemonic: String,
+    esplora_url: String,
+    probe_signers: Vec<String>,
+) -> Result<Option<DelegationRecord>> {
+    let controller_hex = staker_public_key(mnemonic.clone())?;
+    let controller = lwk_wollet::sequentia_delegation::delegation_pubkey_from_hex(
+        &controller_hex,
+        "controller",
+    )
+    .map_err(rerr)?;
+
+    // (txid, vout) -> (height, record, already known unspent)
+    let mut by_outpoint: std::collections::BTreeMap<(String, u32), (Option<u32>, DelegationRecord, bool)> =
+        Default::default();
+
+    // 1) What this wallet funded itself.
+    let from_history = with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let mut found = Vec::new();
+        for wtx in wollet.transactions().map_err(rerr)? {
+            for (vout, out) in wtx.tx.output.iter().enumerate() {
+                let parsed = match lwk_wollet::parse_delegation_script(&out.script_pubkey) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                if parsed.0 != controller {
+                    continue;
+                }
+                let value = match out.value {
+                    lwk_wollet::elements::confidential::Value::Explicit(v) => v,
+                    _ => continue, // a blinded record carries no readable value
+                };
+                found.push((
+                    wtx.height,
+                    DelegationRecord {
+                        txid: wtx.txid.to_string(),
+                        vout: vout as u32,
+                        value,
+                        signer: tohex(&parsed.1),
+                        confirmed: wtx.height.is_some(),
+                    },
+                ));
+            }
+        }
+        Ok(found)
+    })?;
+    for (h, rec) in from_history {
+        by_outpoint.insert((rec.txid.clone(), rec.vout), (h, rec, false));
+    }
+
+    // 2) What is out there under our controller, whoever created it.
+    for signer_hex in probe_signers {
+        let signer = match lwk_wollet::sequentia_delegation::delegation_pubkey_from_hex(&signer_hex, "signer") {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let script = lwk_wollet::sequentia_delegation_script(&controller, &signer);
+        let utxos = match scripthash_utxos(&esplora_url, &delegation_scripthash(&script)) {
+            Ok(u) => u,
+            Err(_) => continue, // transient: the other signers still get their turn
+        };
+        for (txid, vout, value, height) in utxos {
+            let rec = DelegationRecord {
+                txid: txid.clone(),
+                vout,
+                value,
+                signer: signer_hex.clone(),
+                confirmed: height.is_some(),
+            };
+            by_outpoint.insert((txid, vout), (height, rec, true));
+        }
+    }
+
+    if by_outpoint.is_empty() {
+        return Ok(None);
+    }
+    let mut candidates: Vec<(Option<u32>, DelegationRecord, bool)> = by_outpoint.into_values().collect();
+    // Unconfirmed first (it is the most recent thing that happened), then by
+    // height descending: a move spends the old record and creates a new one, so
+    // the most recent unspent record is the one in force.
+    candidates.sort_by_key(|(h, _, _)| std::cmp::Reverse(h.unwrap_or(u32::MAX)));
+    for (_, rec, known_unspent) in candidates {
+        if known_unspent || !outpoint_is_spent(&esplora_url, &rec.txid, rec.vout)? {
+            return Ok(Some(rec));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether an outpoint has been spent, per the explorer.
+fn outpoint_is_spent(esplora_url: &str, txid: &str, vout: u32) -> Result<bool> {
+    let url = format!(
+        "{}/tx/{}/outspend/{}",
+        esplora_url.trim_end_matches('/'),
+        txid,
+        vout
+    );
+    let mut req = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(rerr)?
+        .get(&url);
+    if let Some(auth) = crate::auth_header() {
+        req = req.header("Authorization", auth);
+    }
+    let resp = req.send().map_err(rerr)?;
+    if !resp.status().is_success() {
+        return Err(err(format!(
+            "esplora /tx/{txid}/outspend/{vout} returned {}",
+            resp.status()
+        )));
+    }
+    let v: serde_json::Value = resp.json().map_err(rerr)?;
+    Ok(v.get("spent").and_then(|s| s.as_bool()).unwrap_or(false))
+}
+
+/// The chain tip, for the record spend's nLockTime (anti fee-sniping). A height
+/// in the future would make the transaction unminable, so any doubt falls back
+/// to 0, which is always valid.
+fn tip_height(esplora_url: &str) -> u32 {
+    let url = format!("{}/blocks/tip/height", esplora_url.trim_end_matches('/'));
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let mut req = client.get(&url);
+    if let Some(auth) = crate::auth_header() {
+        req = req.header("Authorization", auth);
+    }
+    match req.send().ok().and_then(|r| r.text().ok()) {
+        Some(t) => t.trim().parse().unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// Spend this wallet's delegation record: move to another pool (`rotate_to`
+/// set), or leave (`rotate_to` empty). Returns the raw signed transaction hex to
+/// broadcast with [`xchain_seq_broadcast`].
+///
+/// Moving spends the old record and creates the new one in ONE transaction.
+/// Consensus permits at most one live record per staking key, so leaving and
+/// re-joining as two loose transactions could be mined in the order that leaves
+/// two live records, which invalidates the block carrying the second.
+///
+/// Leaving takes nobody's cooperation and has no notice period: the record's
+/// signature check names this wallet's staking key and nothing else. It does NOT
+/// unstake; the staked coins were never moved by delegating.
+pub fn build_delegation_spend(
+    mnemonic: String,
+    esplora_url: String,
+    rotate_to: Option<String>,
+    probe_signers: Vec<String>,
+) -> Result<String> {
+    let rec = find_delegation(mnemonic.clone(), esplora_url.clone(), probe_signers)?
+        .ok_or_else(|| err("this wallet is not delegating".to_string()))?;
+    if !rec.confirmed {
+        return Err(err(
+            "the last delegation change has not confirmed yet; wait for it".to_string(),
+        ));
+    }
+    let rotate_bytes = match rotate_to.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => Some(
+            lwk_wollet::sequentia_delegation::delegation_pubkey_from_hex(s, "new pool signer")
+                .map_err(rerr)?,
+        ),
+        _ => None,
+    };
+    let current_signer =
+        lwk_wollet::sequentia_delegation::delegation_pubkey_from_hex(&rec.signer, "current signer")
+            .map_err(rerr)?;
+
+    // Leaving needs somewhere to put the record's coins; a fresh address of this
+    // wallet, unblinded, because the record spend creates an explicit output.
+    let reclaim_spk = if rotate_bytes.is_some() {
+        lwk_wollet::elements::Script::new()
+    } else {
+        with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+            let a = wollet.address(None).map_err(rerr)?;
+            Ok(a.address().to_unconfidential().script_pubkey())
+        })?
+    };
+
+    let plan = lwk_wollet::DelegationSpendPlan {
+        record_txid: lwk_wollet::sequentia_delegation::delegation_txid_from_hex(&rec.txid)
+            .map_err(rerr)?,
+        record_vout: rec.vout,
+        record_value: rec.value,
+        asset: *crate::sequentia_testnet().policy_asset(),
+        current_signer,
+        controller_secret: staker_secret(&mnemonic)?,
+        rotate_to: rotate_bytes,
+        reclaim_spk,
+        fee_atoms: DELEGATION_SPEND_FEE_ATOMS,
+        // Elements' default relay dust floor: refuse here rather than let the
+        // broadcast fail with something the user cannot act on.
+        dust_floor: 1_000,
+        locktime: tip_height(&esplora_url),
+    };
+    let (raw_hex, _txid) = lwk_wollet::build_delegation_spend_tx(&plan).map_err(rerr)?;
+    Ok(raw_hex)
+}
+
 // --- OpenAMP restricted-asset enclave signing --------------------------------
 //
 // OpenAMP holds a user's restricted (clawback-capable) assets in an enclave

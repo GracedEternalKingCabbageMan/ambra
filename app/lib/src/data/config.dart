@@ -30,6 +30,11 @@ class Backend {
   static String get registry => '$_origin/registry/index.minimal.json';
   static String get faucet => '$_origin/faucet';
 
+  /// The public staking pool board's feed: every signer producing blocks, the
+  /// weight lent to it, how reliably it produces, and what it has committed
+  /// on-chain to paying its delegators. Read-only, same origin as the node.
+  static String get pools => '$_origin/pools/pools.json';
+
   /// The OpenAMP restricted-asset enclave API base (`/v1/users`, `/v1/assets`,
   /// `/v1/transfers`), same-origin by default (live at `<origin>/openamp`). The
   /// wallet holds the enclave's signing key on-device (m/5/0 x-only) and the
