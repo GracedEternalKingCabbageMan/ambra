@@ -17,9 +17,13 @@ Protocol documentation lives in the node repo:
 
 ## Get the app
 
-- Download the Android APK from https://sequentiatestnet.com/download/
-  (current release: `ambra-0.10.3-android-testnet.apk`). Allow "install unknown apps",
-  then open the `.apk`.
+- Download the Android APK from https://sequentiatestnet.com/download/. That page always
+  names the current release; this file deliberately does not, because a version pinned in
+  prose goes stale the next time the publisher runs. Allow "install unknown apps", then
+  open the `.apk`.
+- Ambra also ships as a Chromium browser extension, the same dual-chain wallet built from
+  [sequentia-extension](https://github.com/GracedEternalKingCabbageMan/sequentia-extension),
+  offered on the same download page.
 - iOS is not released. The `app/ios/` scaffold exists but iOS bring-up has not happened
   (it needs a macOS + Xcode machine).
 - Free testnet funds: the in-app faucet (More tab) dispenses tSEQ and the demo assets;
@@ -252,13 +256,14 @@ Rust core through flutter_rust_bridge on the host. They need `cargo build` in
 
 | Repo | One-liner |
 |---|---|
-| [Sequentia](https://github.com/GracedEternalKingCabbageMan/Sequentia) | The Sequentia node (`elementsd` fork of Elements 23.3.3): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
+| [Sequentia](https://github.com/GracedEternalKingCabbageMan/Sequentia) | The Sequentia node (`sequentiad`, a fork of Elements 23.3.3): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
 | [SWK](https://github.com/GracedEternalKingCabbageMan/SWK) | Sequentia Wallet Kit: a fork of Blockstream LWK, providing the Rust wallet library, CLI, and WASM bindings for building Sequentia (and Bitcoin testnet4) wallets. |
 | [sequentia-web-wallet](https://github.com/GracedEternalKingCabbageMan/sequentia-web-wallet) | Proof-of-concept browser wallet built on SWK, live at https://sequentiatestnet.com/wallet. |
 | [seqdex](https://github.com/GracedEternalKingCabbageMan/seqdex) | SeqDEX: non-custodial atomic-swap DEX with a P2P order book (seqob), same-chain swaps, and cross-chain BTC↔asset swaps made safe by Bitcoin anchoring. |
 | [seqln](https://github.com/GracedEternalKingCabbageMan/seqln) | SeqLN: a Core Lightning fork that runs on Sequentia and Bitcoin from the same binary, with asset channels, any-asset payments, and pure-Lightning swaps. |
 | [openamp](https://github.com/GracedEternalKingCabbageMan/openamp) | OpenAMP: open-source restricted-asset issuance/transfer-approval service (an AMP2 equivalent) with opt-in confidentiality; zero consensus changes. |
 | [fulmen](https://github.com/GracedEternalKingCabbageMan/fulmen) | Fulmen: desktop (Electron) wallet for SeqLN with a bundled Lightning node. |
+| [sequentia-extension](https://github.com/GracedEternalKingCabbageMan/sequentia-extension) | Ambra for Chromium: the same dual-chain wallet as a browser extension, plus the `window.sequentia` API websites use to reach it. |
 
 ## Contributing
 
@@ -271,5 +276,4 @@ use only the well-known all-zero BIP39 vector).
 
 ## License
 
-MIT (declared in `ambra_core/Cargo.toml`; a top-level LICENSE file has not been added
-yet).
+MIT, in [LICENSE](LICENSE) and declared in `ambra_core/Cargo.toml`.
