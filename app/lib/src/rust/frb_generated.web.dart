@@ -87,6 +87,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool dco_decode_bool(dynamic raw);
 
   @protected
+  DelegationRecord dco_decode_box_autoadd_delegation_record(dynamic raw);
+
+  @protected
   double dco_decode_box_autoadd_f_32(dynamic raw);
 
   @protected
@@ -121,6 +124,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   CovenantPrepared dco_decode_covenant_prepared(dynamic raw);
+
+  @protected
+  DelegationRecord dco_decode_delegation_record(dynamic raw);
 
   @protected
   EnclaveDecodedInput dco_decode_enclave_decoded_input(dynamic raw);
@@ -186,6 +192,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   String? dco_decode_opt_String(dynamic raw);
+
+  @protected
+  DelegationRecord? dco_decode_opt_box_autoadd_delegation_record(dynamic raw);
 
   @protected
   double? dco_decode_opt_box_autoadd_f_32(dynamic raw);
@@ -296,6 +305,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
+  DelegationRecord sse_decode_box_autoadd_delegation_record(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   double sse_decode_box_autoadd_f_32(SseDeserializer deserializer);
 
   @protected
@@ -334,6 +348,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   CovenantPrepared sse_decode_covenant_prepared(SseDeserializer deserializer);
+
+  @protected
+  DelegationRecord sse_decode_delegation_record(SseDeserializer deserializer);
 
   @protected
   EnclaveDecodedInput sse_decode_enclave_decoded_input(
@@ -411,6 +428,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
+
+  @protected
+  DelegationRecord? sse_decode_opt_box_autoadd_delegation_record(
+    SseDeserializer deserializer,
+  );
 
   @protected
   double? sse_decode_opt_box_autoadd_f_32(SseDeserializer deserializer);
@@ -538,6 +560,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_bool(bool self, SseSerializer serializer);
 
   @protected
+  void sse_encode_box_autoadd_delegation_record(
+    DelegationRecord self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_f_32(double self, SseSerializer serializer);
 
   @protected
@@ -582,6 +610,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_covenant_prepared(
     CovenantPrepared self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_delegation_record(
+    DelegationRecord self,
     SseSerializer serializer,
   );
 
@@ -683,6 +717,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_box_autoadd_delegation_record(
+    DelegationRecord? self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_opt_box_autoadd_f_32(double? self, SseSerializer serializer);

@@ -6,7 +6,8 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `btc_params`, `clear_scan_marks`, `ct_str`, `ct_u64`, `derive_maker_payout`, `derive_maker_secret`, `enclave_prevout_to_txout`, `enclave_prevouts_to_txouts`, `enclave_sighash_inner`, `err`, `esplora_client`, `fetch_utxo`, `hexbytes`, `last_scan`, `maker_identity_priv`, `mark_scanned`, `openamp_keypair`, `order_from_terms`, `parse_openamp_tx`, `priv32`, `rerr`, `scan_into`, `scanned_recently`, `select_taker_inputs`, `seq_addr_params`, `tohex`, `with_synced_wollet`, `wollet_cache`
+// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `btc_params`, `clear_scan_marks`, `ct_str`, `ct_u64`, `delegation_scripthash`, `derive_maker_payout`, `derive_maker_secret`, `enclave_prevout_to_txout`, `enclave_prevouts_to_txouts`, `enclave_sighash_inner`, `err`, `esplora_client`, `fetch_utxo`, `hexbytes`, `last_scan`, `maker_identity_priv`, `mark_scanned`, `openamp_keypair`, `order_from_terms`, `outpoint_is_spent`, `parse_openamp_tx`, `priv32`, `rerr`, `scan_into`, `scanned_recently`, `scripthash_utxos`, `select_taker_inputs`, `seq_addr_params`, `staker_secret`, `tip_height`, `tohex`, `with_synced_wollet`, `wollet_cache`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
 String networkName() => RustLib.instance.api.crateApiNetworkName();
@@ -759,6 +760,81 @@ Future<String> buildStakeTx({
   feeAsset: feeAsset,
 );
 
+/// Lend this wallet's stake weight to `signer_pubkey` (33-byte hex) by funding a
+/// delegation record. Returns an unsigned PSET for the normal review-and-sign
+/// flow ([`finalize_and_broadcast`]).
+///
+/// This creates a FIRST delegation. Moving to another pool must spend the old
+/// record and create the new one in one transaction, because consensus permits
+/// at most one live record per staking key; use [`build_delegation_spend`].
+Future<String> buildDelegateTx({
+  required String mnemonic,
+  required String esploraUrl,
+  required String signerPubkey,
+  double? feeRateSatKvb,
+  FeeAsset? feeAsset,
+}) => RustLib.instance.api.crateApiBuildDelegateTx(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  signerPubkey: signerPubkey,
+  feeRateSatKvb: feeRateSatKvb,
+  feeAsset: feeAsset,
+);
+
+/// This wallet's live delegation, or `None`.
+///
+/// Two ways of looking, because neither alone is enough:
+///
+///  * the wallet's own history finds the record it FUNDED, since that
+///    transaction spent this wallet's coins. It cannot find one created by a
+///    MOVE: that transaction spends only the old bare record and pays only the
+///    new one, so nothing in it belongs to this wallet and no scan will ever
+///    download it.
+///  * asking the explorer for unspent outputs at the record script, for each
+///    signer worth trying, finds it whatever created it, and survives a restore
+///    onto a device that has never seen any of this.
+///
+/// `probe_signers` is what to try in the second pass: the pool board's signers,
+/// plus any this device has used before. They are a HINT, never a source of
+/// truth -- a pool with no weight and no announced policy is not on the board at
+/// all.
+///
+/// The record is a bare script, so the wallet cannot answer either question by
+/// itself.
+Future<DelegationRecord?> findDelegation({
+  required String mnemonic,
+  required String esploraUrl,
+  required List<String> probeSigners,
+}) => RustLib.instance.api.crateApiFindDelegation(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  probeSigners: probeSigners,
+);
+
+/// Spend this wallet's delegation record: move to another pool (`rotate_to`
+/// set), or leave (`rotate_to` empty). Returns the raw signed transaction hex to
+/// broadcast with [`xchain_seq_broadcast`].
+///
+/// Moving spends the old record and creates the new one in ONE transaction.
+/// Consensus permits at most one live record per staking key, so leaving and
+/// re-joining as two loose transactions could be mined in the order that leaves
+/// two live records, which invalidates the block carrying the second.
+///
+/// Leaving takes nobody's cooperation and has no notice period: the record's
+/// signature check names this wallet's staking key and nothing else. It does NOT
+/// unstake; the staked coins were never moved by delegating.
+Future<String> buildDelegationSpend({
+  required String mnemonic,
+  required String esploraUrl,
+  String? rotateTo,
+  required List<String> probeSigners,
+}) => RustLib.instance.api.crateApiBuildDelegationSpend(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+  rotateTo: rotateTo,
+  probeSigners: probeSigners,
+);
+
 /// The 32-byte x-only public key (BIP340) at m/5/0, as 64-char hex — the key an
 /// OpenAMP enclave user registers under (`POST /v1/users {pubkeys:[..]}`).
 String openampXonlyPubkey({required String mnemonic}) =>
@@ -1204,6 +1280,51 @@ class CovenantPrepared {
           expiryLocktime == other.expiryLocktime &&
           makerIndex == other.makerIndex &&
           makerPubkey == other.makerPubkey;
+}
+
+/// This wallet's delegation record, as found on-chain.
+class DelegationRecord {
+  /// The transaction that funded the record.
+  final String txid;
+
+  /// Its output index.
+  final int vout;
+
+  /// Its value in atoms, recoverable in full (less the fee) by leaving.
+  final BigInt value;
+
+  /// The pool signer this delegation currently points at (33-byte hex).
+  final String signer;
+
+  /// A delegation is not in force until its record confirms.
+  final bool confirmed;
+
+  const DelegationRecord({
+    required this.txid,
+    required this.vout,
+    required this.value,
+    required this.signer,
+    required this.confirmed,
+  });
+
+  @override
+  int get hashCode =>
+      txid.hashCode ^
+      vout.hashCode ^
+      value.hashCode ^
+      signer.hashCode ^
+      confirmed.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is DelegationRecord &&
+          runtimeType == other.runtimeType &&
+          txid == other.txid &&
+          vout == other.vout &&
+          value == other.value &&
+          signer == other.signer &&
+          confirmed == other.confirmed;
 }
 
 /// One decoded input of a candidate enclave spend.
