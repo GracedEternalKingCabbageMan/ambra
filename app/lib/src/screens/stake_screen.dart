@@ -473,6 +473,10 @@ class _PoolSectionState extends State<_PoolSection> {
     } else if (p.payout.startsWith('pays a committed address')) {
       out.add('This pool pays a committed address. The chain stops it redirecting the reward '
           'silently, but does not check that address shares anything with you.');
+    } else if (p.payout.startsWith('pays every delegator')) {
+      out.add('This pool shares rewards proportionally: they pool up on-chain and anyone can '
+          'trigger the payout. Leaving forfeits your unclaimed share, so claim your rewards '
+          'before you leave.');
     }
     final away = p.pendingBlocks;
     if (away != null) {
