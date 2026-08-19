@@ -316,8 +316,13 @@ class _PoolSectionState extends State<_PoolSection> {
     if (mounted) setState(() => _loading = false);
   }
 
-  /// Everything worth probing for a record of ours: the board's pools, plus the
-  /// signers this device has used before.
+  /// Everything worth probing for a record of ours, in the ORDER it should be
+  /// tried: the signers this device has used, then the rest of the board.
+  ///
+  /// The order is part of the contract. find_delegation stops as soon as a probe
+  /// finds something, so putting the one or two keys this device actually used
+  /// first turns the ordinary case into a single request instead of one per
+  /// pool. A Dart Set preserves insertion order, which is what keeps that true.
   Future<List<String>> _probeSigners() async {
     final out = <String>{...await _loadHints()};
     for (final p in _pools) {

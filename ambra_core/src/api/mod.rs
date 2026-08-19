@@ -2138,7 +2138,21 @@ pub fn find_delegation(
     }
 
     // 2) What is out there under our controller, whoever created it.
+    //
+    //    `probe_signers` is tried in ORDER and the sweep stops as soon as
+    //    anything is found, so the caller can put the handful of signers this
+    //    device has actually used first. The ordinary case then costs one
+    //    request instead of one per pool on every refresh, while a seed restored
+    //    onto a device that remembers nothing still sweeps the whole board.
+    let mut probed = 0usize;
     for signer_hex in probe_signers {
+        // Stop on what an EARLIER PROBE found, never on the history pass:
+        // history finds the record this wallet funded, which a later move has
+        // spent, and skipping the probe would report "not delegating" for a
+        // delegation that is very much alive.
+        if probed > 0 {
+            break;
+        }
         let signer = match lwk_wollet::sequentia_delegation::delegation_pubkey_from_hex(&signer_hex, "signer") {
             Ok(s) => s,
             Err(_) => continue,
@@ -2157,6 +2171,7 @@ pub fn find_delegation(
                 confirmed: height.is_some(),
             };
             by_outpoint.insert((txid, vout), (height, rec, true));
+            probed += 1;
         }
     }
 
