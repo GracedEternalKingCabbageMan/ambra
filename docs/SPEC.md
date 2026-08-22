@@ -22,7 +22,7 @@ and enabling/disabling the lock itself requires authentication.
 
 Bitcoin anchoring is supreme: Sequentia reorganizes whenever Bitcoin reorganizes
 away a block's anchor, overriding checkpoints and immediate finality. A transaction
-is settled when it lands in a certified block (~30s slot), subject always to a
+is settled when it lands in a certified block (~60 s slot), subject always to a
 Bitcoin reorg of its anchor. There is no confirmation-count bar and no anchor-depth
 gating in the general UI: a light wallet cannot watch Bitcoin itself and mirrors
 backend chain state; if a sync reports a (rare, Bitcoin-reorg-driven) disconnect,
@@ -50,7 +50,7 @@ same swap, swap identity, the seqFundTxid guard (a recorded fund txid is never
 abandonable), an explicit human warning, and — carrying the entire staleness AND
 anchor-reorg margin — a CLOCK-FREE height proof. The height proof trusts an empty
 on-chain HTLC scan only when the backend's current tip HEIGHT has advanced at least
-~240 Sequentia blocks (≈2h at 30s slots) past the height recorded at broadcast.
+~240 Sequentia blocks (≈4 h at 60-s slots) past the height recorded at broadcast.
 That single depth is deliberately deep because it is the SOLE margin: it is well
 past any funding-confirmation depth AND past any realistic Bitcoin-anchored reorg
 depth (Sequentia reorgs whenever Bitcoin reorgs, so heights are monotonic only
@@ -178,15 +178,12 @@ Generated bindings live in `app/lib/src/rust/`; the Rust source of truth is
 Single wallet (mirrors the web wallet); opt-in device biometric/passcode lock;
 foreground + on-resume + pull-to-refresh sync (no push); testnet/faucet cues kept;
 reference currency defaults to USD. Backend defaults to the public testnet node
-`http://159.195.15.140` and is user-configurable (More > Node, optional HTTP auth);
+`https://sequentiatestnet.com` and is user-configurable (More > Node, optional HTTP auth);
 endpoints: `/api`, `/testnet4/api`, `/dex`, `/feerates`, `/prices`,
 `/registry/index.minimal.json`, `/faucet`, `/openamp`, `/lsp`.
 
 ## Roadmap (not yet implemented)
 
 - Unstaking/unbonding flow (staking is one-way in the app today).
-- A live hosted LSP deployment; the Lightning rail ships dormant until
-  `Backend.lnWsUrl`/`lnHostPubkey` point at one.
-- iOS bring-up (scaffold exists; needs a macOS/Xcode machine) and release signing
-  for Android (currently debug-signed).
+- iOS bring-up (scaffold exists; needs a macOS/Xcode machine).
 - Push/background sync.
