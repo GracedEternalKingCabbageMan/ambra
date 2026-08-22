@@ -17,7 +17,7 @@ mnemonic, and the plain-HTTP sidecar services.
 |---|---|
 | `main.dart` | Startup (core init, data dir, node/prices/registry load) + root routing: boot, onboarding, lock, shell. |
 | `src/screens/shell.dart` | The tab shell: Balance, Send, Receive, Swap, History, More (plus the Balance/Receive/More tab bodies). |
-| `src/screens/` | The remaining screens: onboarding, lock, send, scan (QR), history, rescue (RBF/CPFP), swap, xchain_swap, lightning_swap, assets, stake, faucet, node. |
+| `src/screens/` | The remaining screens: onboarding, recover (on-screen-keyboard phrase import), lock, send, scan (QR), history, rescue (RBF/CPFP), swap, xchain_swap, lightning_swap, submarine_swap, subasset_buy/sell, cross_lift, cross_walk, my_orders, sign (OpenAMP tagged signing), assets, stake, faucet, node. |
 | `src/data/` | Services and state: `wallet_repository.dart` (mnemonic in secure storage + opt-in app lock), `config.dart` (backend endpoints + asset labels), `wallet_cache.dart` (instant-launch cache), price/registry/faucet clients, SeqDEX + cross-chain swap clients, OpenAMP service, LSP client + `seqln_signer.dart` (on-device Lightning signer transport). |
 | `src/rust/` | Generated flutter_rust_bridge bindings (do not edit; regenerate with `flutter_rust_bridge_codegen generate`). |
 | `src/theme/`, `src/widgets/` | Design tokens and the shared component set from the spec. |
@@ -31,5 +31,6 @@ flutter test test/lsp_client_test.dart   # pure-Dart test, runs anywhere
 ```
 
 The other two tests (`widget_test.dart`, `seqln_device_key_test.dart`) load the
-host-built `ambra_core` cdylib via a hardcoded absolute path; build it with `cargo build`
-in `../ambra_core` and adjust `_hostLib` to your checkout before running them.
+host-built `ambra_core` cdylib from `$AMBRA_CORE_LIB`, defaulting to
+`../ambra_core/target/debug/libambra_core.so`; build it with `cargo build` in
+`../ambra_core` first, or set the variable to your own build.

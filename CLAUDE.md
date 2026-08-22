@@ -119,17 +119,13 @@ debug to release signing requires one uninstall, after which updates apply clean
   change and its reasoning are recorded, not because anyone is waiting to review it. There is
   no review process. If you are ever told to leave one specific PR open, that applies to that
   PR only and never becomes the default.
-- The remote default branch is `main`, but development has been happening on `terminal-rebuild`
-  (24 commits ahead of `main`, which still sits at 0.13.7). Check `git log` on both before
-  choosing a base; the README's "development happens on `main`" is out of date.
+- The remote default branch is `main` and all development lands there. `terminal-rebuild`
+  is fully merged into `main` and is no longer a base for anything.
 
 ## README drift
 
-The top-level `README.md` is useful but has known-stale claims: it says release builds are
-signed with the debug key (false since `a85a9e9`), names an old APK as the current release,
-says a LICENSE file has not been added (it exists), says the host tests use a hardcoded
-absolute path (they use `$AMBRA_CORE_LIB`), and documents only one Android ABI. Verify against
-the code before repeating anything from it.
+The top-level `README.md` documents only the `arm64-v8a` cross-compile, while the tree
+carries three ABIs (see above). Verify against the code before repeating anything from it.
 
 <!-- BEGIN SHARED AGENT CONVENTIONS: identical in every Sequentia repo. Change it in all of them together. -->
 ## Working with git and GitHub here
