@@ -44,6 +44,12 @@ that implements it).
   app is backgrounded; revealing the recovery phrase always requires authentication.
 - Reveal recovery phrase and remove wallet (deletes the phrase from the device), both
   from the More tab.
+- Keylogger-immune phrase import: the import path uses an on-screen keyboard with BIP39
+  autocomplete, so no system IME ever sees the words; free-text paste remains as a
+  fallback (`app/lib/src/screens/recover_screen.dart`).
+- OpenAMP tagged signing: sign a wallet-link/login challenge or a document hash for an
+  OpenAMP-integrated site, opened from an `oamp-sign` deep link
+  (`app/lib/src/screens/sign_screen.dart`).
 
 **Balance (dual-chain, no privileged asset)**
 - The headline is one **total balance across all held assets, valued in a user-chosen
@@ -95,11 +101,28 @@ that implements it).
   (`app/lib/src/screens/xchain_swap_screen.dart`). The preimage reveal is hard-gated on
   verifying the Sequentia leg's Bitcoin anchor; in-flight swaps persist across restarts
   and a BTC refund path opens after the timeout.
-- **Instant (Lightning)**: a pure-Lightning BTC<->asset rail through a hosted SeqLN LSP,
-  non-custodial via an on-device signer (below). The entry point appears only when a
-  build is configured with an LSP endpoint (`Backend.lnWsUrl` / `lnHostPubkey` in
-  `app/lib/src/data/config.dart`); in the released APK these are empty, so the rail is
-  dormant and the wallet behaves as an on-chain-only build.
+- **Instant (Lightning)**: a pure-Lightning BTC<->asset rail through the public hosted
+  SeqLN LSP, non-custodial via an on-device signer
+  (`app/lib/src/screens/lightning_swap_screen.dart`). It is on by default: the released
+  APK points at `wss://sequentiatestnet.com/lsp-ws-asset` and `/lsp-ws-btc` with pinned
+  host keys (`Backend` in `app/lib/src/data/config.dart`). Pointing the wallet at a
+  custom node clears these, because a custom node has no hosted LSP, and the rail goes
+  dark until you return to the default.
+- **Peer-to-peer submarine swap**: a rail crossing on the BTC leg settled directly with
+  an interactive maker, no LSP in the value path. A buy pays Bitcoin over Lightning and
+  receives the asset in one on-chain HTLC bound to the same secret; a sell funds the
+  asset HTLC (`app/lib/src/screens/submarine_swap_screen.dart`).
+- **Sub-asset rails**: buy or sell a Sequentia asset over Lightning against Bitcoin on
+  the testnet4 chain, served by the LSP (`app/lib/src/screens/subasset_buy_screen.dart`,
+  `subasset_sell_screen.dart`).
+- **Cross-market lift and walk**: buy an asset with Bitcoin against one resting cross
+  offer at a live maker quote fetched over the relay courier
+  (`app/lib/src/screens/cross_lift_screen.dart`), or sweep several resting offers best
+  price first, one leg at a time through the same path
+  (`app/lib/src/screens/cross_walk_screen.dart`). The BTC is refundable after the
+  timeout and the secret reveals only on an anchor-safe asset leg.
+- **My orders**: the maker's own resting covenant orders (funded on-chain, posted to the
+  relay) with a reclaim path (`app/lib/src/screens/my_orders_screen.dart`).
 
 **Assets, staking, faucet, node**
 - Issue a new asset, reissue (mint more of) an asset you hold the reissuance token for,
@@ -115,10 +138,6 @@ that implements it).
   auth) instead of the public testnet default (`app/lib/src/screens/node_screen.dart`).
 
 **Experimental / in progress**
-- The Lightning rail (on-device signer + hosted LSP) is fully wired in code, including
-  a byte-for-byte conformance test of the signer against libhsmd
-  (`ambra_core/tests/signer_conformance.rs`), but no public hosted LSP is deployed, so
-  it is not reachable in the released build.
 - iOS: scaffold only, never built or tested.
 
 ## Consensus rules the UX must respect
@@ -148,10 +167,11 @@ change:
 | `<origin>/registry/index.minimal.json` | Asset registry labels |
 | `<origin>/faucet` | Testnet faucet |
 | `<origin>/openamp` | OpenAMP restricted-asset API |
-| `<origin>/lsp` | Hosted SeqLN LSP HTTP API (dormant unless configured) |
+| `<origin>/lsp` | Hosted SeqLN LSP HTTP API |
 
-The default origin is `http://159.195.15.140`, the same host that serves
-https://sequentiatestnet.com.
+The default origin is `https://sequentiatestnet.com`. The Lightning rail's websocket
+endpoints and pinned host keys are separate constants in the same file and are enabled
+only while the default origin is in use.
 
 ## Architecture
 
@@ -214,8 +234,10 @@ flutter build apk --release        # or: flutter run (device attached)
 ```
 
 `app/android/app/src/main/jniLibs/` is gitignored; the `.so` is rebuilt on demand by
-step 3. Release builds are currently signed with the debug key (see the TODO in
-`app/android/app/build.gradle.kts`).
+step 3. Release builds are signed with the Ambra release key when
+`app/android/key.properties` (gitignored) is present; without it Gradle silently falls
+back to the debug key, producing an APK that will not install over the published one
+(`app/android/app/build.gradle.kts`).
 
 If you change the `ambra_core::api` surface, regenerate the bridge from `app/`
 (config in `app/flutter_rust_bridge.yaml`):
@@ -247,10 +269,9 @@ flutter test                                  # all tests; see the caveat below
 ```
 
 Caveat: `test/widget_test.dart` and `test/seqln_device_key_test.dart` drive the real
-Rust core through flutter_rust_bridge on the host. They need `cargo build` in
-`ambra_core/` first, and they currently load the cdylib from a hardcoded absolute path
-(`const _hostLib` at the top of each file), which you must point at your own checkout's
-`ambra_core/target/debug/libambra_core.so`.
+Rust core through flutter_rust_bridge on the host. They resolve the cdylib from
+`$AMBRA_CORE_LIB`, defaulting to `../ambra_core/target/debug/libambra_core.so`
+(relative to `app/`), so run `cargo build` in `ambra_core/` first or set the variable.
 
 ## Sequentia ecosystem
 
@@ -259,7 +280,7 @@ Rust core through flutter_rust_bridge on the host. They need `cargo build` in
 | [Sequentia](https://github.com/GracedEternalKingCabbageMan/Sequentia) | The Sequentia node (`sequentiad`, a fork of Elements 23.3.3): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
 | [SWK](https://github.com/GracedEternalKingCabbageMan/SWK) | Sequentia Wallet Kit: a fork of Blockstream LWK, providing the Rust wallet library, CLI, and WASM bindings for building Sequentia (and Bitcoin testnet4) wallets. |
 | [sequentia-web-wallet](https://github.com/GracedEternalKingCabbageMan/sequentia-web-wallet) | Proof-of-concept browser wallet built on SWK, live at https://sequentiatestnet.com/wallet. |
-| [seqdex](https://github.com/GracedEternalKingCabbageMan/seqdex) | SeqDEX: non-custodial atomic-swap DEX with a P2P order book (seqob), same-chain swaps, and cross-chain BTC↔asset swaps made safe by Bitcoin anchoring. |
+| [seqdex](https://github.com/GracedEternalKingCabbageMan/seqdex) | SeqDEX: non-custodial atomic-swap DEX with an on-chain covenant order book (SeqOB) served over a relay, same-chain swaps, and cross-chain BTC↔asset swaps made safe by Bitcoin anchoring. |
 | [seqln](https://github.com/GracedEternalKingCabbageMan/seqln) | SeqLN: a Core Lightning fork that runs on Sequentia and Bitcoin from the same binary, with asset channels, any-asset payments, and pure-Lightning swaps. |
 | [openamp](https://github.com/GracedEternalKingCabbageMan/openamp) | OpenAMP: open-source restricted-asset issuance/transfer-approval service (an AMP2 equivalent) with opt-in confidentiality; zero consensus changes. |
 | [fulmen](https://github.com/GracedEternalKingCabbageMan/fulmen) | Fulmen: desktop (Electron) wallet for SeqLN with a bundled Lightning node. |
