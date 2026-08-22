@@ -95,8 +95,8 @@ the build number every release, `1.0.0` at mainnet). Release commits are titled
 `ambra 0.X.Y: <summary>` and touch `app/pubspec.yaml` alone.
 
 `kAppVersion` in `app/lib/src/data/config.dart` is a *separate* constant, and it is what the UI
-footer renders (`app/lib/src/screens/shell.dart`). Bump both. It has drifted before, was fixed
-in `1e839c9`, and has drifted again.
+footer renders (`app/lib/src/screens/shell.dart`). Bump both in the same commit. It matches
+pubspec now; it has drifted twice before (fixed in `1e839c9` and again at 0.16.4).
 
 ## Release signing
 
