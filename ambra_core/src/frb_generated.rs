@@ -39,7 +39,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -269018628;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1358840031;
 
 // Section: executor
 
@@ -2667,6 +2667,39 @@ fn wire__crate__api__seqob_verify_offer_impl(
         },
     )
 }
+fn wire__crate__api__rewards__sequentia_coinbase_maturity_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "sequentia_coinbase_maturity",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, ()>((move || {
+                    let output_ok =
+                        Result::<_, ()>::Ok(crate::api::rewards::sequentia_coinbase_maturity())?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 fn wire__crate__api__sequentia_genesis_hash_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -4581,31 +4614,37 @@ fn pde_ffi_dispatcher_primary_impl(
         62 => wire__crate__api__seqob_sign_cancel_impl(port, ptr, rust_vec_len, data_len),
         63 => wire__crate__api__seqob_sign_offer_impl(port, ptr, rust_vec_len, data_len),
         64 => wire__crate__api__seqob_verify_offer_impl(port, ptr, rust_vec_len, data_len),
-        68 => wire__crate__api__sign_pset_impl(port, ptr, rust_vec_len, data_len),
-        69 => wire__crate__api__staker_public_key_impl(port, ptr, rust_vec_len, data_len),
-        70 => wire__crate__api__rewards__staking_key_facts_impl(port, ptr, rust_vec_len, data_len),
-        71 => wire__crate__api__sync_wallet_impl(port, ptr, rust_vec_len, data_len),
-        72 => wire__crate__api__rewards__tip_height_impl(port, ptr, rust_vec_len, data_len),
-        73 => wire__crate__api__validate_address_impl(port, ptr, rust_vec_len, data_len),
-        74 => wire__crate__api__validate_mnemonic_impl(port, ptr, rust_vec_len, data_len),
-        75 => wire__crate__api__wallet_transactions_impl(port, ptr, rust_vec_len, data_len),
-        76 => wire__crate__api__rewards__wallet_tx_facts_impl(port, ptr, rust_vec_len, data_len),
-        77 => wire__crate__api__xchain_btc_claim_impl(port, ptr, rust_vec_len, data_len),
-        78 => wire__crate__api__xchain_btc_claim_pubkey_impl(port, ptr, rust_vec_len, data_len),
-        79 => wire__crate__api__xchain_btc_htlc_impl(port, ptr, rust_vec_len, data_len),
-        80 => wire__crate__api__xchain_btc_refund_impl(port, ptr, rust_vec_len, data_len),
-        81 => wire__crate__api__xchain_btc_refund_pubkey_impl(port, ptr, rust_vec_len, data_len),
-        82 => wire__crate__api__xchain_find_btc_funding_impl(port, ptr, rust_vec_len, data_len),
-        83 => wire__crate__api__xchain_new_secret_impl(port, ptr, rust_vec_len, data_len),
-        84 => wire__crate__api__xchain_read_seq_preimage_impl(port, ptr, rust_vec_len, data_len),
-        85 => wire__crate__api__xchain_seq_broadcast_impl(port, ptr, rust_vec_len, data_len),
-        86 => wire__crate__api__xchain_seq_claim_impl(port, ptr, rust_vec_len, data_len),
-        87 => wire__crate__api__xchain_seq_claim_pubkey_impl(port, ptr, rust_vec_len, data_len),
-        88 => wire__crate__api__xchain_seq_htlc_forward_impl(port, ptr, rust_vec_len, data_len),
-        89 => wire__crate__api__xchain_seq_htlc_reverse_impl(port, ptr, rust_vec_len, data_len),
-        90 => wire__crate__api__xchain_seq_redeem_script_impl(port, ptr, rust_vec_len, data_len),
-        91 => wire__crate__api__xchain_seq_refund_impl(port, ptr, rust_vec_len, data_len),
-        92 => wire__crate__api__xchain_verify_seq_leg_safe_impl(port, ptr, rust_vec_len, data_len),
+        65 => wire__crate__api__rewards__sequentia_coinbase_maturity_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
+        69 => wire__crate__api__sign_pset_impl(port, ptr, rust_vec_len, data_len),
+        70 => wire__crate__api__staker_public_key_impl(port, ptr, rust_vec_len, data_len),
+        71 => wire__crate__api__rewards__staking_key_facts_impl(port, ptr, rust_vec_len, data_len),
+        72 => wire__crate__api__sync_wallet_impl(port, ptr, rust_vec_len, data_len),
+        73 => wire__crate__api__rewards__tip_height_impl(port, ptr, rust_vec_len, data_len),
+        74 => wire__crate__api__validate_address_impl(port, ptr, rust_vec_len, data_len),
+        75 => wire__crate__api__validate_mnemonic_impl(port, ptr, rust_vec_len, data_len),
+        76 => wire__crate__api__wallet_transactions_impl(port, ptr, rust_vec_len, data_len),
+        77 => wire__crate__api__rewards__wallet_tx_facts_impl(port, ptr, rust_vec_len, data_len),
+        78 => wire__crate__api__xchain_btc_claim_impl(port, ptr, rust_vec_len, data_len),
+        79 => wire__crate__api__xchain_btc_claim_pubkey_impl(port, ptr, rust_vec_len, data_len),
+        80 => wire__crate__api__xchain_btc_htlc_impl(port, ptr, rust_vec_len, data_len),
+        81 => wire__crate__api__xchain_btc_refund_impl(port, ptr, rust_vec_len, data_len),
+        82 => wire__crate__api__xchain_btc_refund_pubkey_impl(port, ptr, rust_vec_len, data_len),
+        83 => wire__crate__api__xchain_find_btc_funding_impl(port, ptr, rust_vec_len, data_len),
+        84 => wire__crate__api__xchain_new_secret_impl(port, ptr, rust_vec_len, data_len),
+        85 => wire__crate__api__xchain_read_seq_preimage_impl(port, ptr, rust_vec_len, data_len),
+        86 => wire__crate__api__xchain_seq_broadcast_impl(port, ptr, rust_vec_len, data_len),
+        87 => wire__crate__api__xchain_seq_claim_impl(port, ptr, rust_vec_len, data_len),
+        88 => wire__crate__api__xchain_seq_claim_pubkey_impl(port, ptr, rust_vec_len, data_len),
+        89 => wire__crate__api__xchain_seq_htlc_forward_impl(port, ptr, rust_vec_len, data_len),
+        90 => wire__crate__api__xchain_seq_htlc_reverse_impl(port, ptr, rust_vec_len, data_len),
+        91 => wire__crate__api__xchain_seq_redeem_script_impl(port, ptr, rust_vec_len, data_len),
+        92 => wire__crate__api__xchain_seq_refund_impl(port, ptr, rust_vec_len, data_len),
+        93 => wire__crate__api__xchain_verify_seq_leg_safe_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -4648,9 +4687,9 @@ fn pde_ffi_dispatcher_sync_impl(
             rust_vec_len,
             data_len,
         ),
-        65 => wire__crate__api__sequentia_genesis_hash_impl(ptr, rust_vec_len, data_len),
-        66 => wire__crate__api__set_auth_header_impl(ptr, rust_vec_len, data_len),
-        67 => wire__crate__api__set_data_dir_impl(ptr, rust_vec_len, data_len),
+        66 => wire__crate__api__sequentia_genesis_hash_impl(ptr, rust_vec_len, data_len),
+        67 => wire__crate__api__set_auth_header_impl(ptr, rust_vec_len, data_len),
+        68 => wire__crate__api__set_data_dir_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }

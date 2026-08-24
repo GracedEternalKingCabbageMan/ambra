@@ -22,6 +22,7 @@ use lwk_wollet::elements::{AssetId, OutPoint, Script, Txid};
 use lwk_wollet::staking_rewards::{
     attribute_rewards, batches, decide, AutoConvertSettings, ConvertTarget, Decision, OwnedOutput,
     Quote, RewardBatch, RewardSource, SignerRelation, StakingReward, TxFacts,
+    SEQUENTIA_COINBASE_MATURITY,
 };
 use serde::{Deserialize, Serialize};
 
@@ -396,6 +397,17 @@ pub fn reward_slice_for_whole_htlc(offer_atoms: u64, batch_atoms: u64) -> u64 {
     offer_atoms.min(batch_atoms)
 }
 
+
+/// Sequentia's coinbase maturity, in blocks -- 1,000, not Bitcoin's 100.
+///
+/// The protection is a wall-clock one and this chain runs at 60 seconds, so 100
+/// blocks here would buy a tenth of what Bitcoin's 100 buys. Exposed so the Dart
+/// side never has to hard-code it, and cannot hard-code it wrong: a wallet using
+/// 100 calls a reward spendable 900 blocks early and then builds a transaction
+/// the chain rejects.
+pub fn sequentia_coinbase_maturity() -> u32 {
+    SEQUENTIA_COINBASE_MATURITY
+}
 
 /// The facts attribution needs, gathered from a synced wallet.
 ///
