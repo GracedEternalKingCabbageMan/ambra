@@ -7,6 +7,7 @@
 // ignore_for_file: argument_type_not_assignable
 
 import 'api.dart';
+import 'api/rewards.dart';
 import 'api/signer.dart';
 import 'dart:async';
 import 'dart:convert';
