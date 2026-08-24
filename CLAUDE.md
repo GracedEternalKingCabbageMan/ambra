@@ -4,7 +4,7 @@ Non-custodial dual-chain mobile wallet for Bitcoin (testnet4) and Sequentia: a F
 over a shared Rust core. Android-first; `app/ios/` is a scaffold only.
 
 Everything here is testnet. Node and consensus conventions live in the
-[`Sequentia`](https://github.com/GracedEternalKingCabbageMan/Sequentia) repo, not here.
+[`Sequentia`](https://github.com/ConcatenaLabs/Sequentia) repo, not here.
 
 ## Layout
 
@@ -23,9 +23,9 @@ carries a `[patch.crates-io]` block redirecting `lwk_common`, `lwk_signer`, `lwk
 the branches the README names:
 
 ```sh
-git clone https://github.com/GracedEternalKingCabbageMan/ambra.git
-git clone -b sequentia https://github.com/GracedEternalKingCabbageMan/SWK.git
-git clone -b sequentia-stable https://github.com/GracedEternalKingCabbageMan/seqln.git
+git clone https://github.com/ConcatenaLabs/ambra.git
+git clone -b sequentia https://github.com/ConcatenaLabs/SWK.git
+git clone -b sequentia-stable https://github.com/ConcatenaLabs/seqln.git
 ```
 
 ## Build and test
