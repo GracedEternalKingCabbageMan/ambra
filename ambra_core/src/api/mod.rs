@@ -9,6 +9,11 @@
 /// the wallet's keys on-device and co-signs a hosted SeqLN node over Noise_XK.
 pub mod signer;
 
+/// SEQUENTIA staking rewards: which coins a staker was PAID, and which of them
+/// to convert. Both decisions come straight from the kit, so a phone and a
+/// desktop watching one staker's keys cannot disagree about that staker's coins.
+pub mod rewards;
+
 use std::str::FromStr;
 
 use anyhow::Result;

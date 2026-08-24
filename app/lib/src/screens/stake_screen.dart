@@ -2,7 +2,12 @@ import 'dart:convert';
 
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+
+import '../data/reward_convert.dart';
+import '../rust/api/rewards.dart' as rewards_api;
 import 'package:http/http.dart' as http;
 
 import '../rust/api.dart' as core;
@@ -33,6 +38,10 @@ class _StakeScreenState extends State<StakeScreen> {
   BigInt _tseq = BigInt.zero;
   bool _busy = false;
 
+  // Staking rewards, and what the standing instruction would do with them.
+  List<Map<String, dynamic>> _rewardTotals = <Map<String, dynamic>>[];
+  List<RewardPassRow> _rewardRows = <RewardPassRow>[];
+
   @override
   void initState() {
     super.initState();
@@ -45,9 +54,48 @@ class _StakeScreenState extends State<StakeScreen> {
     super.dispose();
   }
 
+  /// What staking has paid, and a DRY RUN of what would be converted.
+  ///
+  /// Dry, always, on a render path: a cross-chain conversion waits on Bitcoin
+  /// confirmations and can run for the better part of an hour, and a screen that
+  /// awaited one would simply hang. The real pass runs in the background.
+  Future<void> _loadRewards(String mnemonic) async {
+    try {
+      await RewardConvert.instance.loadFor(mnemonic);
+      final txsJson = await rewards_api.walletTxFacts(
+          mnemonic: mnemonic, esploraUrl: Backend.esplora);
+      final keysJson = await rewards_api.stakingKeyFacts(
+          mnemonic: mnemonic, delegated: false);
+      final tip = await rewards_api.tipHeight(
+          mnemonic: mnemonic, esploraUrl: Backend.esplora);
+      final rewardsJson = await rewards_api.attributeStakingRewards(
+        txsJson: txsJson,
+        stakingKeysJson: keysJson,
+        tipHeight: tip,
+        coinbaseMaturity: 100,
+      );
+      final rewards = (jsonDecode(rewardsJson) as List).cast<Map<String, dynamic>>();
+      final report = await RewardConvert.instance.runPass(
+        rewards: rewards,
+        quoteFor: (asset, atoms, target) async => null,
+        execute: (asset, atoms, target) async => null,
+        dryRun: true,
+      );
+      if (!mounted) return;
+      setState(() {
+        _rewardTotals = rewardTotals(rewards);
+        _rewardRows = report.considered;
+      });
+    } catch (_) {
+      // A wallet that cannot answer yet is not an error worth a banner: the
+      // card simply shows nothing until it can.
+    }
+  }
+
   Future<void> _load() async {
     final m = await WalletRepository.instance.readMnemonic();
     if (m == null) return;
+    unawaited(_loadRewards(m));
     try {
       final key = await core.stakerPublicKey(mnemonic: m);
       final s = await core.syncWallet(mnemonic: m, esploraUrl: Backend.esplora);
@@ -138,6 +186,15 @@ class _StakeScreenState extends State<StakeScreen> {
                 'Bond Sequence (tSEQ) to participate in block production. Stake weight = the amount '
                 '(no benefit to a longer lock). It uses the network minimum unbonding period.',
                 style: AmbraText.muted,
+              ),
+              const SizedBox(height: 18),
+              RewardsCard(
+                totals: _rewardTotals,
+                rows: _rewardRows,
+                onChanged: () async {
+                  final m = await WalletRepository.instance.readMnemonic();
+                  if (m != null) await _loadRewards(m);
+                },
               ),
               const SizedBox(height: 18),
               AmbraField(label: 'Amount (tSEQ)', controller: _amount, hint: '40000'),
@@ -602,5 +659,105 @@ class _PoolSectionState extends State<_PoolSection> {
         GhostButton(label: 'Leave this pool', onPressed: _busy ? null : _leave),
       ],
     ]);
+  }
+}
+
+
+/// STAKING REWARDS — what staking has paid, and the standing instruction to
+/// convert it.
+///
+/// A staker earns the transaction fees of the blocks it produces, in whichever
+/// assets the payers chose, so rewards arrive as a tail of small balances in
+/// assets nobody chose to hold. This card shows that tail, and offers to sell it
+/// for ONE asset the staker picks. Bitcoin is the default and the first entry,
+/// but not the only choice: outside staking no asset is privileged.
+///
+/// Which coins are rewards, and which batches convert, are decided by the kit
+/// (see [RewardConvert]) — never here, and never differently from the desktop
+/// wallet watching the same keys.
+class RewardsCard extends StatefulWidget {
+  const RewardsCard({super.key, required this.totals, required this.rows, this.onChanged});
+
+  /// Per-asset totals, from `rewardTotals`.
+  final List<Map<String, dynamic>> totals;
+
+  /// What a dry run says would happen, from `RewardConvert.runPass`.
+  final List<RewardPassRow> rows;
+
+  final VoidCallback? onChanged;
+
+  @override
+  State<RewardsCard> createState() => _RewardsCardState();
+}
+
+class _RewardsCardState extends State<RewardsCard> {
+  RewardConvert get _rc => RewardConvert.instance;
+
+  @override
+  Widget build(BuildContext context) {
+    return AmbraCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Staking rewards', style: AmbraText.title),
+        const SizedBox(height: 8),
+        const Text(
+          'What staking has paid you, in whatever assets the fees were paid in. Sequentia has no '
+          'block subsidy: a block earns its own transaction fees and nothing else. Block rewards '
+          'are spendable 100 blocks after they are earned; a pool payout is spendable at once.',
+          style: AmbraText.muted,
+        ),
+        const SizedBox(height: 12),
+        if (widget.totals.isEmpty)
+          const Text(
+            'No staking rewards yet. A block pays its own fees, so rewards appear once a block '
+            'you (or your pool) produced carried some.',
+            style: AmbraText.muted,
+          )
+        else
+          ...widget.totals.map((t) {
+            final mature = (t['mature'] as BigInt).toString();
+            final immature = (t['immature'] as BigInt).toString();
+            final maturing = (t['immature'] as BigInt) > BigInt.zero ? ' · $immature maturing' : '';
+            return _Kv(t['asset'] as String, '$mature spendable$maturing');
+          }),
+        const SizedBox(height: 16),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('Convert my staking rewards automatically', style: AmbraText.body),
+          value: _rc.enabled,
+          onChanged: (v) async {
+            setState(() => _rc.enabled = v);
+            await _rc.save();
+            widget.onChanged?.call();
+          },
+        ),
+        const Text(
+          'Once this is on, the wallet sells without asking again. It never converts more than '
+          'staking has paid you, never touches your stake, and never converts what it cannot get '
+          'a fair price for — but the selling itself is unattended, which is the point of it.',
+          style: AmbraText.muted,
+        ),
+        if (_rc.enabled) ...[
+          const SizedBox(height: 12),
+          _Kv('Convert into', _rc.target == RewardConvert.btc ? 'BTC (Bitcoin)' : _rc.target),
+          _Kv('Only once worth at least', _rc.minReceive.toString()),
+          _Kv('Refuse a price worse than', '${(_rc.maxSlippageBp / 100).toStringAsFixed(2)}%'),
+          const SizedBox(height: 12),
+          if (widget.rows.isEmpty)
+            const Text(
+              'Nothing to convert right now. Rewards are gathered per asset until a batch is '
+              'worth converting.',
+              style: AmbraText.muted,
+            )
+          else
+            // Why it would NOT convert matters as much as why it would:
+            // "nothing happened" and "nothing should have happened" look
+            // identical otherwise, and the second is far the more common.
+            ...widget.rows.map((r) => _Kv(
+                  '${r.value} ${r.asset}',
+                  r.converts ? 'converting' : r.reason,
+                )),
+        ],
+      ]),
+    );
   }
 }
