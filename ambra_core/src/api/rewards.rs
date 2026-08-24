@@ -353,6 +353,15 @@ pub fn decide_reward_conversion(
             cap_bp: None,
             reason: "This asset is the one you convert into, or you chose to keep it.".into(),
         },
+        Decision::TooSmallToPrice => DecisionDto {
+            decision: "tooSmallToPrice".into(),
+            converts: false,
+            receives: None,
+            floor: None,
+            slippage_bp: None,
+            cap_bp: None,
+            reason: "There is a market, but this much is worth less than one unit of what you are converting into. These rewards wait until there are more of them.".into(),
+        },
         Decision::NoMarket => DecisionDto {
             decision: "noMarket".into(),
             converts: false,
