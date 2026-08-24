@@ -72,6 +72,16 @@ Future<BigInt> rewardSliceForWholeHtlc({
   batchAtoms: batchAtoms,
 );
 
+/// Sequentia's coinbase maturity, in blocks -- 1,000, not Bitcoin's 100.
+///
+/// The protection is a wall-clock one and this chain runs at 60 seconds, so 100
+/// blocks here would buy a tenth of what Bitcoin's 100 buys. Exposed so the Dart
+/// side never has to hard-code it, and cannot hard-code it wrong: a wallet using
+/// 100 calls a reward spendable 900 blocks early and then builds a transaction
+/// the chain rejects.
+Future<int> sequentiaCoinbaseMaturity() =>
+    RustLib.instance.api.crateApiRewardsSequentiaCoinbaseMaturity();
+
 /// The facts attribution needs, gathered from a synced wallet.
 ///
 /// The Dart side has no wollet handle of its own, and it should not: assembling

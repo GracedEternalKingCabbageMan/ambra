@@ -68,11 +68,16 @@ class _StakeScreenState extends State<StakeScreen> {
           mnemonic: mnemonic, delegated: false);
       final tip = await rewards_api.tipHeight(
           mnemonic: mnemonic, esploraUrl: Backend.esplora);
+      // The maturity comes from the kit, never a literal here: Sequentia's is
+      // 1,000 blocks, not Bitcoin's 100, because the protection is a wall-clock
+      // one and this chain runs at 60 seconds. A wallet that guessed 100 would
+      // call a reward spendable 900 blocks early and then build a transaction
+      // the chain rejects.
       final rewardsJson = await rewards_api.attributeStakingRewards(
         txsJson: txsJson,
         stakingKeysJson: keysJson,
         tipHeight: tip,
-        coinbaseMaturity: 100,
+        coinbaseMaturity: await rewards_api.sequentiaCoinbaseMaturity(),
       );
       final rewards = (jsonDecode(rewardsJson) as List).cast<Map<String, dynamic>>();
       final report = await RewardConvert.instance.runPass(
