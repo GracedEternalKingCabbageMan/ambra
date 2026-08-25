@@ -11,7 +11,7 @@ wallet, not an add-on.
 Everything here is **testnet software** (Bitcoin testnet4 + the public Sequentia testnet).
 There is no mainnet. Coins and assets have no value.
 
-Sequentia itself is a Bitcoin sidechain for asset tokenization and decentralized exchange.
+Sequentia itself is a Bitcoin sidechain for asset tokenization and disintermediated exchanges.
 Protocol documentation lives in the node repo:
 [Sequentia `doc/sequentia/`](https://github.com/ConcatenaLabs/Sequentia/tree/HEAD/doc/sequentia).
 
