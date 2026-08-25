@@ -29,10 +29,10 @@ Protocol documentation lives in the node repo:
 - Free testnet funds: the in-app faucet (More tab) dispenses tSEQ and the demo assets;
   for BTC use any public Bitcoin testnet4 faucet with the wallet's receive address.
 
-## What works today
+## What the wallet does
 
-Every item below is implemented in this repo (file pointers are to the screen or module
-that implements it).
+Each item below is implemented in this repo; the file pointers name the screen or
+module that implements it.
 
 **Wallet and custody**
 - Create a wallet (12-word BIP39 phrase, word grid + verification quiz) or import an
@@ -129,16 +129,13 @@ that implements it).
   and burn (`app/lib/src/screens/assets_screen.dart`).
 - Stake the Sequence token (tSEQ) for block production: 40,000 tSEQ minimum, time-based
   CSV lock of roughly 15 days (`app/lib/src/screens/stake_screen.dart`). Staked tSEQ is
-  excluded from the spendable balance. Unbonding is not available in the app yet, so
+  excluded from the spendable balance. Unbonding is not available in the app, so
   only stake what you can lock. Staking is the one thing the Sequence token is for; it
   is not privileged anywhere else in the wallet.
 - Faucet screen requesting tSEQ, USDX, EURX, GOLD, SILVR, or OILX from the public
   testnet faucet.
 - Custom node: point the wallet at your own Sequentia node/backend (with optional HTTP
   auth) instead of the public testnet default (`app/lib/src/screens/node_screen.dart`).
-
-**Experimental / in progress**
-- iOS: scaffold only, never built or tested.
 
 ## Consensus rules the UX must respect
 
