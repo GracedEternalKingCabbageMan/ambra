@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `btc_params`, `clear_scan_marks`, `ct_str`, `ct_u64`, `delegation_scripthash`, `derive_maker_payout`, `derive_maker_secret`, `enclave_prevout_to_txout`, `enclave_prevouts_to_txouts`, `enclave_sighash_inner`, `err`, `esplora_client`, `fetch_utxo`, `hexbytes`, `last_scan`, `maker_identity_priv`, `mark_scanned`, `openamp_keypair`, `order_from_terms`, `outpoint_is_spent`, `parse_openamp_tx`, `priv32`, `rerr`, `scan_into`, `scanned_recently`, `scripthash_utxos`, `select_taker_inputs`, `seq_addr_params`, `staker_secret`, `tip_height`, `tohex`, `with_synced_wollet`, `wollet_cache`
+// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `base64_encode`, `btc_params`, `clear_scan_marks`, `ct_str`, `ct_u64`, `delegation_scripthash`, `derive_maker_payout`, `derive_maker_secret`, `enclave_prevout_to_txout`, `enclave_prevouts_to_txouts`, `enclave_sighash_inner`, `err`, `esplora_client`, `fetch_utxo`, `hexbytes`, `last_scan`, `maker_identity_priv`, `mark_scanned`, `openamp_keypair`, `order_from_terms`, `outpoint_is_spent`, `parse_openamp_tx`, `priv32`, `rerr`, `scan_into`, `scanned_recently`, `scripthash_utxos`, `select_taker_inputs`, `seq_addr_params`, `staker_secret`, `tip_height`, `tohex`, `with_synced_wollet`, `wollet_cache`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
@@ -51,6 +51,34 @@ Future<ConfidentialReceive> confidentialReceiveWithBlindingPub({
 /// The wallet's CT output descriptor for a recovery phrase.
 Future<String> descriptorFromMnemonic({required String mnemonic}) =>
     RustLib.instance.api.crateApiDescriptorFromMnemonic(mnemonic: mnemonic);
+
+/// The account extended public key, in the keyorigin form a watch-only import
+/// wants: `[fingerprint/84h/1h/0h]tpub...`. ONE key covers both chains — the
+/// Sequentia and Bitcoin sides derive from the same m/84'/1'/0' account, which
+/// is what makes their `tb1` address the same string.
+Future<String> accountXpub({required String mnemonic}) =>
+    RustLib.instance.api.crateApiAccountXpub(mnemonic: mnemonic);
+
+/// Sign `message` with the key behind the wallet's receive address at `index`,
+/// in the "Bitcoin Signed Message" format: the magic string and the message
+/// each length-prefixed, hashed twice, signed with recoverable ECDSA, base64.
+///
+/// Verification is offered against the LEGACY form of the address, because a
+/// node's MessageVerify takes a PKHash destination and rejects bech32 whatever
+/// key stands behind it. Sequentia's testnet keeps Bitcoin testnet's P2PKH
+/// version byte, so one signature verifies on sequentiad and Bitcoin Core alike.
+///
+/// Non-spending, like the OpenAMP signatures beside it: it proves control of an
+/// address and can authorize nothing.
+Future<SignedMessage> signMessageClassic({
+  required String mnemonic,
+  required int index,
+  required String message,
+}) => RustLib.instance.api.crateApiSignMessageClassic(
+  mnemonic: mnemonic,
+  index: index,
+  message: message,
+);
 
 /// Validate a BIP39 recovery phrase (import flow). Throws on an invalid phrase.
 Future<void> validateMnemonic({required String mnemonic}) =>
@@ -1640,6 +1668,37 @@ class SeqobKeypair {
           runtimeType == other.runtimeType &&
           privHex == other.privHex &&
           pubHex == other.pubHex;
+}
+
+/// A classic signed message, and the address a verifier must be given for it.
+class SignedMessage {
+  /// Base64, the format `verifymessage` takes.
+  final String signature;
+
+  /// The LEGACY (P2PKH) form of the signing key.
+  final String verifyAddress;
+
+  /// The wallet's own address for the same key, the one it hands out.
+  final String address;
+
+  const SignedMessage({
+    required this.signature,
+    required this.verifyAddress,
+    required this.address,
+  });
+
+  @override
+  int get hashCode =>
+      signature.hashCode ^ verifyAddress.hashCode ^ address.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SignedMessage &&
+          runtimeType == other.runtimeType &&
+          signature == other.signature &&
+          verifyAddress == other.verifyAddress &&
+          address == other.address;
 }
 
 /// A wallet transaction history row.

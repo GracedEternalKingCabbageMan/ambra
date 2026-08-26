@@ -250,8 +250,154 @@ class _SignScreenState extends State<SignScreen> {
               Text(_sendMsg!, style: TextStyle(color: _sendOk ? AmbraColors.green : AmbraColors.red)),
             ],
           ],
+          const SizedBox(height: 26),
+          const ClassicSignCard(),
         ]),
       ),
+    );
+  }
+}
+
+
+/// The classic, key-derived signature — the counterpart to the tagged OpenAMP
+/// one above. It proves control of an ADDRESS rather than of an enclave account
+/// id, and anyone can check it with a node: `verifymessage`, on Sequentia or on
+/// Bitcoin, with nothing to look up. Like the OpenAMP card it cannot move funds.
+///
+/// Verification is offered against the LEGACY form of the address, because a
+/// node takes a PKHash destination there and rejects bech32 whatever key stands
+/// behind it. The signing key is the one behind the address the Receive screen
+/// hands out at the same index, so an address someone was given is an address
+/// they can sign with.
+class ClassicSignCard extends StatefulWidget {
+  const ClassicSignCard({super.key});
+  @override
+  State<ClassicSignCard> createState() => _ClassicSignCardState();
+}
+
+class _ClassicSignCardState extends State<ClassicSignCard> {
+  final _message = TextEditingController();
+  final _index = TextEditingController(text: '0');
+  bool _busy = false;
+  String? _error;
+  String? _address;        // the tb1 address at this index, shown before signing
+  core.SignedMessage? _out;
+
+  @override
+  void initState() {
+    super.initState();
+    _index.addListener(_loadAddress);
+    _loadAddress();
+  }
+
+  @override
+  void dispose() {
+    _message.dispose();
+    _index.dispose();
+    super.dispose();
+  }
+
+  int get _idx {
+    final v = int.tryParse(_index.text.trim());
+    return (v == null || v < 0) ? 0 : v;
+  }
+
+  Future<void> _loadAddress() async {
+    try {
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) return;
+      final info = await core.receiveAddressAt(mnemonic: m, index: _idx, confidential: false);
+      if (mounted) setState(() => _address = info.address);
+    } catch (_) {
+      if (mounted) setState(() => _address = null);
+    }
+  }
+
+  Future<void> _sign() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+      _out = null;
+    });
+    try {
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) throw Exception('open your wallet first');
+      if (_message.text.isEmpty) throw Exception('enter the message you want to sign');
+      final out = await core.signMessageClassic(mnemonic: m, index: _idx, message: _message.text);
+      if (!mounted) return;
+      setState(() {
+        _out = out;
+        _busy = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = e.toString().replaceFirst('Exception: ', '');
+      });
+    }
+  }
+
+  void _copy(String text, String msg) {
+    Clipboard.setData(ClipboardData(text: text));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final out = _out;
+    return AmbraCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        const SectionLabel('Sign a message with your wallet key'),
+        const SizedBox(height: 10),
+        const Text(
+          'The classic signature: made with the private key behind one of your own addresses, and '
+          'checkable by anyone running a node — verifymessage, on Sequentia or on Bitcoin, with '
+          'nothing to look up and no account id involved. Use it to prove an address is yours. '
+          'Like the signature above it cannot move funds.',
+          style: AmbraText.muted,
+        ),
+        const SizedBox(height: 16),
+        AmbraField(label: 'Message', controller: _message, hint: 'the text you want to sign', maxLines: 3),
+        const SizedBox(height: 12),
+        AmbraField(label: 'Address index', controller: _index, hint: '0', mono: true),
+        if (_address != null) ...[
+          const SizedBox(height: 8),
+          Text(_address!, style: AmbraText.mono.copyWith(fontSize: 12, color: AmbraColors.dim)),
+        ],
+        const SizedBox(height: 18),
+        PrimaryButton(label: 'Sign', icon: Icons.draw, busy: _busy, onPressed: _busy ? null : _sign),
+        if (_error != null) ...[
+          const SizedBox(height: 12),
+          Text(_error!, style: const TextStyle(color: AmbraColors.red)),
+        ],
+        if (out != null) ...[
+          const SizedBox(height: 20),
+          _ResultBlock(
+            label: 'Signature',
+            value: out.signature,
+            onCopy: () => _copy(out.signature, 'Signature copied'),
+          ),
+          const SizedBox(height: 14),
+          _ResultBlock(label: 'Verify against this address', value: out.verifyAddress),
+          const SizedBox(height: 8),
+          const Text(
+            'The same key as the address above, written the older way. A node accepts only that form '
+            'here: it rejects a tb1 address whatever key stands behind it.',
+            style: AmbraText.sub,
+          ),
+          const SizedBox(height: 14),
+          SecondaryButton(
+            label: 'Copy verify command',
+            icon: Icons.copy,
+            onPressed: () => _copy(
+              'verifymessage "${out.verifyAddress}" "${out.signature}" '
+                  '"${_message.text.replaceAll('"', r'\"')}"',
+              'Verify command copied',
+            ),
+          ),
+        ],
+      ]),
     );
   }
 }

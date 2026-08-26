@@ -225,6 +225,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   SeqobKeypair dco_decode_seqob_keypair(dynamic raw);
 
   @protected
+  SignedMessage dco_decode_signed_message(dynamic raw);
+
+  @protected
   TxRow dco_decode_tx_row(dynamic raw);
 
   @protected
@@ -463,6 +466,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   SeqobKeypair sse_decode_seqob_keypair(SseDeserializer deserializer);
+
+  @protected
+  SignedMessage sse_decode_signed_message(SseDeserializer deserializer);
 
   @protected
   TxRow sse_decode_tx_row(SseDeserializer deserializer);
@@ -757,6 +763,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_seqob_keypair(SeqobKeypair self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_signed_message(SignedMessage self, SseSerializer serializer);
 
   @protected
   void sse_encode_tx_row(TxRow self, SseSerializer serializer);

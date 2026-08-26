@@ -23,11 +23,12 @@ class LnAssetOption {
   final int precision;
 }
 
-/// Load the assets the wallet holds (from the shared last-known cache) as LN pay/receive options.
-/// A per-asset node is single-asset, so only held assets are offerable. Returns an empty list when
-/// nothing is held — the cards then show an honest "no assets yet" note rather than a dead dropdown.
+/// What this wallet can send and receive over Lightning. Native BTC leads: the LSP runs a BTC leg
+/// of its own, and a wallet whose parent chain is Bitcoin has no business hiding it — it is offered
+/// whether or not the wallet holds any, exactly as the rest of the wallet treats the parent chain.
+/// A per-asset node is single-asset, so the Sequentia assets offered are the ones actually held.
 Future<List<LnAssetOption>> loadLnAssetOptions() async {
-  final out = <LnAssetOption>[];
+  final out = <LnAssetOption>[const LnAssetOption(kLnBtc, 'BTC', 8)];
   final seen = <String>{};
   final held = await WalletCache.loadBalances();
   if (held != null) {
@@ -195,7 +196,7 @@ class _LnReceiveCardState extends State<LnReceiveCard> {
             style: AmbraText.sub),
         const SizedBox(height: 12),
         if (_assets.isEmpty)
-          const Text('You hold no assets to receive over Lightning yet.', style: AmbraText.muted)
+          const Text('Nothing is available to receive over Lightning yet.', style: AmbraText.muted)
         else ...[
           Row(children: [
             Expanded(child: _LnAssetDropdown(options: _assets, value: _asset, onChanged: (v) => setState(() => _asset = v))),
@@ -362,7 +363,7 @@ class _LnPayCardState extends State<LnPayCard> {
             style: AmbraText.sub),
         const SizedBox(height: 12),
         if (_assets.isEmpty)
-          const Text('You hold no assets to pay over Lightning yet.', style: AmbraText.muted)
+          const Text('Nothing is available to pay over Lightning yet.', style: AmbraText.muted)
         else ...[
           _LnAssetDropdown(options: _assets, value: _asset, onChanged: (v) => setState(() => _asset = v)),
           const SizedBox(height: 10),

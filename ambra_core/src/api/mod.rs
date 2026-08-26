@@ -124,6 +124,90 @@ pub fn descriptor_from_mnemonic(mnemonic: String) -> Result<String> {
     crate::descriptor_from_mnemonic(&mnemonic).map_err(err)
 }
 
+/// The account extended public key, in the keyorigin form a watch-only import
+/// wants: `[fingerprint/84h/1h/0h]tpub...`. ONE key covers both chains — the
+/// Sequentia and Bitcoin sides derive from the same m/84'/1'/0' account, which
+/// is what makes their `tb1` address the same string.
+pub fn account_xpub(mnemonic: String) -> Result<String> {
+    let signer = SwSigner::new(&mnemonic, /* is_mainnet */ false).map_err(rerr)?;
+    signer
+        .keyorigin_xpub(lwk_common::Bip::Bip84, /* is_mainnet */ false)
+        .map_err(rerr)
+}
+
+/// A classic signed message, and the address a verifier must be given for it.
+pub struct SignedMessage {
+    /// Base64, the format `verifymessage` takes.
+    pub signature: String,
+    /// The LEGACY (P2PKH) form of the signing key.
+    pub verify_address: String,
+    /// The wallet's own address for the same key, the one it hands out.
+    pub address: String,
+}
+
+/// Sign `message` with the key behind the wallet's receive address at `index`,
+/// in the "Bitcoin Signed Message" format: the magic string and the message
+/// each length-prefixed, hashed twice, signed with recoverable ECDSA, base64.
+///
+/// Verification is offered against the LEGACY form of the address, because a
+/// node's MessageVerify takes a PKHash destination and rejects bech32 whatever
+/// key stands behind it. Sequentia's testnet keeps Bitcoin testnet's P2PKH
+/// version byte, so one signature verifies on sequentiad and Bitcoin Core alike.
+///
+/// Non-spending, like the OpenAMP signatures beside it: it proves control of an
+/// address and can authorize nothing.
+pub fn sign_message_classic(mnemonic: String, index: u32, message: String) -> Result<SignedMessage> {
+    use lwk_wollet::bitcoin::{
+        secp256k1::{ecdsa::RecoveryId, Message, Secp256k1},
+        sign_message::signed_msg_hash,
+        Network, PublicKey,
+    };
+    let signer = SwSigner::new(&mnemonic, /* is_mainnet */ false).map_err(rerr)?;
+    let path = DerivationPath::from_str(&format!("m/84h/1h/0h/0/{index}")).map_err(rerr)?;
+    let xprv = signer.derive_xprv(&path).map_err(rerr)?;
+
+    let secp = Secp256k1::new();
+    let sk = xprv.private_key;
+    let hash = signed_msg_hash(&message);
+    let msg = Message::from_digest(*hash.as_ref());
+    let (recovery, sig) = secp
+        .sign_ecdsa_recoverable(&msg, &sk)
+        .serialize_compact();
+
+    // header = 27 + recovery id + 4, the +4 saying the key is compressed — which
+    // is all this wallet derives.
+    let mut compact = [0u8; 65];
+    compact[0] = 27 + (RecoveryId::to_i32(recovery) as u8) + 4;
+    compact[1..].copy_from_slice(&sig);
+
+    let pk = PublicKey::new(sk.public_key(&secp));
+    let btc = lwk_wollet::bitcoin::Address::p2wpkh(
+        &lwk_wollet::bitcoin::CompressedPublicKey(pk.inner),
+        Network::Testnet,
+    );
+    Ok(SignedMessage {
+        signature: base64_encode(&compact),
+        verify_address: lwk_wollet::bitcoin::Address::p2pkh(pk, Network::Testnet).to_string(),
+        address: btc.to_string(),
+    })
+}
+
+/// Base64 for the 65-byte signature. Written out rather than pulled in: the one
+/// place this crate needs it, and the alphabet is not going to change.
+fn base64_encode(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { A[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
 /// A receive address together with the derivation index it came from.
 pub struct AddressInfo {
     pub address: String,
@@ -2789,6 +2873,69 @@ mod openamp_tests {
             tohex(&sighash),
             "1bff568af1b88b0518ea7b82374b047e5d8383b9bd230bb20df68452001db43c",
             "enclave sighash drifted from the SWK reference vector"
+        );
+    }
+}
+
+#[cfg(test)]
+mod classic_signing_tests {
+    use super::*;
+
+    // Standard BIP39 test vector mnemonic — the same one the OpenAMP tests use.
+    const MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    /// These are the WEB WALLET's vectors, and the web wallet's are the NODE's:
+    /// `sequentia-cli signmessagewithprivkey` produces this exact base64, and
+    /// `verifymessage` accepts it against this exact address. Asserting them here
+    /// is what makes "Ambra and the web wallet sign the same" a checked claim
+    /// rather than a hope — one phrase, one signature, either wallet.
+    #[test]
+    fn signs_what_the_web_wallet_and_the_node_do() {
+        let out = sign_message_classic(
+            MNEMONIC.to_string(),
+            0,
+            "sequentia web wallet classic signing".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            out.signature,
+            "IPqYE4yB1g2PC2I9Yflw3yWl7Y8uJ83t/9TmuLwsRe1DV1zOey2HU8AVAeSMI8IT5VCP2gCMn8z8eMFk3WyWNVo="
+        );
+        assert_eq!(out.verify_address, "mzYpQmSAGYWWyTLiLGbGaG8T3rHdjNcV11");
+        assert_eq!(out.address, "tb1q6rz28mcfaxtmd6v789l9rrlrusdprr9pqcpvkl");
+    }
+
+    /// A message past the 252-byte boundary where the length prefix stops being
+    /// one byte, and non-ASCII with it, so the message is measured in BYTES.
+    #[test]
+    fn signs_a_long_non_ascii_message_the_same_way() {
+        let message = "ü ".repeat(120) + "end";
+        let out = sign_message_classic(MNEMONIC.to_string(), 1, message).unwrap();
+        assert_eq!(
+            out.signature,
+            "ILot/sycI3Gn3LUfG8xeqiNA9xTgsmESgBUb/pAvHK7tX6aairgmDfOet5dYyA/FhtWnEfLNthmENUuyS7i5wJY="
+        );
+        assert_eq!(out.verify_address, "mqhB5Q36hdgWv2hLhyDk79zzi7MxjRYfHn");
+    }
+
+    /// The signing key must be the key behind the address the wallet HANDS OUT,
+    /// or a user would be proving control of something they were never shown.
+    #[test]
+    fn signs_with_the_key_behind_the_wallets_own_address() {
+        for index in [0u32, 1, 7] {
+            let out = sign_message_classic(MNEMONIC.to_string(), index, "x".to_string()).unwrap();
+            let shown = lwk_wollet::btc::address(&btc_params(), MNEMONIC, false, index).unwrap();
+            assert_eq!(out.address, shown, "index {index}");
+        }
+    }
+
+    #[test]
+    fn account_xpub_is_the_keyorigin_form() {
+        let x = account_xpub(MNEMONIC.to_string()).unwrap();
+        assert_eq!(
+            x,
+            "[73c5da0a/84h/1h/0h]tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M"
         );
     }
 }

@@ -9,6 +9,7 @@ import '../data/api_client.dart';
 import '../data/asset_picker.dart';
 import '../data/btc_state.dart';
 import '../data/config.dart';
+import '../data/descriptor.dart';
 import '../data/format.dart';
 import '../data/hidden_assets.dart';
 import '../data/lightning_service.dart';
@@ -1130,6 +1131,136 @@ void _showRefSheet(BuildContext context) {
 }
 
 // ---------------------------------------------------------------------------
+// The account key, for a watch-only import elsewhere. Collapsed by default: it is
+// not a thing to hand out casually — it derives every address this wallet will
+// ever use, on BOTH chains, since they share one m/84'/1'/0' account. It cannot
+// spend, and the card says so.
+//
+// Three forms of the same key, matching the web wallet: the extended key, the
+// wpkh() descriptor that describes the addresses this wallet hands out, and the
+// legacy pkh() form, which is what a node's verifymessage takes and so what
+// someone imports to check a signature made on the Sign screen.
+// ---------------------------------------------------------------------------
+enum AccountKeyForm { xpub, wpkh, pkh }
+
+class AccountKeyCard extends StatefulWidget {
+  const AccountKeyCard({super.key});
+  @override
+  State<AccountKeyCard> createState() => _AccountKeyCardState();
+}
+
+class _AccountKeyCardState extends State<AccountKeyCard> {
+  bool _shown = false;
+  AccountKeyForm _form = AccountKeyForm.xpub;
+  String? _keyorigin;
+  String? _error;
+
+  static const _notes = {
+    AccountKeyForm.xpub: 'The account key with its origin path, which is what a watch-only import asks for.',
+    AccountKeyForm.wpkh: 'Import both lines: the first derives your receive addresses, the second your change. '
+        'These are the tb1 addresses this wallet hands out — the same ones on Sequentia and on Bitcoin testnet4.',
+    AccountKeyForm.pkh: 'The legacy form of the same key. Nothing is paid to these addresses; it is the form a '
+        'node takes for verifymessage, so it is what someone imports to check a signature made on the Sign screen.',
+  };
+
+  Future<void> _reveal() async {
+    setState(() {
+      _shown = true;
+      _error = null;
+    });
+    try {
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) return;
+      final k = await core.accountXpub(mnemonic: m);
+      if (mounted) setState(() => _keyorigin = k);
+    } catch (e) {
+      if (mounted) setState(() => _error = 'Could not read the account key: $e');
+    }
+  }
+
+  String get _value {
+    final k = _keyorigin;
+    if (k == null || k.isEmpty) return '';
+    switch (_form) {
+      case AccountKeyForm.xpub:
+        return k;
+      case AccountKeyForm.wpkh:
+        return accountDescriptors(k).join('\n');
+      case AccountKeyForm.pkh:
+        return accountDescriptors(k, kind: 'pkh').join('\n');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_shown) {
+      return SecondaryButton(label: 'Show account key (xpub)', icon: Icons.key, onPressed: _reveal);
+    }
+    final value = _value;
+    return AmbraCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        const SectionLabel('Account key'),
+        const SizedBox(height: 12),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          decoration: BoxDecoration(
+            color: AmbraColors.panelDeep,
+            border: Border.all(color: AmbraColors.line),
+            borderRadius: BorderRadius.circular(AmbraRadii.input),
+          ),
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<AccountKeyForm>(
+              value: _form,
+              isExpanded: true,
+              dropdownColor: AmbraColors.panel,
+              iconEnabledColor: AmbraColors.dim,
+              style: const TextStyle(color: AmbraColors.txt, fontSize: 15, fontWeight: FontWeight.w600),
+              items: const [
+                DropdownMenuItem(value: AccountKeyForm.xpub, child: Text('Extended public key')),
+                DropdownMenuItem(value: AccountKeyForm.wpkh, child: Text('Descriptor — wpkh')),
+                DropdownMenuItem(value: AccountKeyForm.pkh, child: Text('Descriptor — pkh (legacy)')),
+              ],
+              onChanged: (v) => setState(() => _form = v ?? AccountKeyForm.xpub),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        if (_error != null)
+          Text(_error!, style: const TextStyle(color: AmbraColors.red))
+        else if (value.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 12),
+            child: Center(child: CircularProgressIndicator(color: AmbraColors.amber)),
+          )
+        else ...[
+          SelectableText(value, style: AmbraText.mono.copyWith(fontSize: 12)),
+          const SizedBox(height: 10),
+          Text(_notes[_form]!, style: AmbraText.sub),
+          const SizedBox(height: 8),
+          const Text(
+            'Watch-only either way. It derives every address this wallet will ever use — on Sequentia and on '
+            'Bitcoin testnet4, which share this one account key — so anyone holding it can follow your whole '
+            'history on both chains. It cannot spend: only the recovery phrase can.',
+            style: AmbraText.sub,
+          ),
+          const SizedBox(height: 14),
+          SecondaryButton(
+            label: 'Copy',
+            icon: Icons.copy,
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: value));
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Account key copied')));
+            },
+          ),
+          const SizedBox(height: 6),
+          GhostButton(label: 'Hide', onPressed: () => setState(() => _shown = false)),
+        ],
+      ]),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Receive (M3: shared tb1 default + confidential tsqb1 opt-in, copy, cycle)
 // ---------------------------------------------------------------------------
 class ReceiveTab extends StatefulWidget {
@@ -1316,6 +1447,8 @@ class _ReceiveTabState extends State<ReceiveTab> {
           title: const Text('Show confidential address', style: AmbraText.body),
           subtitle: const Text('A private address that hides the amount and asset.', style: AmbraText.sub),
         ),
+        const SizedBox(height: 18),
+        const AccountKeyCard(),
         // General Lightning receive — generate a BOLT11 into the user's own hosted node. Mounted
         // only when Lightning is deployed for this build (dormant otherwise, so nothing shows).
         if (LightningService.instance.configured) ...[
