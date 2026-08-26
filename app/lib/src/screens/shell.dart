@@ -1262,6 +1262,21 @@ class _AccountKeyCardState extends State<AccountKeyCard> {
               ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Account key copied')));
             },
           ),
+          // Some importers take ONE descriptor and only ever want the receive branch. Copying
+          // the whole box then hands them the change line as often as not, so offer the
+          // receive line on its own rather than leaving it to a careful selection.
+          if (_form != AccountKeyForm.xpub) ...[
+            const SizedBox(height: 8),
+            SecondaryButton(
+              label: 'Copy the receive line',
+              icon: Icons.call_received,
+              onPressed: () {
+                Clipboard.setData(ClipboardData(text: value.split('\n').first));
+                ScaffoldMessenger.of(context)
+                    .showSnackBar(const SnackBar(content: Text('Receive descriptor copied')));
+              },
+            ),
+          ],
           const SizedBox(height: 6),
           GhostButton(label: 'Hide', onPressed: () => setState(() => _shown = false)),
         ],
