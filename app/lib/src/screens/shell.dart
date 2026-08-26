@@ -1156,12 +1156,21 @@ class _AccountKeyCardState extends State<AccountKeyCard> {
   String? _keyorigin;
   String? _error;
 
+  // Why a descriptor view shows TWO lines is the first thing anyone asks, so every
+  // descriptor form says it — not only the first one. A descriptor covers one branch of the
+  // keychain: /0/* is receive, /1/* is change, and a wallet given only the first would see
+  // incoming payments and none of the change.
+  static const _pair = 'Two lines, because a descriptor covers one branch: the first derives your '
+      'receive addresses, the second your change. Import both — a wallet given only the first would '
+      'miss every change output. They come as a pair rather than one combined <0;1> descriptor '
+      'because this network\'s node refuses that form.';
   static const _notes = {
     AccountKeyForm.xpub: 'The account key with its origin path, which is what a watch-only import asks for.',
-    AccountKeyForm.wpkh: 'Import both lines: the first derives your receive addresses, the second your change. '
-        'These are the tb1 addresses this wallet hands out — the same ones on Sequentia and on Bitcoin testnet4.',
-    AccountKeyForm.pkh: 'The legacy form of the same key. Nothing is paid to these addresses; it is the form a '
-        'node takes for verifymessage, so it is what someone imports to check a signature made on the Sign screen.',
+    AccountKeyForm.wpkh: '$_pair These are the tb1 addresses this wallet hands out — the same ones on '
+        'Sequentia and on Bitcoin testnet4.',
+    AccountKeyForm.pkh: '$_pair This is the legacy form of the same key: nothing is paid to these '
+        'addresses, but it is the form a node takes for verifymessage, so it is what someone imports '
+        'to check a signature made on the Sign screen.',
   };
 
   Future<void> _reveal() async {
