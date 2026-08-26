@@ -118,6 +118,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BuiltRawTx dco_decode_built_raw_tx(dynamic raw);
 
   @protected
+  CoinjoinMineOutput dco_decode_coinjoin_mine_output(dynamic raw);
+
+  @protected
+  CoinjoinSignInput dco_decode_coinjoin_sign_input(dynamic raw);
+
+  @protected
+  CoinjoinUtxo dco_decode_coinjoin_utxo(dynamic raw);
+
+  @protected
   ConfidentialReceive dco_decode_confidential_receive(dynamic raw);
 
   @protected
@@ -161,6 +170,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<AssetDelta> dco_decode_list_asset_delta(dynamic raw);
+
+  @protected
+  List<CoinjoinMineOutput> dco_decode_list_coinjoin_mine_output(dynamic raw);
+
+  @protected
+  List<CoinjoinSignInput> dco_decode_list_coinjoin_sign_input(dynamic raw);
+
+  @protected
+  List<CoinjoinUtxo> dco_decode_list_coinjoin_utxo(dynamic raw);
 
   @protected
   List<EnclaveDecodedInput> dco_decode_list_enclave_decoded_input(dynamic raw);
@@ -208,6 +226,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw);
+
+  @protected
+  OwnershipProof dco_decode_ownership_proof(dynamic raw);
 
   @protected
   PsetFee dco_decode_pset_fee(dynamic raw);
@@ -341,6 +362,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BuiltRawTx sse_decode_built_raw_tx(SseDeserializer deserializer);
 
   @protected
+  CoinjoinMineOutput sse_decode_coinjoin_mine_output(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  CoinjoinSignInput sse_decode_coinjoin_sign_input(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  CoinjoinUtxo sse_decode_coinjoin_utxo(SseDeserializer deserializer);
+
+  @protected
   ConfidentialReceive sse_decode_confidential_receive(
     SseDeserializer deserializer,
   );
@@ -398,6 +432,21 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<AssetDelta> sse_decode_list_asset_delta(SseDeserializer deserializer);
 
   @protected
+  List<CoinjoinMineOutput> sse_decode_list_coinjoin_mine_output(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<CoinjoinSignInput> sse_decode_list_coinjoin_sign_input(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<CoinjoinUtxo> sse_decode_list_coinjoin_utxo(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   List<EnclaveDecodedInput> sse_decode_list_enclave_decoded_input(
     SseDeserializer deserializer,
   );
@@ -449,6 +498,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BigInt? sse_decode_opt_box_autoadd_u_64(SseDeserializer deserializer);
+
+  @protected
+  OwnershipProof sse_decode_ownership_proof(SseDeserializer deserializer);
 
   @protected
   PsetFee sse_decode_pset_fee(SseDeserializer deserializer);
@@ -603,6 +655,21 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_built_raw_tx(BuiltRawTx self, SseSerializer serializer);
 
   @protected
+  void sse_encode_coinjoin_mine_output(
+    CoinjoinMineOutput self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_coinjoin_sign_input(
+    CoinjoinSignInput self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_coinjoin_utxo(CoinjoinUtxo self, SseSerializer serializer);
+
+  @protected
   void sse_encode_confidential_receive(
     ConfidentialReceive self,
     SseSerializer serializer,
@@ -678,6 +745,24 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_coinjoin_mine_output(
+    List<CoinjoinMineOutput> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_coinjoin_sign_input(
+    List<CoinjoinSignInput> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_coinjoin_utxo(
+    List<CoinjoinUtxo> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_enclave_decoded_input(
     List<EnclaveDecodedInput> self,
     SseSerializer serializer,
@@ -745,6 +830,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_opt_box_autoadd_u_64(BigInt? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_ownership_proof(
+    OwnershipProof self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_pset_fee(PsetFee self, SseSerializer serializer);

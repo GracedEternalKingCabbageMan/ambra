@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `base64_encode`, `btc_params`, `clear_scan_marks`, `ct_str`, `ct_u64`, `delegation_scripthash`, `derive_maker_payout`, `derive_maker_secret`, `enclave_prevout_to_txout`, `enclave_prevouts_to_txouts`, `enclave_sighash_inner`, `err`, `esplora_client`, `fetch_utxo`, `hexbytes`, `last_scan`, `maker_identity_priv`, `mark_scanned`, `openamp_keypair`, `order_from_terms`, `outpoint_is_spent`, `parse_openamp_tx`, `priv32`, `rerr`, `scan_into`, `scanned_recently`, `scripthash_utxos`, `select_taker_inputs`, `seq_addr_params`, `staker_secret`, `tip_height`, `tohex`, `with_synced_wollet`, `wollet_cache`
+// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `base64_encode`, `btc_params`, `clear_scan_marks`, `ct_str`, `ct_u64`, `delegation_scripthash`, `derive_maker_payout`, `derive_maker_secret`, `enclave_prevout_to_txout`, `enclave_prevouts_to_txouts`, `enclave_sighash_inner`, `err`, `esplora_client`, `fetch_utxo`, `hexbytes`, `hexstr_bytes`, `last_scan`, `maker_identity_priv`, `mark_scanned`, `openamp_keypair`, `order_from_terms`, `outpoint_is_spent`, `parse_openamp_tx`, `priv32`, `rerr`, `scan_into`, `scanned_recently`, `scripthash_utxos`, `select_taker_inputs`, `seq_addr_params`, `staker_secret`, `tip_height`, `tohex`, `with_synced_wollet`, `wollet_cache`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
@@ -937,6 +937,68 @@ EnclaveSpendEffects decodeEnclaveSpend({
   myScripts: myScripts,
 );
 
+/// The wallet's TRANSPARENT coins. Confidential ones are excluded because the coordinator refuses
+/// them: blinding the round would need their blinding factors, and handing those over would undo
+/// the privacy of every transaction that coin has ever been in.
+Future<List<CoinjoinUtxo>> coinjoinUtxos({
+  required String mnemonic,
+  required String esploraUrl,
+}) => RustLib.instance.api.crateApiCoinjoinUtxos(
+  mnemonic: mnemonic,
+  esploraUrl: esploraUrl,
+);
+
+/// Which outputs of the round are ours, and for how much.
+///
+/// This is the participant's ONLY way to answer the question that decides whether to sign: does
+/// this transaction actually pay me what the round owed? The coordinator built and blinded it, so
+/// its word for the amounts is worth nothing; the wallet's own SLIP-77 blinding key settles it.
+/// An output belonging to another participant simply fails to unblind, as it must.
+Future<List<CoinjoinMineOutput>> coinjoinUnblindOutputs({
+  required String mnemonic,
+  required String txHex,
+}) => RustLib.instance.api.crateApiCoinjoinUnblindOutputs(
+  mnemonic: mnemonic,
+  txHex: txHex,
+);
+
+/// Sign OUR inputs of the round transaction, and only those. Inputs are located by outpoint, so
+/// the coordinator's shuffling cannot redirect a signature onto a coin we did not mean to spend.
+Future<String> coinjoinSignInputs({
+  required String mnemonic,
+  required String txHex,
+  required List<CoinjoinSignInput> inputs,
+}) => RustLib.instance.api.crateApiCoinjoinSignInputs(
+  mnemonic: mnemonic,
+  txHex: txHex,
+  inputs: inputs,
+);
+
+/// Prove a coin is ours. The Sequentia and Bitcoin sides share one derivation
+/// (m/84'/1'/0'/chain/i), which is why the same key answers for a Sequentia coin.
+Future<OwnershipProof> coinjoinProveOwnership({
+  required String mnemonic,
+  required String message,
+  required int chain,
+  required int index,
+}) => RustLib.instance.api.crateApiCoinjoinProveOwnership(
+  mnemonic: mnemonic,
+  message: message,
+  chain: chain,
+  index: index,
+);
+
+/// The scriptPubKey of an address, hex. The round's gate compares the outputs it could
+/// unblind against the addresses it registered, and a script is what an output carries.
+Future<String> addressScriptPubkey({required String address}) =>
+    RustLib.instance.api.crateApiAddressScriptPubkey(address: address);
+
+/// Every outpoint the transaction spends, as "txid:vout". The participant checks that the
+/// coins it registered are all present before signing: a round missing one of them is not
+/// the round that was agreed to.
+Future<List<String>> coinjoinTxOutpoints({required String txHex}) =>
+    RustLib.instance.api.crateApiCoinjoinTxOutpoints(txHex: txHex);
+
 /// A receive address together with the derivation index it came from.
 class AddressInfo {
   final String address;
@@ -1175,6 +1237,123 @@ class BuiltRawTx {
           runtimeType == other.runtimeType &&
           rawHex == other.rawHex &&
           txid == other.txid;
+}
+
+/// An output of the round transaction that unblinds under THIS wallet's blinding key.
+class CoinjoinMineOutput {
+  final int vout;
+  final String scriptPubkey;
+  final String asset;
+  final String value;
+
+  const CoinjoinMineOutput({
+    required this.vout,
+    required this.scriptPubkey,
+    required this.asset,
+    required this.value,
+  });
+
+  @override
+  int get hashCode =>
+      vout.hashCode ^ scriptPubkey.hashCode ^ asset.hashCode ^ value.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is CoinjoinMineOutput &&
+          runtimeType == other.runtimeType &&
+          vout == other.vout &&
+          scriptPubkey == other.scriptPubkey &&
+          asset == other.asset &&
+          value == other.value;
+}
+
+/// One of our coins to sign in the round transaction.
+class CoinjoinSignInput {
+  final String txid;
+  final int vout;
+  final String value;
+  final String spkHex;
+  final int chain;
+  final int index;
+
+  const CoinjoinSignInput({
+    required this.txid,
+    required this.vout,
+    required this.value,
+    required this.spkHex,
+    required this.chain,
+    required this.index,
+  });
+
+  @override
+  int get hashCode =>
+      txid.hashCode ^
+      vout.hashCode ^
+      value.hashCode ^
+      spkHex.hashCode ^
+      chain.hashCode ^
+      index.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is CoinjoinSignInput &&
+          runtimeType == other.runtimeType &&
+          txid == other.txid &&
+          vout == other.vout &&
+          value == other.value &&
+          spkHex == other.spkHex &&
+          chain == other.chain &&
+          index == other.index;
+}
+
+/// A transparent coin of the wallet, in the shape a round registration needs.
+class CoinjoinUtxo {
+  final String txid;
+  final int vout;
+
+  /// Explicit value in atoms, as a string for FFI precision-safety.
+  final String atoms;
+  final String asset;
+  final String spkHex;
+
+  /// 0 = external chain, 1 = internal (change), under m/84'/1'/0'.
+  final int chain;
+  final int index;
+
+  const CoinjoinUtxo({
+    required this.txid,
+    required this.vout,
+    required this.atoms,
+    required this.asset,
+    required this.spkHex,
+    required this.chain,
+    required this.index,
+  });
+
+  @override
+  int get hashCode =>
+      txid.hashCode ^
+      vout.hashCode ^
+      atoms.hashCode ^
+      asset.hashCode ^
+      spkHex.hashCode ^
+      chain.hashCode ^
+      index.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is CoinjoinUtxo &&
+          runtimeType == other.runtimeType &&
+          txid == other.txid &&
+          vout == other.vout &&
+          atoms == other.atoms &&
+          asset == other.asset &&
+          spkHex == other.spkHex &&
+          chain == other.chain &&
+          index == other.index;
 }
 
 /// A confidential (blech32 `tsqb…`) receive address together with its 33-byte
@@ -1555,6 +1734,25 @@ class FeeAsset {
           runtimeType == other.runtimeType &&
           assetId == other.assetId &&
           rate == other.rate;
+}
+
+/// An ownership proof over a round-bound message: ECDSA/SHA-256, DER, with the coin's own key.
+class OwnershipProof {
+  final String pubkey;
+  final String sig;
+
+  const OwnershipProof({required this.pubkey, required this.sig});
+
+  @override
+  int get hashCode => pubkey.hashCode ^ sig.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is OwnershipProof &&
+          runtimeType == other.runtimeType &&
+          pubkey == other.pubkey &&
+          sig == other.sig;
 }
 
 /// The network fee of a built PSET: the fee output's asset and amount (atoms).

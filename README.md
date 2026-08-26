@@ -54,6 +54,12 @@ module that implements it.
   wallet's own addresses, in the format `verifymessage` accepts, so anyone with a node
   can check that an address is yours. Neither signature can move funds. Verification is
   offered against the legacy form of the address, the only form that RPC takes.
+- CoinJoin: mix a Sequentia asset in a seqcj round, from the More tab. The amounts are
+  confidential, so the chain sees a transaction and not what moved in it, and the change is
+  blinded like the mixed coins; what the blind signatures buy is that the coordinator cannot
+  link the coins going in to the mixed coins coming out. The screen says the rest plainly —
+  the coordinator sees your amounts, the phone connects from one address, and the anonymity
+  set is the round (`app/lib/src/screens/mix_screen.dart`).
 
 **Balance (dual-chain, no privileged asset)**
 - The headline is one **total balance across all held assets, valued in a user-chosen

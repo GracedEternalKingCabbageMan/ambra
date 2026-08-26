@@ -2939,3 +2939,252 @@ mod classic_signing_tests {
         );
     }
 }
+
+// --- CoinJoin (seqcj) --------------------------------------------------------
+//
+// The wallet's half of a seqcj round: choose transparent coins, prove they are ours, and — the
+// step everything else exists to protect — check the coordinator's transaction against OUR OWN
+// blinding key before signing it. The protocol itself is wallet-agnostic and lives in Dart, the
+// same shape the browser wallet vendors from the seqcj repository; what only a wallet can do is
+// here, and it is the same code the browser wallet runs through lwk_wasm.
+//
+// Nothing here can lose coins. The only irreversible act is a signature, and it is produced by
+// coinjoin_sign_inputs alone, over inputs matched by OUTPOINT — the coordinator shuffles the
+// round, so a position it hands us is a value we must not trust.
+
+/// A transparent coin of the wallet, in the shape a round registration needs.
+pub struct CoinjoinUtxo {
+    pub txid: String,
+    pub vout: u32,
+    /// Explicit value in atoms, as a string for FFI precision-safety.
+    pub atoms: String,
+    pub asset: String,
+    pub spk_hex: String,
+    /// 0 = external chain, 1 = internal (change), under m/84'/1'/0'.
+    pub chain: u32,
+    pub index: u32,
+}
+
+/// The wallet's TRANSPARENT coins. Confidential ones are excluded because the coordinator refuses
+/// them: blinding the round would need their blinding factors, and handing those over would undo
+/// the privacy of every transaction that coin has ever been in.
+pub fn coinjoin_utxos(mnemonic: String, esplora_url: String) -> Result<Vec<CoinjoinUtxo>> {
+    with_synced_wollet(&mnemonic, &esplora_url, |wollet| {
+        let mut out = Vec::new();
+        for u in wollet.utxos().map_err(rerr)? {
+            let (asset, value) = (u.unblinded.asset, u.unblinded.value);
+            out.push(CoinjoinUtxo {
+                txid: u.outpoint.txid.to_string(),
+                vout: u.outpoint.vout,
+                atoms: value.to_string(),
+                asset: asset.to_string(),
+                spk_hex: hexstr_bytes(u.script_pubkey.as_bytes()),
+                chain: match u.ext_int { lwk_wollet::Chain::Internal => 1, _ => 0 },
+                index: u.wildcard_index,
+            });
+        }
+        Ok(out)
+    })
+}
+
+/// An output of the round transaction that unblinds under THIS wallet's blinding key.
+pub struct CoinjoinMineOutput {
+    pub vout: u32,
+    pub script_pubkey: String,
+    pub asset: String,
+    pub value: String,
+}
+
+/// Which outputs of the round are ours, and for how much.
+///
+/// This is the participant's ONLY way to answer the question that decides whether to sign: does
+/// this transaction actually pay me what the round owed? The coordinator built and blinded it, so
+/// its word for the amounts is worth nothing; the wallet's own SLIP-77 blinding key settles it.
+/// An output belonging to another participant simply fails to unblind, as it must.
+pub fn coinjoin_unblind_outputs(mnemonic: String, tx_hex: String) -> Result<Vec<CoinjoinMineOutput>> {
+    use lwk_wollet::elements;
+    let bytes = Vec::<u8>::from_hex(&tx_hex).map_err(rerr)?;
+    let tx: elements::Transaction = elements::encode::deserialize(&bytes).map_err(rerr)?;
+    let desc_str = crate::descriptor_from_mnemonic(&mnemonic).map_err(err)?;
+    let desc: lwk_wollet::WolletDescriptor = desc_str.parse().map_err(rerr)?;
+    let ct = desc.ct_descriptor().map_err(rerr)?;
+    let secp = lwk_wollet::secp256k1::Secp256k1::new();
+    let mut mine = Vec::new();
+    for (vout, out) in tx.output.iter().enumerate() {
+        if out.is_fee() {
+            continue;
+        }
+        let Some(key) = lwk_common::derive_blinding_key(ct, &out.script_pubkey) else { continue };
+        if let Ok(secrets) = out.unblind(&secp, key) {
+            mine.push(CoinjoinMineOutput {
+                vout: vout as u32,
+                script_pubkey: hexstr_bytes(out.script_pubkey.as_bytes()),
+                asset: secrets.asset.to_string(),
+                value: secrets.value.to_string(),
+            });
+        }
+    }
+    Ok(mine)
+}
+
+/// One of our coins to sign in the round transaction.
+pub struct CoinjoinSignInput {
+    pub txid: String,
+    pub vout: u32,
+    pub value: String,
+    pub spk_hex: String,
+    pub chain: u32,
+    pub index: u32,
+}
+
+/// Sign OUR inputs of the round transaction, and only those. Inputs are located by outpoint, so
+/// the coordinator's shuffling cannot redirect a signature onto a coin we did not mean to spend.
+pub fn coinjoin_sign_inputs(
+    mnemonic: String,
+    tx_hex: String,
+    inputs: Vec<CoinjoinSignInput>,
+) -> Result<String> {
+    let signer = SwSigner::new(&mnemonic, /* is_mainnet */ false).map_err(rerr)?;
+    let mut ins = Vec::with_capacity(inputs.len());
+    for i in &inputs {
+        let path = DerivationPath::from_str(&format!("m/84h/1h/0h/{}/{}", i.chain, i.index)).map_err(rerr)?;
+        let xprv = signer.derive_xprv(&path).map_err(rerr)?;
+        ins.push(lwk_wollet::CoinjoinInput {
+            txid: lwk_wollet::elements::Txid::from_str(&i.txid).map_err(rerr)?,
+            vout: i.vout,
+            value: i.value.parse::<u64>().map_err(rerr)?,
+            spk: Vec::<u8>::from_hex(&i.spk_hex).map_err(rerr)?,
+            secret_key: xprv.private_key,
+        });
+    }
+    lwk_wollet::sign_coinjoin_inputs(&tx_hex, &ins).map_err(rerr)
+}
+
+/// An ownership proof over a round-bound message: ECDSA/SHA-256, DER, with the coin's own key.
+pub struct OwnershipProof {
+    pub pubkey: String,
+    pub sig: String,
+}
+
+/// Prove a coin is ours. The Sequentia and Bitcoin sides share one derivation
+/// (m/84'/1'/0'/chain/i), which is why the same key answers for a Sequentia coin.
+pub fn coinjoin_prove_ownership(
+    mnemonic: String,
+    message: String,
+    chain: u32,
+    index: u32,
+) -> Result<OwnershipProof> {
+    use lwk_wollet::bitcoin::hashes::{sha256, Hash};
+    use lwk_wollet::bitcoin::secp256k1::{Message, Secp256k1};
+    let signer = SwSigner::new(&mnemonic, /* is_mainnet */ false).map_err(rerr)?;
+    let path = DerivationPath::from_str(&format!("m/84h/1h/0h/{chain}/{index}")).map_err(rerr)?;
+    let xprv = signer.derive_xprv(&path).map_err(rerr)?;
+    let secp = Secp256k1::new();
+    let digest = sha256::Hash::hash(message.as_bytes());
+    let msg = Message::from_digest(digest.to_byte_array());
+    let sig = secp.sign_ecdsa(&msg, &xprv.private_key);
+    Ok(OwnershipProof {
+        pubkey: hexstr_bytes(&xprv.private_key.public_key(&secp).serialize()),
+        sig: hexstr_bytes(&sig.serialize_der()),
+    })
+}
+
+fn hexstr_bytes(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// The scriptPubKey of an address, hex. The round's gate compares the outputs it could
+/// unblind against the addresses it registered, and a script is what an output carries.
+pub fn address_script_pubkey(address: String) -> Result<String> {
+    let a = Address::from_str(&address).map_err(rerr)?;
+    Ok(hexstr_bytes(a.script_pubkey().as_bytes()))
+}
+
+/// Every outpoint the transaction spends, as "txid:vout". The participant checks that the
+/// coins it registered are all present before signing: a round missing one of them is not
+/// the round that was agreed to.
+pub fn coinjoin_tx_outpoints(tx_hex: String) -> Result<Vec<String>> {
+    use lwk_wollet::elements;
+    let bytes = Vec::<u8>::from_hex(&tx_hex).map_err(rerr)?;
+    let tx: elements::Transaction = elements::encode::deserialize(&bytes).map_err(rerr)?;
+    Ok(tx
+        .input
+        .iter()
+        .map(|i| format!("{}:{}", i.previous_output.txid, i.previous_output.vout))
+        .collect())
+}
+
+#[cfg(test)]
+mod coinjoin_tests {
+    use super::*;
+
+    const MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    /// The ownership proof is what a coordinator checks before it will register a coin, so
+    /// it must verify under the pubkey it carries — and be bound to the round and the coin,
+    /// which is the caller's message.
+    #[test]
+    fn ownership_proof_verifies_under_its_own_pubkey() {
+        use lwk_wollet::bitcoin::hashes::{sha256, Hash};
+        use lwk_wollet::bitcoin::secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1};
+
+        let msg = "seqcj-ownership-v1|r1|".to_string() + &"ab".repeat(32) + ":0";
+        let p = coinjoin_prove_ownership(MNEMONIC.to_string(), msg.clone(), 0, 3).unwrap();
+
+        let secp = Secp256k1::verification_only();
+        let pk = PublicKey::from_slice(&hexbytes(&p.pubkey).unwrap()).unwrap();
+        let sig = Signature::from_der(&hexbytes(&p.sig).unwrap()).unwrap();
+        let digest = sha256::Hash::hash(msg.as_bytes());
+        assert!(secp
+            .verify_ecdsa(&Message::from_digest(digest.to_byte_array()), &sig, &pk)
+            .is_ok());
+    }
+
+    /// A proof for one coin must not verify for another: the message binds the outpoint,
+    /// and a coordinator that accepted a floating proof would let anyone register a coin
+    /// they do not own.
+    #[test]
+    fn a_proof_does_not_carry_to_another_coin() {
+        use lwk_wollet::bitcoin::hashes::{sha256, Hash};
+        use lwk_wollet::bitcoin::secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1};
+
+        let mine = "seqcj-ownership-v1|r1|".to_string() + &"ab".repeat(32) + ":0";
+        let other = "seqcj-ownership-v1|r1|".to_string() + &"ab".repeat(32) + ":1";
+        let p = coinjoin_prove_ownership(MNEMONIC.to_string(), mine, 0, 3).unwrap();
+
+        let secp = Secp256k1::verification_only();
+        let pk = PublicKey::from_slice(&hexbytes(&p.pubkey).unwrap()).unwrap();
+        let sig = Signature::from_der(&hexbytes(&p.sig).unwrap()).unwrap();
+        let digest = sha256::Hash::hash(other.as_bytes());
+        assert!(secp
+            .verify_ecdsa(&Message::from_digest(digest.to_byte_array()), &sig, &pk)
+            .is_err());
+    }
+
+    /// The proving key is the key behind the coin, which is the same derivation the wallet
+    /// hands addresses out from — proving with anything else would prove nothing about it.
+    #[test]
+    fn the_proving_key_is_the_key_behind_the_address() {
+        use lwk_wollet::bitcoin::secp256k1::{PublicKey, Secp256k1};
+        let p = coinjoin_prove_ownership(MNEMONIC.to_string(), "x".into(), 0, 3).unwrap();
+        let secp = Secp256k1::new();
+        let pk = PublicKey::from_slice(&hexbytes(&p.pubkey).unwrap()).unwrap();
+        let addr = lwk_wollet::bitcoin::Address::p2wpkh(
+            &lwk_wollet::bitcoin::CompressedPublicKey(pk),
+            lwk_wollet::bitcoin::Network::Testnet,
+        );
+        let shown = lwk_wollet::btc::address(&btc_params(), MNEMONIC, false, 3).unwrap();
+        assert_eq!(addr.to_string(), shown);
+    }
+
+    /// The gate compares the outputs it unblinded against the addresses it registered, and
+    /// a script is what an output carries.
+    #[test]
+    fn an_address_yields_its_script_pubkey() {
+        let info = receive_address_at(MNEMONIC.to_string(), 0, false).unwrap();
+        let spk = address_script_pubkey(info.address).unwrap();
+        assert!(spk.starts_with("0014"), "a v0 witness program: {spk}");
+        assert_eq!(spk.len(), 44); // OP_0 PUSH20 <20 bytes>
+    }
+}

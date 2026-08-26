@@ -34,6 +34,7 @@ import 'faucet_screen.dart';
 import 'history_screen.dart';
 import 'node_screen.dart';
 import 'send_screen.dart';
+import 'mix_screen.dart';
 import 'stake_screen.dart';
 import 'swap_screen.dart';
 
@@ -1662,6 +1663,12 @@ class MoreTab extends StatelessWidget {
               label: 'Stake tSEQ',
               icon: Icons.lock_outline,
               onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const StakeScreen())),
+            ),
+            const SizedBox(height: 10),
+            SecondaryButton(
+              label: 'Mix (CoinJoin)',
+              icon: Icons.shuffle,
+              onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const MixScreen())),
             ),
           ]),
         ),
