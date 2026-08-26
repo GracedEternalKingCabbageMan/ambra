@@ -21,6 +21,10 @@ class Backend {
   static bool get isDefault => _origin == defaultOrigin;
 
   static String get esplora => '$_origin/api';
+
+  /// The seqcj CoinJoin coordinator, behind the same reverse proxy as every other
+  /// endpoint — so a mix needs no separate host and the app holds no coordinator secret.
+  static String get coinjoin => '$_origin/coinjoin';
   static String get testnet4 => '$_origin/testnet4/api';
   static String get dex => '$_origin/dex'; // SeqDEX daemon (grpc-gateway REST) reverse-proxy
   static String get seqob => '$_origin/seqob'; // SeqOB order-book relay (grpc-gateway REST), matches the web wallet's SEQOB default

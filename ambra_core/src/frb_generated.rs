@@ -39,7 +39,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -2119344721;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1835232249;
 
 // Section: executor
 
@@ -626,6 +626,41 @@ fn wire__crate__api__account_xpub_impl(
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                     (move || {
                         let output_ok = crate::api::account_xpub(api_mnemonic)?;
+                        Ok(output_ok)
+                    })(),
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__address_script_pubkey_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "address_script_pubkey",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_address = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let output_ok = crate::api::address_script_pubkey(api_address)?;
                         Ok(output_ok)
                     })(),
                 )
@@ -1283,6 +1318,195 @@ fn wire__crate__api__clear_wallet_cache_impl(
                     })?;
                     Ok(output_ok)
                 })())
+            }
+        },
+    )
+}
+fn wire__crate__api__coinjoin_prove_ownership_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "coinjoin_prove_ownership",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_mnemonic = <String>::sse_decode(&mut deserializer);
+            let api_message = <String>::sse_decode(&mut deserializer);
+            let api_chain = <u32>::sse_decode(&mut deserializer);
+            let api_index = <u32>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let output_ok = crate::api::coinjoin_prove_ownership(
+                            api_mnemonic,
+                            api_message,
+                            api_chain,
+                            api_index,
+                        )?;
+                        Ok(output_ok)
+                    })(),
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__coinjoin_sign_inputs_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "coinjoin_sign_inputs",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_mnemonic = <String>::sse_decode(&mut deserializer);
+            let api_tx_hex = <String>::sse_decode(&mut deserializer);
+            let api_inputs = <Vec<crate::api::CoinjoinSignInput>>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let output_ok =
+                            crate::api::coinjoin_sign_inputs(api_mnemonic, api_tx_hex, api_inputs)?;
+                        Ok(output_ok)
+                    })(),
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__coinjoin_tx_outpoints_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "coinjoin_tx_outpoints",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_tx_hex = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let output_ok = crate::api::coinjoin_tx_outpoints(api_tx_hex)?;
+                        Ok(output_ok)
+                    })(),
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__coinjoin_unblind_outputs_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "coinjoin_unblind_outputs",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_mnemonic = <String>::sse_decode(&mut deserializer);
+            let api_tx_hex = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let output_ok =
+                            crate::api::coinjoin_unblind_outputs(api_mnemonic, api_tx_hex)?;
+                        Ok(output_ok)
+                    })(),
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__coinjoin_utxos_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "coinjoin_utxos",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_mnemonic = <String>::sse_decode(&mut deserializer);
+            let api_esplora_url = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let output_ok = crate::api::coinjoin_utxos(api_mnemonic, api_esplora_url)?;
+                        Ok(output_ok)
+                    })(),
+                )
             }
         },
     )
@@ -4083,6 +4307,64 @@ impl SseDecode for crate::api::BuiltRawTx {
     }
 }
 
+impl SseDecode for crate::api::CoinjoinMineOutput {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_vout = <u32>::sse_decode(deserializer);
+        let mut var_scriptPubkey = <String>::sse_decode(deserializer);
+        let mut var_asset = <String>::sse_decode(deserializer);
+        let mut var_value = <String>::sse_decode(deserializer);
+        return crate::api::CoinjoinMineOutput {
+            vout: var_vout,
+            script_pubkey: var_scriptPubkey,
+            asset: var_asset,
+            value: var_value,
+        };
+    }
+}
+
+impl SseDecode for crate::api::CoinjoinSignInput {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_txid = <String>::sse_decode(deserializer);
+        let mut var_vout = <u32>::sse_decode(deserializer);
+        let mut var_value = <String>::sse_decode(deserializer);
+        let mut var_spkHex = <String>::sse_decode(deserializer);
+        let mut var_chain = <u32>::sse_decode(deserializer);
+        let mut var_index = <u32>::sse_decode(deserializer);
+        return crate::api::CoinjoinSignInput {
+            txid: var_txid,
+            vout: var_vout,
+            value: var_value,
+            spk_hex: var_spkHex,
+            chain: var_chain,
+            index: var_index,
+        };
+    }
+}
+
+impl SseDecode for crate::api::CoinjoinUtxo {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_txid = <String>::sse_decode(deserializer);
+        let mut var_vout = <u32>::sse_decode(deserializer);
+        let mut var_atoms = <String>::sse_decode(deserializer);
+        let mut var_asset = <String>::sse_decode(deserializer);
+        let mut var_spkHex = <String>::sse_decode(deserializer);
+        let mut var_chain = <u32>::sse_decode(deserializer);
+        let mut var_index = <u32>::sse_decode(deserializer);
+        return crate::api::CoinjoinUtxo {
+            txid: var_txid,
+            vout: var_vout,
+            atoms: var_atoms,
+            asset: var_asset,
+            spk_hex: var_spkHex,
+            chain: var_chain,
+            index: var_index,
+        };
+    }
+}
+
 impl SseDecode for crate::api::ConfidentialReceive {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -4296,6 +4578,42 @@ impl SseDecode for Vec<crate::api::AssetDelta> {
     }
 }
 
+impl SseDecode for Vec<crate::api::CoinjoinMineOutput> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::CoinjoinMineOutput>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
+impl SseDecode for Vec<crate::api::CoinjoinSignInput> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::CoinjoinSignInput>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
+impl SseDecode for Vec<crate::api::CoinjoinUtxo> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::CoinjoinUtxo>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
 impl SseDecode for Vec<crate::api::EnclaveDecodedInput> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -4455,6 +4773,18 @@ impl SseDecode for Option<u64> {
         } else {
             return None;
         }
+    }
+}
+
+impl SseDecode for crate::api::OwnershipProof {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_pubkey = <String>::sse_decode(deserializer);
+        let mut var_sig = <String>::sse_decode(deserializer);
+        return crate::api::OwnershipProof {
+            pubkey: var_pubkey,
+            sig: var_sig,
+        };
     }
 }
 
@@ -4636,104 +4966,110 @@ fn pde_ffi_dispatcher_primary_impl(
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
         13 => wire__crate__api__account_xpub_impl(port, ptr, rust_vec_len, data_len),
-        14 => wire__crate__api__rewards__attribute_staking_rewards_impl(
+        14 => wire__crate__api__address_script_pubkey_impl(port, ptr, rust_vec_len, data_len),
+        15 => wire__crate__api__rewards__attribute_staking_rewards_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        15 => wire__crate__api__btc_broadcast_impl(port, ptr, rust_vec_len, data_len),
-        16 => wire__crate__api__btc_prepare_impl(port, ptr, rust_vec_len, data_len),
-        17 => wire__crate__api__btc_sync_impl(port, ptr, rust_vec_len, data_len),
-        18 => wire__crate__api__build_burn_tx_impl(port, ptr, rust_vec_len, data_len),
-        19 => wire__crate__api__build_cpfp_tx_impl(port, ptr, rust_vec_len, data_len),
-        20 => wire__crate__api__build_delegate_tx_impl(port, ptr, rust_vec_len, data_len),
-        21 => wire__crate__api__build_delegation_spend_impl(port, ptr, rust_vec_len, data_len),
-        22 => wire__crate__api__build_issue_tx_impl(port, ptr, rust_vec_len, data_len),
-        23 => wire__crate__api__build_rbf_bump_tx_impl(port, ptr, rust_vec_len, data_len),
-        24 => wire__crate__api__build_rbf_replace_tx_impl(port, ptr, rust_vec_len, data_len),
-        25 => wire__crate__api__build_reissue_tx_impl(port, ptr, rust_vec_len, data_len),
-        26 => wire__crate__api__build_send_tx_impl(port, ptr, rust_vec_len, data_len),
-        27 => wire__crate__api__build_stake_tx_impl(port, ptr, rust_vec_len, data_len),
-        28 => wire__crate__api__clear_wallet_cache_impl(port, ptr, rust_vec_len, data_len),
-        29 => {
+        16 => wire__crate__api__btc_broadcast_impl(port, ptr, rust_vec_len, data_len),
+        17 => wire__crate__api__btc_prepare_impl(port, ptr, rust_vec_len, data_len),
+        18 => wire__crate__api__btc_sync_impl(port, ptr, rust_vec_len, data_len),
+        19 => wire__crate__api__build_burn_tx_impl(port, ptr, rust_vec_len, data_len),
+        20 => wire__crate__api__build_cpfp_tx_impl(port, ptr, rust_vec_len, data_len),
+        21 => wire__crate__api__build_delegate_tx_impl(port, ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__build_delegation_spend_impl(port, ptr, rust_vec_len, data_len),
+        23 => wire__crate__api__build_issue_tx_impl(port, ptr, rust_vec_len, data_len),
+        24 => wire__crate__api__build_rbf_bump_tx_impl(port, ptr, rust_vec_len, data_len),
+        25 => wire__crate__api__build_rbf_replace_tx_impl(port, ptr, rust_vec_len, data_len),
+        26 => wire__crate__api__build_reissue_tx_impl(port, ptr, rust_vec_len, data_len),
+        27 => wire__crate__api__build_send_tx_impl(port, ptr, rust_vec_len, data_len),
+        28 => wire__crate__api__build_stake_tx_impl(port, ptr, rust_vec_len, data_len),
+        29 => wire__crate__api__clear_wallet_cache_impl(port, ptr, rust_vec_len, data_len),
+        30 => wire__crate__api__coinjoin_prove_ownership_impl(port, ptr, rust_vec_len, data_len),
+        31 => wire__crate__api__coinjoin_sign_inputs_impl(port, ptr, rust_vec_len, data_len),
+        32 => wire__crate__api__coinjoin_tx_outpoints_impl(port, ptr, rust_vec_len, data_len),
+        33 => wire__crate__api__coinjoin_unblind_outputs_impl(port, ptr, rust_vec_len, data_len),
+        34 => wire__crate__api__coinjoin_utxos_impl(port, ptr, rust_vec_len, data_len),
+        35 => {
             wire__crate__api__confidential_receive_address_impl(port, ptr, rust_vec_len, data_len)
         }
-        30 => wire__crate__api__confidential_receive_with_blinding_pub_impl(
+        36 => wire__crate__api__confidential_receive_with_blinding_pub_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        31 => wire__crate__api__covenant_build_fill_tx_impl(port, ptr, rust_vec_len, data_len),
-        32 => wire__crate__api__covenant_build_refund_tx_impl(port, ptr, rust_vec_len, data_len),
-        33 => wire__crate__api__covenant_finalize_offer_impl(port, ptr, rust_vec_len, data_len),
-        34 => wire__crate__api__covenant_maker_address_impl(port, ptr, rust_vec_len, data_len),
-        35 => wire__crate__api__covenant_prepare_offer_impl(port, ptr, rust_vec_len, data_len),
-        36 => wire__crate__api__cpfp_suggested_feerate_impl(port, ptr, rust_vec_len, data_len),
-        37 => wire__crate__api__rewards__decide_reward_conversion_impl(
+        37 => wire__crate__api__covenant_build_fill_tx_impl(port, ptr, rust_vec_len, data_len),
+        38 => wire__crate__api__covenant_build_refund_tx_impl(port, ptr, rust_vec_len, data_len),
+        39 => wire__crate__api__covenant_finalize_offer_impl(port, ptr, rust_vec_len, data_len),
+        40 => wire__crate__api__covenant_maker_address_impl(port, ptr, rust_vec_len, data_len),
+        41 => wire__crate__api__covenant_prepare_offer_impl(port, ptr, rust_vec_len, data_len),
+        42 => wire__crate__api__cpfp_suggested_feerate_impl(port, ptr, rust_vec_len, data_len),
+        43 => wire__crate__api__rewards__decide_reward_conversion_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        39 => wire__crate__api__descriptor_from_mnemonic_impl(port, ptr, rust_vec_len, data_len),
-        42 => wire__crate__api__finalize_and_broadcast_impl(port, ptr, rust_vec_len, data_len),
-        43 => wire__crate__api__find_delegation_impl(port, ptr, rust_vec_len, data_len),
-        44 => wire__crate__api__generate_mnemonic_impl(port, ptr, rust_vec_len, data_len),
-        49 => {
+        45 => wire__crate__api__descriptor_from_mnemonic_impl(port, ptr, rust_vec_len, data_len),
+        48 => wire__crate__api__finalize_and_broadcast_impl(port, ptr, rust_vec_len, data_len),
+        49 => wire__crate__api__find_delegation_impl(port, ptr, rust_vec_len, data_len),
+        50 => wire__crate__api__generate_mnemonic_impl(port, ptr, rust_vec_len, data_len),
+        55 => {
             wire__crate__api__rewards__plan_reward_batches_impl(port, ptr, rust_vec_len, data_len)
         }
-        50 => wire__crate__api__pset_fee_impl(port, ptr, rust_vec_len, data_len),
-        51 => wire__crate__api__receive_address_impl(port, ptr, rust_vec_len, data_len),
-        52 => wire__crate__api__receive_address_at_impl(port, ptr, rust_vec_len, data_len),
-        53 => wire__crate__api__rewards__reward_slice_for_whole_htlc_impl(
+        56 => wire__crate__api__pset_fee_impl(port, ptr, rust_vec_len, data_len),
+        57 => wire__crate__api__receive_address_impl(port, ptr, rust_vec_len, data_len),
+        58 => wire__crate__api__receive_address_at_impl(port, ptr, rust_vec_len, data_len),
+        59 => wire__crate__api__rewards__reward_slice_for_whole_htlc_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        54 => wire__crate__api__seqdex_build_swap_request_impl(port, ptr, rust_vec_len, data_len),
-        55 => wire__crate__api__seqdex_sign_accept_impl(port, ptr, rust_vec_len, data_len),
-        59 => wire__crate__api__seqob_e2e_open_impl(port, ptr, rust_vec_len, data_len),
-        60 => wire__crate__api__seqob_e2e_seal_impl(port, ptr, rust_vec_len, data_len),
-        61 => wire__crate__api__seqob_ephemeral_key_impl(port, ptr, rust_vec_len, data_len),
-        62 => wire__crate__api__seqob_maker_pubkey_impl(port, ptr, rust_vec_len, data_len),
-        63 => wire__crate__api__seqob_sign_cancel_impl(port, ptr, rust_vec_len, data_len),
-        64 => wire__crate__api__seqob_sign_offer_impl(port, ptr, rust_vec_len, data_len),
-        65 => wire__crate__api__seqob_verify_offer_impl(port, ptr, rust_vec_len, data_len),
-        66 => wire__crate__api__rewards__sequentia_coinbase_maturity_impl(
+        60 => wire__crate__api__seqdex_build_swap_request_impl(port, ptr, rust_vec_len, data_len),
+        61 => wire__crate__api__seqdex_sign_accept_impl(port, ptr, rust_vec_len, data_len),
+        65 => wire__crate__api__seqob_e2e_open_impl(port, ptr, rust_vec_len, data_len),
+        66 => wire__crate__api__seqob_e2e_seal_impl(port, ptr, rust_vec_len, data_len),
+        67 => wire__crate__api__seqob_ephemeral_key_impl(port, ptr, rust_vec_len, data_len),
+        68 => wire__crate__api__seqob_maker_pubkey_impl(port, ptr, rust_vec_len, data_len),
+        69 => wire__crate__api__seqob_sign_cancel_impl(port, ptr, rust_vec_len, data_len),
+        70 => wire__crate__api__seqob_sign_offer_impl(port, ptr, rust_vec_len, data_len),
+        71 => wire__crate__api__seqob_verify_offer_impl(port, ptr, rust_vec_len, data_len),
+        72 => wire__crate__api__rewards__sequentia_coinbase_maturity_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        70 => wire__crate__api__sign_message_classic_impl(port, ptr, rust_vec_len, data_len),
-        71 => wire__crate__api__sign_pset_impl(port, ptr, rust_vec_len, data_len),
-        72 => wire__crate__api__staker_public_key_impl(port, ptr, rust_vec_len, data_len),
-        73 => wire__crate__api__rewards__staking_key_facts_impl(port, ptr, rust_vec_len, data_len),
-        74 => wire__crate__api__sync_wallet_impl(port, ptr, rust_vec_len, data_len),
-        75 => wire__crate__api__rewards__tip_height_impl(port, ptr, rust_vec_len, data_len),
-        76 => wire__crate__api__validate_address_impl(port, ptr, rust_vec_len, data_len),
-        77 => wire__crate__api__validate_mnemonic_impl(port, ptr, rust_vec_len, data_len),
-        78 => wire__crate__api__wallet_transactions_impl(port, ptr, rust_vec_len, data_len),
-        79 => wire__crate__api__rewards__wallet_tx_facts_impl(port, ptr, rust_vec_len, data_len),
-        80 => wire__crate__api__xchain_btc_claim_impl(port, ptr, rust_vec_len, data_len),
-        81 => wire__crate__api__xchain_btc_claim_pubkey_impl(port, ptr, rust_vec_len, data_len),
-        82 => wire__crate__api__xchain_btc_htlc_impl(port, ptr, rust_vec_len, data_len),
-        83 => wire__crate__api__xchain_btc_refund_impl(port, ptr, rust_vec_len, data_len),
-        84 => wire__crate__api__xchain_btc_refund_pubkey_impl(port, ptr, rust_vec_len, data_len),
-        85 => wire__crate__api__xchain_find_btc_funding_impl(port, ptr, rust_vec_len, data_len),
-        86 => wire__crate__api__xchain_new_secret_impl(port, ptr, rust_vec_len, data_len),
-        87 => wire__crate__api__xchain_read_seq_preimage_impl(port, ptr, rust_vec_len, data_len),
-        88 => wire__crate__api__xchain_seq_broadcast_impl(port, ptr, rust_vec_len, data_len),
-        89 => wire__crate__api__xchain_seq_claim_impl(port, ptr, rust_vec_len, data_len),
-        90 => wire__crate__api__xchain_seq_claim_pubkey_impl(port, ptr, rust_vec_len, data_len),
-        91 => wire__crate__api__xchain_seq_htlc_forward_impl(port, ptr, rust_vec_len, data_len),
-        92 => wire__crate__api__xchain_seq_htlc_reverse_impl(port, ptr, rust_vec_len, data_len),
-        93 => wire__crate__api__xchain_seq_redeem_script_impl(port, ptr, rust_vec_len, data_len),
-        94 => wire__crate__api__xchain_seq_refund_impl(port, ptr, rust_vec_len, data_len),
-        95 => wire__crate__api__xchain_verify_seq_leg_safe_impl(port, ptr, rust_vec_len, data_len),
+        76 => wire__crate__api__sign_message_classic_impl(port, ptr, rust_vec_len, data_len),
+        77 => wire__crate__api__sign_pset_impl(port, ptr, rust_vec_len, data_len),
+        78 => wire__crate__api__staker_public_key_impl(port, ptr, rust_vec_len, data_len),
+        79 => wire__crate__api__rewards__staking_key_facts_impl(port, ptr, rust_vec_len, data_len),
+        80 => wire__crate__api__sync_wallet_impl(port, ptr, rust_vec_len, data_len),
+        81 => wire__crate__api__rewards__tip_height_impl(port, ptr, rust_vec_len, data_len),
+        82 => wire__crate__api__validate_address_impl(port, ptr, rust_vec_len, data_len),
+        83 => wire__crate__api__validate_mnemonic_impl(port, ptr, rust_vec_len, data_len),
+        84 => wire__crate__api__wallet_transactions_impl(port, ptr, rust_vec_len, data_len),
+        85 => wire__crate__api__rewards__wallet_tx_facts_impl(port, ptr, rust_vec_len, data_len),
+        86 => wire__crate__api__xchain_btc_claim_impl(port, ptr, rust_vec_len, data_len),
+        87 => wire__crate__api__xchain_btc_claim_pubkey_impl(port, ptr, rust_vec_len, data_len),
+        88 => wire__crate__api__xchain_btc_htlc_impl(port, ptr, rust_vec_len, data_len),
+        89 => wire__crate__api__xchain_btc_refund_impl(port, ptr, rust_vec_len, data_len),
+        90 => wire__crate__api__xchain_btc_refund_pubkey_impl(port, ptr, rust_vec_len, data_len),
+        91 => wire__crate__api__xchain_find_btc_funding_impl(port, ptr, rust_vec_len, data_len),
+        92 => wire__crate__api__xchain_new_secret_impl(port, ptr, rust_vec_len, data_len),
+        93 => wire__crate__api__xchain_read_seq_preimage_impl(port, ptr, rust_vec_len, data_len),
+        94 => wire__crate__api__xchain_seq_broadcast_impl(port, ptr, rust_vec_len, data_len),
+        95 => wire__crate__api__xchain_seq_claim_impl(port, ptr, rust_vec_len, data_len),
+        96 => wire__crate__api__xchain_seq_claim_pubkey_impl(port, ptr, rust_vec_len, data_len),
+        97 => wire__crate__api__xchain_seq_htlc_forward_impl(port, ptr, rust_vec_len, data_len),
+        98 => wire__crate__api__xchain_seq_htlc_reverse_impl(port, ptr, rust_vec_len, data_len),
+        99 => wire__crate__api__xchain_seq_redeem_script_impl(port, ptr, rust_vec_len, data_len),
+        100 => wire__crate__api__xchain_seq_refund_impl(port, ptr, rust_vec_len, data_len),
+        101 => wire__crate__api__xchain_verify_seq_leg_safe_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -4762,23 +5098,23 @@ fn pde_ffi_dispatcher_sync_impl(
         10 => wire__crate__api__signer__SeqlnSigner_node_id_impl(ptr, rust_vec_len, data_len),
         11 => wire__crate__api__signer__SeqlnSigner_process_frame_impl(ptr, rust_vec_len, data_len),
         12 => wire__crate__api__signer__SeqlnSigner_set_enforce_impl(ptr, rust_vec_len, data_len),
-        38 => wire__crate__api__decode_enclave_spend_impl(ptr, rust_vec_len, data_len),
-        40 => wire__crate__api__signer__device_pubkey_impl(ptr, rust_vec_len, data_len),
-        41 => wire__crate__api__enclave_sighash_impl(ptr, rust_vec_len, data_len),
-        45 => wire__crate__api__network_name_impl(ptr, rust_vec_len, data_len),
-        46 => wire__crate__api__openamp_compute_aid_impl(ptr, rust_vec_len, data_len),
-        47 => wire__crate__api__openamp_sign_sighash_impl(ptr, rust_vec_len, data_len),
-        48 => wire__crate__api__openamp_xonly_pubkey_impl(ptr, rust_vec_len, data_len),
-        56 => wire__crate__api__signer__seqln_derive_asset_impl(ptr, rust_vec_len, data_len),
-        57 => wire__crate__api__signer__seqln_derive_node_impl(ptr, rust_vec_len, data_len),
-        58 => wire__crate__api__signer__seqln_device_transport_privkey_impl(
+        44 => wire__crate__api__decode_enclave_spend_impl(ptr, rust_vec_len, data_len),
+        46 => wire__crate__api__signer__device_pubkey_impl(ptr, rust_vec_len, data_len),
+        47 => wire__crate__api__enclave_sighash_impl(ptr, rust_vec_len, data_len),
+        51 => wire__crate__api__network_name_impl(ptr, rust_vec_len, data_len),
+        52 => wire__crate__api__openamp_compute_aid_impl(ptr, rust_vec_len, data_len),
+        53 => wire__crate__api__openamp_sign_sighash_impl(ptr, rust_vec_len, data_len),
+        54 => wire__crate__api__openamp_xonly_pubkey_impl(ptr, rust_vec_len, data_len),
+        62 => wire__crate__api__signer__seqln_derive_asset_impl(ptr, rust_vec_len, data_len),
+        63 => wire__crate__api__signer__seqln_derive_node_impl(ptr, rust_vec_len, data_len),
+        64 => wire__crate__api__signer__seqln_device_transport_privkey_impl(
             ptr,
             rust_vec_len,
             data_len,
         ),
-        67 => wire__crate__api__sequentia_genesis_hash_impl(ptr, rust_vec_len, data_len),
-        68 => wire__crate__api__set_auth_header_impl(ptr, rust_vec_len, data_len),
-        69 => wire__crate__api__set_data_dir_impl(ptr, rust_vec_len, data_len),
+        73 => wire__crate__api__sequentia_genesis_hash_impl(ptr, rust_vec_len, data_len),
+        74 => wire__crate__api__set_auth_header_impl(ptr, rust_vec_len, data_len),
+        75 => wire__crate__api__set_data_dir_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -4967,6 +5303,72 @@ impl flutter_rust_bridge::IntoDart for crate::api::BuiltRawTx {
 impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::BuiltRawTx {}
 impl flutter_rust_bridge::IntoIntoDart<crate::api::BuiltRawTx> for crate::api::BuiltRawTx {
     fn into_into_dart(self) -> crate::api::BuiltRawTx {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::CoinjoinMineOutput {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.vout.into_into_dart().into_dart(),
+            self.script_pubkey.into_into_dart().into_dart(),
+            self.asset.into_into_dart().into_dart(),
+            self.value.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::CoinjoinMineOutput
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::CoinjoinMineOutput>
+    for crate::api::CoinjoinMineOutput
+{
+    fn into_into_dart(self) -> crate::api::CoinjoinMineOutput {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::CoinjoinSignInput {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.txid.into_into_dart().into_dart(),
+            self.vout.into_into_dart().into_dart(),
+            self.value.into_into_dart().into_dart(),
+            self.spk_hex.into_into_dart().into_dart(),
+            self.chain.into_into_dart().into_dart(),
+            self.index.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::CoinjoinSignInput {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::CoinjoinSignInput>
+    for crate::api::CoinjoinSignInput
+{
+    fn into_into_dart(self) -> crate::api::CoinjoinSignInput {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::CoinjoinUtxo {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.txid.into_into_dart().into_dart(),
+            self.vout.into_into_dart().into_dart(),
+            self.atoms.into_into_dart().into_dart(),
+            self.asset.into_into_dart().into_dart(),
+            self.spk_hex.into_into_dart().into_dart(),
+            self.chain.into_into_dart().into_dart(),
+            self.index.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::CoinjoinUtxo {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::CoinjoinUtxo> for crate::api::CoinjoinUtxo {
+    fn into_into_dart(self) -> crate::api::CoinjoinUtxo {
         self
     }
 }
@@ -5185,6 +5587,22 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::signer::LnNodeKeys>
     for crate::api::signer::LnNodeKeys
 {
     fn into_into_dart(self) -> crate::api::signer::LnNodeKeys {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::OwnershipProof {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.pubkey.into_into_dart().into_dart(),
+            self.sig.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::OwnershipProof {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::OwnershipProof> for crate::api::OwnershipProof {
+    fn into_into_dart(self) -> crate::api::OwnershipProof {
         self
     }
 }
@@ -5488,6 +5906,41 @@ impl SseEncode for crate::api::BuiltRawTx {
     }
 }
 
+impl SseEncode for crate::api::CoinjoinMineOutput {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <u32>::sse_encode(self.vout, serializer);
+        <String>::sse_encode(self.script_pubkey, serializer);
+        <String>::sse_encode(self.asset, serializer);
+        <String>::sse_encode(self.value, serializer);
+    }
+}
+
+impl SseEncode for crate::api::CoinjoinSignInput {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.txid, serializer);
+        <u32>::sse_encode(self.vout, serializer);
+        <String>::sse_encode(self.value, serializer);
+        <String>::sse_encode(self.spk_hex, serializer);
+        <u32>::sse_encode(self.chain, serializer);
+        <u32>::sse_encode(self.index, serializer);
+    }
+}
+
+impl SseEncode for crate::api::CoinjoinUtxo {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.txid, serializer);
+        <u32>::sse_encode(self.vout, serializer);
+        <String>::sse_encode(self.atoms, serializer);
+        <String>::sse_encode(self.asset, serializer);
+        <String>::sse_encode(self.spk_hex, serializer);
+        <u32>::sse_encode(self.chain, serializer);
+        <u32>::sse_encode(self.index, serializer);
+    }
+}
+
 impl SseEncode for crate::api::ConfidentialReceive {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -5635,6 +6088,36 @@ impl SseEncode for Vec<crate::api::AssetDelta> {
     }
 }
 
+impl SseEncode for Vec<crate::api::CoinjoinMineOutput> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::CoinjoinMineOutput>::sse_encode(item, serializer);
+        }
+    }
+}
+
+impl SseEncode for Vec<crate::api::CoinjoinSignInput> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::CoinjoinSignInput>::sse_encode(item, serializer);
+        }
+    }
+}
+
+impl SseEncode for Vec<crate::api::CoinjoinUtxo> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::CoinjoinUtxo>::sse_encode(item, serializer);
+        }
+    }
+}
+
 impl SseEncode for Vec<crate::api::EnclaveDecodedInput> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -5770,6 +6253,14 @@ impl SseEncode for Option<u64> {
         if let Some(value) = self {
             <u64>::sse_encode(value, serializer);
         }
+    }
+}
+
+impl SseEncode for crate::api::OwnershipProof {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.pubkey, serializer);
+        <String>::sse_encode(self.sig, serializer);
     }
 }
 
