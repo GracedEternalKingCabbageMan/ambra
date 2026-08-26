@@ -21,6 +21,11 @@ import 'wallet_repository.dart';
 /// the build ([Backend.lnWsUrl] / [Backend.lnHostPubkey] empty), [start] is a
 /// no-op and [available] stays false, so the wallet behaves exactly as the
 /// on-chain-only build.
+/// The asset id standing for NATIVE Bitcoin on the Lightning surfaces. Not a Sequentia asset
+/// id: it selects the device's BTC leg, which is provisioned from a different identity than an
+/// asset leg, so every Lightning call that takes an asset checks for it first.
+const String kLnBtc = 'BTC';
+
 class LightningService extends ChangeNotifier {
   LightningService._();
   static final LightningService instance = LightningService._();
@@ -372,10 +377,18 @@ class LightningService extends ChangeNotifier {
   Future<NodeInvoice> createInvoice({required String asset, required num amount, String? description}) async {
     final m = await WalletRepository.instance.readMnemonic();
     if (m == null) throw Exception('Your wallet is locked; unlock it and try again.');
-    final nodeKey = await connectNode(m, asset: asset);
-    try {
-      await LspClient.channelInbound(nodeKey: nodeKey, asset: asset, amount: amount);
-    } catch (_) {/* best-effort JIT; a funded channel may already have inbound room */}
+    final btc = asset == kLnBtc;
+    final nodeKey = btc ? await connectNode(m, chain: 'btc') : await connectNode(m, asset: asset);
+    // JIT inbound liquidity is a Sequentia-asset endpoint — POST /channel/inbound answers
+    // "asset must be a Sequentia asset id" — so the BTC leg takes the channel it already has.
+    // For an asset it is best-effort AND the step most likely to stall, because the LSP can be
+    // opening a channel on-chain behind it: give it a deadline rather than the whole wait.
+    if (!btc) {
+      try {
+        await LspClient.channelInbound(nodeKey: nodeKey, asset: asset, amount: amount)
+            .timeout(const Duration(seconds: 20));
+      } catch (_) {/* a funded channel may already have inbound room; the invoice is worth having */}
+    }
     return LspClient.nodeReceive(nodeKey: nodeKey, amount: amount, description: description);
   }
 
@@ -385,7 +398,8 @@ class LightningService extends ChangeNotifier {
   Future<NodePayResult> payInvoice({required String bolt11, required String asset}) async {
     final m = await WalletRepository.instance.readMnemonic();
     if (m == null) throw Exception('Your wallet is locked; unlock it and try again.');
-    final nodeKey = await connectNode(m, asset: asset);
+    final nodeKey =
+        asset == kLnBtc ? await connectNode(m, chain: 'btc') : await connectNode(m, asset: asset);
     return LspClient.nodePay(nodeKey: nodeKey, bolt11: bolt11);
   }
 

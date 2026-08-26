@@ -50,6 +50,10 @@ module that implements it.
 - OpenAMP tagged signing: sign a wallet-link/login challenge or a document hash for an
   OpenAMP-integrated site, opened from an `oamp-sign` deep link
   (`app/lib/src/screens/sign_screen.dart`).
+- Classic message signing on the same screen: sign with the key behind one of the
+  wallet's own addresses, in the format `verifymessage` accepts, so anyone with a node
+  can check that an address is yours. Neither signature can move funds. Verification is
+  offered against the legacy form of the address, the only form that RPC takes.
 
 **Balance (dual-chain, no privileged asset)**
 - The headline is one **total balance across all held assets, valued in a user-chosen
@@ -69,6 +73,10 @@ module that implements it.
   is the one that can receive Bitcoin.
 - OpenAMP account id + enclave deposit address for receiving restricted assets, shown
   when the OpenAMP service is reachable.
+- The account key, on request, for a watch-only import elsewhere: the extended public
+  key (`[fingerprint/84h/1h/0h]tpub...`) or a checksummed descriptor pair, receive and
+  change, in the `wpkh(...)` form that matches this wallet's addresses or the legacy
+  `pkh(...)` form. One key covers both chains, which share the `m/84'/1'/0'` account.
 
 **Send**
 - Sequentia send of any held asset, with the signature Sequentia feature: an **any-asset
