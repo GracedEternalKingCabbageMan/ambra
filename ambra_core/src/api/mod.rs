@@ -135,6 +135,53 @@ pub fn account_xpub(mnemonic: String) -> Result<String> {
         .map_err(rerr)
 }
 
+/// A message signed with the STAKING key (m/2/0), for a site that reads the
+/// stake behind a key: it recovers this key from the signature and looks the
+/// stake up. Levo's sign-in works this way. Non-spending, like the classic
+/// signature: it can authorise nothing.
+pub struct StakerSignedMessage {
+    /// Base64, the format `verifymessage` takes and a verifier recovers from.
+    pub signature: String,
+    /// The 33-byte compressed staking key, hex: what the verifier recovers.
+    pub staker_pubkey: String,
+}
+
+/// Sign `message` with the staking key, in the classic recoverable form.
+pub fn sign_message_with_staker_key(mnemonic: String, message: String) -> Result<StakerSignedMessage> {
+    use lwk_wollet::bitcoin::secp256k1::Secp256k1;
+    let signer = SwSigner::new(&mnemonic, /* is_mainnet */ false).map_err(rerr)?;
+    let path = DerivationPath::from(vec![
+        ChildNumber::Normal { index: 2 },
+        ChildNumber::Normal { index: 0 },
+    ]);
+    let xprv = signer.derive_xprv(&path).map_err(rerr)?;
+    let secp = Secp256k1::new();
+    let sk = xprv.private_key;
+    let compact = recoverable_signature(&secp, &sk, &message);
+    Ok(StakerSignedMessage {
+        signature: base64_encode(&compact),
+        staker_pubkey: sk.public_key(&secp).to_string(),
+    })
+}
+
+/// The 65-byte recoverable signature over the Bitcoin signed-message digest:
+/// header (27 + recovery id + 4, the +4 saying the key is compressed, which
+/// is all this wallet derives), then r and s.
+fn recoverable_signature(
+    secp: &lwk_wollet::bitcoin::secp256k1::Secp256k1<lwk_wollet::bitcoin::secp256k1::All>,
+    sk: &lwk_wollet::bitcoin::secp256k1::SecretKey,
+    message: &str,
+) -> [u8; 65] {
+    use lwk_wollet::bitcoin::{secp256k1::{ecdsa::RecoveryId, Message}, sign_message::signed_msg_hash};
+    let hash = signed_msg_hash(message);
+    let msg = Message::from_digest(*hash.as_ref());
+    let (recovery, sig) = secp.sign_ecdsa_recoverable(&msg, sk).serialize_compact();
+    let mut compact = [0u8; 65];
+    compact[0] = 27 + (RecoveryId::to_i32(recovery) as u8) + 4;
+    compact[1..].copy_from_slice(&sig);
+    compact
+}
+
 /// A classic signed message, and the address a verifier must be given for it.
 pub struct SignedMessage {
     /// Base64, the format `verifymessage` takes.
@@ -157,28 +204,14 @@ pub struct SignedMessage {
 /// Non-spending, like the OpenAMP signatures beside it: it proves control of an
 /// address and can authorize nothing.
 pub fn sign_message_classic(mnemonic: String, index: u32, message: String) -> Result<SignedMessage> {
-    use lwk_wollet::bitcoin::{
-        secp256k1::{ecdsa::RecoveryId, Message, Secp256k1},
-        sign_message::signed_msg_hash,
-        Network, PublicKey,
-    };
+    use lwk_wollet::bitcoin::{secp256k1::Secp256k1, Network, PublicKey};
     let signer = SwSigner::new(&mnemonic, /* is_mainnet */ false).map_err(rerr)?;
     let path = DerivationPath::from_str(&format!("m/84h/1h/0h/0/{index}")).map_err(rerr)?;
     let xprv = signer.derive_xprv(&path).map_err(rerr)?;
 
     let secp = Secp256k1::new();
     let sk = xprv.private_key;
-    let hash = signed_msg_hash(&message);
-    let msg = Message::from_digest(*hash.as_ref());
-    let (recovery, sig) = secp
-        .sign_ecdsa_recoverable(&msg, &sk)
-        .serialize_compact();
-
-    // header = 27 + recovery id + 4, the +4 saying the key is compressed — which
-    // is all this wallet derives.
-    let mut compact = [0u8; 65];
-    compact[0] = 27 + (RecoveryId::to_i32(recovery) as u8) + 4;
-    compact[1..].copy_from_slice(&sig);
+    let compact = recoverable_signature(&secp, &sk, &message);
 
     let pk = PublicKey::new(sk.public_key(&secp));
     let btc = lwk_wollet::bitcoin::Address::p2wpkh(

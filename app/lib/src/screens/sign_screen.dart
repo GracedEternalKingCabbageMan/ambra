@@ -252,6 +252,8 @@ class _SignScreenState extends State<SignScreen> {
           ],
           const SizedBox(height: 26),
           const ClassicSignCard(),
+          const SizedBox(height: 16),
+          const StakerSignCard(),
         ]),
       ),
     );
@@ -395,6 +397,127 @@ class _ClassicSignCardState extends State<ClassicSignCard> {
                   '"${_message.text.replaceAll('"', r'\"')}"',
               'Verify command copied',
             ),
+          ),
+        ],
+      ]),
+    );
+  }
+}
+
+/// A message signed with the STAKING key: what a site that reads the stake
+/// behind a key asks for. Levo issues a message, this signs it with the key
+/// the stake is bonded to (m/2/0, the key the Stake screen shows), and the
+/// site recovers that key from the signature and finds the stake. The other
+/// two cards sign with keys that own no stake, so a signature from them signs
+/// you in as nobody. Non-spending, like the two above.
+class StakerSignCard extends StatefulWidget {
+  const StakerSignCard({super.key});
+  @override
+  State<StakerSignCard> createState() => _StakerSignCardState();
+}
+
+class _StakerSignCardState extends State<StakerSignCard> {
+  final _message = TextEditingController();
+  bool _busy = false;
+  String? _error;
+  String? _staker;         // the staking key, shown before signing
+  core.StakerSignedMessage? _out;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadKey();
+  }
+
+  @override
+  void dispose() {
+    _message.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadKey() async {
+    try {
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) return;
+      final k = await core.stakerPublicKey(mnemonic: m);
+      if (mounted) setState(() => _staker = k);
+    } catch (_) {
+      if (mounted) setState(() => _staker = null);
+    }
+  }
+
+  Future<void> _sign() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+      _out = null;
+    });
+    try {
+      final m = await WalletRepository.instance.readMnemonic();
+      if (m == null) throw Exception('open your wallet first');
+      if (_message.text.isEmpty) throw Exception('paste the message the site asked you to sign');
+      // Signed exactly as pasted: a site's message over even slightly
+      // different bytes recovers to a key nobody holds.
+      final out = await core.signMessageWithStakerKey(mnemonic: m, message: _message.text);
+      if (!mounted) return;
+      setState(() {
+        _out = out;
+        _busy = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = e.toString().replaceFirst('Exception: ', '');
+      });
+    }
+  }
+
+  void _copy(String text, String msg) {
+    Clipboard.setData(ClipboardData(text: text));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final out = _out;
+    return AmbraCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        const SectionLabel('Sign a message with your staking key'),
+        const SizedBox(height: 10),
+        const Text(
+          'For a site that reads the stake behind a key, such as Levo: it issues a message, you sign '
+          'it here with the key your stake is bonded to, and it recovers that key from the signature '
+          'and finds your stake. Paste the message whole, exactly as issued. Like the signatures '
+          'above it cannot move funds.',
+          style: AmbraText.muted,
+        ),
+        const SizedBox(height: 16),
+        AmbraField(label: 'Message', controller: _message, hint: 'the message the site asked you to sign', maxLines: 4),
+        if (_staker != null) ...[
+          const SizedBox(height: 8),
+          Text('Staking key $_staker', style: AmbraText.mono.copyWith(fontSize: 12, color: AmbraColors.dim)),
+        ],
+        const SizedBox(height: 18),
+        PrimaryButton(label: 'Sign', icon: Icons.draw, busy: _busy, onPressed: _busy ? null : _sign),
+        if (_error != null) ...[
+          const SizedBox(height: 12),
+          Text(_error!, style: const TextStyle(color: AmbraColors.red)),
+        ],
+        if (out != null) ...[
+          const SizedBox(height: 20),
+          _ResultBlock(
+            label: 'Signature',
+            value: out.signature,
+            onCopy: () => _copy(out.signature, 'Signature copied'),
+          ),
+          const SizedBox(height: 14),
+          _ResultBlock(label: 'Your staking key', value: out.stakerPubkey),
+          const SizedBox(height: 8),
+          const Text(
+            'The site recovers this key from the signature; paste the signature back into it and '
+            'the account it opens is this key.',
+            style: AmbraText.sub,
           ),
         ],
       ]),

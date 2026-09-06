@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `base64_encode`, `btc_params`, `clear_scan_marks`, `ct_str`, `ct_u64`, `delegation_scripthash`, `derive_maker_payout`, `derive_maker_secret`, `enclave_prevout_to_txout`, `enclave_prevouts_to_txouts`, `enclave_sighash_inner`, `err`, `esplora_client`, `fetch_utxo`, `hexbytes`, `hexstr_bytes`, `last_scan`, `maker_identity_priv`, `mark_scanned`, `openamp_keypair`, `order_from_terms`, `outpoint_is_spent`, `parse_openamp_tx`, `priv32`, `rerr`, `scan_into`, `scanned_recently`, `scripthash_utxos`, `select_taker_inputs`, `seq_addr_params`, `staker_secret`, `tip_height`, `tohex`, `with_synced_wollet`, `wollet_cache`
+// These functions are ignored because they are not marked as `pub`: `apply_fee_and_finish`, `base64_encode`, `btc_params`, `clear_scan_marks`, `ct_str`, `ct_u64`, `delegation_scripthash`, `derive_maker_payout`, `derive_maker_secret`, `enclave_prevout_to_txout`, `enclave_prevouts_to_txouts`, `enclave_sighash_inner`, `err`, `esplora_client`, `fetch_utxo`, `hexbytes`, `hexstr_bytes`, `last_scan`, `maker_identity_priv`, `mark_scanned`, `openamp_keypair`, `order_from_terms`, `outpoint_is_spent`, `parse_openamp_tx`, `priv32`, `recoverable_signature`, `rerr`, `scan_into`, `scanned_recently`, `scripthash_utxos`, `select_taker_inputs`, `seq_addr_params`, `staker_secret`, `tip_height`, `tohex`, `with_synced_wollet`, `wollet_cache`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`
 
 /// The active Sequentia network's identifier, e.g. `"sequentia-testnet"`.
@@ -58,6 +58,15 @@ Future<String> descriptorFromMnemonic({required String mnemonic}) =>
 /// is what makes their `tb1` address the same string.
 Future<String> accountXpub({required String mnemonic}) =>
     RustLib.instance.api.crateApiAccountXpub(mnemonic: mnemonic);
+
+/// Sign `message` with the staking key, in the classic recoverable form.
+Future<StakerSignedMessage> signMessageWithStakerKey({
+  required String mnemonic,
+  required String message,
+}) => RustLib.instance.api.crateApiSignMessageWithStakerKey(
+  mnemonic: mnemonic,
+  message: message,
+);
 
 /// Sign `message` with the key behind the wallet's receive address at `index`,
 /// in the "Bitcoin Signed Message" format: the magic string and the message
@@ -1897,6 +1906,34 @@ class SignedMessage {
           signature == other.signature &&
           verifyAddress == other.verifyAddress &&
           address == other.address;
+}
+
+/// A message signed with the STAKING key (m/2/0), for a site that reads the
+/// stake behind a key: it recovers this key from the signature and looks the
+/// stake up. Levo's sign-in works this way. Non-spending, like the classic
+/// signature: it can authorise nothing.
+class StakerSignedMessage {
+  /// Base64, the format `verifymessage` takes and a verifier recovers from.
+  final String signature;
+
+  /// The 33-byte compressed staking key, hex: what the verifier recovers.
+  final String stakerPubkey;
+
+  const StakerSignedMessage({
+    required this.signature,
+    required this.stakerPubkey,
+  });
+
+  @override
+  int get hashCode => signature.hashCode ^ stakerPubkey.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is StakerSignedMessage &&
+          runtimeType == other.runtimeType &&
+          signature == other.signature &&
+          stakerPubkey == other.stakerPubkey;
 }
 
 /// A wallet transaction history row.
