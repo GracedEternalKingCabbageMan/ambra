@@ -236,3 +236,25 @@ fn noise_wrong_host_key_fails() {
         "handshake must fail closed on a wrong pinned host key"
     );
 }
+
+
+/// A message signed with the staking key recovers to the staking key: that is
+/// the whole contract a site that reads stake (Levo) relies on. The classic
+/// signer at an address index must NOT recover to it.
+#[test]
+fn a_staker_signed_message_recovers_to_the_staker_key() {
+    use lwk_wollet::bitcoin::{secp256k1::Secp256k1, sign_message::{signed_msg_hash, MessageSignature}};
+    let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string();
+    let message = "Sign in to Levo\nnonce: 0123456789abcdef\nThis authorises no payment.".to_string();
+    let out = ambra_core::api::sign_message_with_staker_key(mnemonic.clone(), message.clone()).unwrap();
+    let staker = ambra_core::api::staker_public_key(mnemonic.clone()).unwrap();
+    assert_eq!(out.staker_pubkey, staker, "the key the wallet reports beside the signature is the staking key");
+    let secp = Secp256k1::new();
+    let sig = MessageSignature::from_base64(&out.signature).unwrap();
+    let recovered = sig.recover_pubkey(&secp, signed_msg_hash(&message)).unwrap();
+    assert_eq!(recovered.to_string(), staker, "a verifier recovers the staking key from the signature");
+    let classic = ambra_core::api::sign_message_classic(mnemonic, 0, message.clone()).unwrap();
+    let other = MessageSignature::from_base64(&classic.signature).unwrap()
+        .recover_pubkey(&secp, signed_msg_hash(&message)).unwrap();
+    assert_ne!(other.to_string(), staker, "a classic signature is by an address key, not the staking key");
+}
